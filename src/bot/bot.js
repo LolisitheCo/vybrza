@@ -1,6 +1,8 @@
+
+import "dotenv/config";
+import path from "node:path";
 import { Telegraf } from "telegraf";
-import dotenv from "dotenv";
-import path from "path";
+
 import {
   startHostApplication,
   submitHostApplicationEmail,
@@ -21,14 +23,9 @@ import {
   rejectUser,
 } from "../services/adminService.js";
 
-import {
-  registerPaymentHandlers,
-} from "./paymentBot.js";
+import { registerPaymentHandlers } from "./paymentBot.js";
 
-import {
-  matchUserToHost,
-} from "../services/matchingService.js";
-
+import { matchUserToHost } from "../services/matchingService.js";
 import { mainMenu } from "./menu.js";
 
 import {
@@ -42,32 +39,100 @@ import {
   noHostCard,
 } from "./ui.js";
 
-dotenv.config();
-
 // ============================================================
-// TELEGRAM BOT CONFIGURATION
+// CONFIGURATION
 // ============================================================
 
-const token = process.env.TELEGRAM_BOT_TOKEN;
+const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
+const configuredAdminId = process.env.ADMIN_TELEGRAM_ID?.trim();
 
 if (!token) {
-  throw new Error("TELEGRAM_BOT_TOKEN is missing.");
+  throw new Error("Missing required environment variable: TELEGRAM_BOT_TOKEN");
+}
+
+if (/\s/.test(token)) {
+  throw new Error("TELEGRAM_BOT_TOKEN has an invalid format.");
+}
+
+if (
+  configuredAdminId &&
+  !/^\d{1,20}$/.test(configuredAdminId)
+) {
+  throw new Error("ADMIN_TELEGRAM_ID must be a numeric Telegram user ID.");
+}
+
+if (!configuredAdminId) {
+  console.warn(
+    "ADMIN_TELEGRAM_ID is not configured. Admin commands will remain unavailable."
+  );
 }
 
 const bot = new Telegraf(token);
 
 // ============================================================
-// ADMIN CHECK
+// SECURITY HELPERS
 // ============================================================
 
-function isAdmin(ctx) {
-  const adminId = process.env.ADMIN_TELEGRAM_ID;
+// Escape user-controlled text before inserting it into Telegram's
+// legacy Markdown messages.
+function escapeMarkdown(value) {
+  return String(value ?? "").replace(/([_*`\[])/g, "\\$1");
+}
 
-  if (!adminId) {
+function cleanText(value, maxLength = 200) {
+  return String(value ?? "")
+    .replace(/[\u0000-\u001F\u007F]/g, " ")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function isAdmin(ctx) {
+  if (!configuredAdminId) {
     return false;
   }
 
-  return String(ctx.from?.id) === String(adminId);
+  return String(ctx.from?.id ?? "") === configuredAdminId;
+}
+
+function validDocumentId(value) {
+  return (
+    typeof value === "string" &&
+    value.length >= 1 &&
+    value.length <= 128 &&
+    /^[A-Za-z0-9_-]+$/.test(value)
+  );
+}
+
+async function answerCallback(ctx, text) {
+  try {
+    await ctx.answerCbQuery(text);
+  } catch (error) {
+    // Telegram can expire callback queries if a user clicks an old button.
+    console.warn("Unable to answer Telegram callback query:", error?.message);
+  }
+}
+
+async function replyError(ctx, title, message, includeMenu = true) {
+  try {
+    await ctx.reply(
+      errorCard(title, message),
+      {
+        parse_mode: "Markdown",
+        ...(includeMenu ? mainMenu() : {}),
+      }
+    );
+  } catch (error) {
+    console.error("Unable to send error message:", error?.message);
+  }
+}
+
+function userDisplayName(user, telegramUser) {
+  return cleanText(
+    user?.profile?.displayName ||
+      telegramUser?.first_name ||
+      "Not set",
+    100
+  );
 }
 
 // ============================================================
@@ -76,11 +141,17 @@ function isAdmin(ctx) {
 
 async function sendWelcome(ctx) {
   try {
-    const telegramId = String(ctx.from.id);
+    if (!ctx.from?.id) {
+      await ctx.reply("Unable to identify your Telegram account. Please try again.");
+      return;
+    }
 
+    const telegramId = String(ctx.from.id);
     await getOrCreateUser(telegramId);
 
-    const firstName = ctx.from.first_name || "there";
+    const firstName = escapeMarkdown(
+      cleanText(ctx.from.first_name || "there", 64)
+    );
 
     const welcomeImagePath = path.resolve(
       process.cwd(),
@@ -109,7 +180,7 @@ async function sendWelcome(ctx) {
         }
       );
     } catch (imageError) {
-      console.error("Welcome image error:", imageError);
+      console.warn("Welcome image could not be sent:", imageError?.message);
 
       await ctx.reply(caption, {
         parse_mode: "Markdown",
@@ -117,42 +188,26 @@ async function sendWelcome(ctx) {
       });
     }
   } catch (error) {
-    console.error("Welcome error:", error);
+    console.error("Welcome handler failed:", error?.message);
 
     try {
       await ctx.reply(
-        `🟢 *SA LIVE*\n\n` +
-        `Welcome! Something went wrong while loading the full menu.\n\n` +
-        `Please try again.`,
-        {
-          parse_mode: "Markdown",
-          ...mainMenu(),
-        }
+        "🟢 SA LIVE\n\nWelcome! We could not load the full menu. Please try again.",
+        mainMenu()
       );
     } catch (replyError) {
-      console.error("Welcome fallback error:", replyError);
+      console.error("Welcome fallback failed:", replyError?.message);
     }
   }
 }
 
 // ============================================================
-// /start
+// START COMMANDS
 // ============================================================
 
-bot.start(async (ctx) => {
-  await sendWelcome(ctx);
-});
+bot.start(sendWelcome);
 
-// ============================================================
-// START OVER WITH NORMAL TEXT
-// ============================================================
-
-bot.hears(
-  /^(hi|hello|hey|start|begin)$/i,
-  async (ctx) => {
-    await sendWelcome(ctx);
-  }
-);
+bot.hears(/^(hi|hello|hey|start|begin)$/i, sendWelcome);
 
 // ============================================================
 // REQUEST VERIFICATION
@@ -160,7 +215,7 @@ bot.hears(
 
 bot.action("request_verification", async (ctx) => {
   try {
-    await ctx.answerCbQuery();
+    await answerCallback(ctx);
 
     const user = await getOrCreateUser(ctx.from);
 
@@ -169,37 +224,36 @@ bot.action("request_verification", async (ctx) => {
         verificationCard({
           status: "approved",
           message:
-            `Your account has already been approved.\n\n` +
-            `🎉 You have access to SA LIVE.\n\n` +
-            `⏱️ Available minutes: *${user.minutes || 0}*`,
+            "Your account has already been approved.\n\n" +
+            "🎉 You have access to SA LIVE.\n\n" +
+           `Current balance: ${Math.max(
+  0,
+  Number(user.minutes) || 0
+)} minutes`,
         }),
         {
           parse_mode: "Markdown",
           ...mainMenu(),
         }
       );
-
       return;
     }
 
     if (user.verificationStatus === "pending") {
-      const submittedAt = user.verification?.submittedAt;
-
-      if (submittedAt) {
+      if (user.verification?.submittedAt) {
         await ctx.reply(
           verificationCard({
             status: "pending",
-            message:
-              `Your verification request has already been submitted.\n\n` +
-              `🔎 An administrator is reviewing your account.\n\n` +
-              `🎁 Once approved, you will receive your *5 free minutes*.`,
+           message:
+  "Your verification request has been submitted successfully.\n\n" +
+  "An administrator will review your account.\n\n" +
+  "Once approved, you can purchase minutes and use SA LIVE.",
           }),
           {
             parse_mode: "Markdown",
             ...mainMenu(),
           }
         );
-
         return;
       }
 
@@ -207,9 +261,9 @@ bot.action("request_verification", async (ctx) => {
         verificationCard({
           status: "pending",
           message:
-            `Your account needs to be verified before you can start a call.\n\n` +
-            `Complete the verification process provided by SA LIVE.\n\n` +
-            `Once completed, submit your request for review.`,
+            "Your account needs to be verified before you can start a call.\n\n" +
+            "Complete the verification process provided by SA LIVE.\n\n" +
+            "Once completed, submit your request for review.",
         }),
         {
           reply_markup: {
@@ -230,7 +284,6 @@ bot.action("request_verification", async (ctx) => {
           },
         }
       );
-
       return;
     }
 
@@ -239,8 +292,8 @@ bot.action("request_verification", async (ctx) => {
         verificationCard({
           status: "rejected",
           message:
-            `Your previous verification request was not approved.\n\n` +
-            `You may submit another request for review.`,
+            "Your previous verification request was not approved.\n\n" +
+            "You may submit another request for review.",
         }),
         {
           reply_markup: {
@@ -261,21 +314,34 @@ bot.action("request_verification", async (ctx) => {
           },
         }
       );
-
       return;
     }
-  } catch (error) {
-    console.error("Verification request error:", error);
 
     await ctx.reply(
-      errorCard(
-        "VERIFICATION ERROR",
-        "Unable to open verification right now."
-      ),
+      verificationCard({
+        status: "pending",
+        message:
+          "Please submit your verification request to continue.",
+      }),
       {
-        parse_mode: "Markdown",
-        ...mainMenu(),
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "✅ Submit Verification Request",
+                callback_data: "submit_verification",
+              },
+            ],
+          ],
+        },
       }
+    );
+  } catch (error) {
+    console.error("Verification request failed:", error?.message);
+    await replyError(
+      ctx,
+      "VERIFICATION ERROR",
+      "Unable to open verification right now."
     );
   }
 });
@@ -286,7 +352,7 @@ bot.action("request_verification", async (ctx) => {
 
 bot.action("submit_verification", async (ctx) => {
   try {
-    await ctx.answerCbQuery();
+    await answerCallback(ctx);
 
     const user = await getOrCreateUser(ctx.from);
 
@@ -301,7 +367,6 @@ bot.action("submit_verification", async (ctx) => {
           ...mainMenu(),
         }
       );
-
       return;
     }
 
@@ -311,9 +376,9 @@ bot.action("submit_verification", async (ctx) => {
       verificationCard({
         status: "pending",
         message:
-          `Your verification request has been sent successfully.\n\n` +
-          `🔎 An administrator will review your account.\n\n` +
-          `🎁 Once approved, you will receive your *5 free minutes*.`,
+          "Your verification request has been sent successfully.\n\n" +
+          "🔎 An administrator will review your account.\n\n" +
+          "🎁 Once approved, you will receive your *5 free minutes*.",
       }),
       {
         parse_mode: "Markdown",
@@ -321,17 +386,11 @@ bot.action("submit_verification", async (ctx) => {
       }
     );
   } catch (error) {
-    console.error("Verification submission error:", error);
-
-    await ctx.reply(
-      errorCard(
-        "SUBMISSION FAILED",
-        "Unable to submit your verification request right now. Please try again."
-      ),
-      {
-        parse_mode: "Markdown",
-        ...mainMenu(),
-      }
+    console.error("Verification submission failed:", error?.message);
+    await replyError(
+      ctx,
+      "SUBMISSION FAILED",
+      "Unable to submit your verification request right now. Please try again."
     );
   }
 });
@@ -342,7 +401,7 @@ bot.action("submit_verification", async (ctx) => {
 
 bot.action("profile", async (ctx) => {
   try {
-    await ctx.answerCbQuery();
+    await answerCallback(ctx);
 
     const user = await getOrCreateUser(ctx.from);
 
@@ -355,18 +414,12 @@ bot.action("profile", async (ctx) => {
 
     await ctx.reply(
       profileCard({
-        name:
-          user.profile?.displayName ||
-          ctx.from.first_name ||
-          "Not set",
-
-        username:
-          user.username ||
-          ctx.from.username ||
-          "Not set",
-
+        name: escapeMarkdown(userDisplayName(user, ctx.from)),
+        username: escapeMarkdown(
+          cleanText(user.username || ctx.from.username || "Not set", 64)
+        ),
         verification,
-        minutes: user.minutes || 0,
+        minutes: Math.max(0, Number(user.minutes) || 0),
       }),
       {
         parse_mode: "Markdown",
@@ -374,17 +427,11 @@ bot.action("profile", async (ctx) => {
       }
     );
   } catch (error) {
-    console.error("Profile error:", error);
-
-    await ctx.reply(
-      errorCard(
-        "PROFILE ERROR",
-        "Unable to load your profile right now."
-      ),
-      {
-        parse_mode: "Markdown",
-        ...mainMenu(),
-      }
+    console.error("Profile handler failed:", error?.message);
+    await replyError(
+      ctx,
+      "PROFILE ERROR",
+      "Unable to load your profile right now."
     );
   }
 });
@@ -395,65 +442,61 @@ bot.action("profile", async (ctx) => {
 
 bot.action("balance", async (ctx) => {
   try {
-    await ctx.answerCbQuery();
+    await answerCallback(ctx);
 
     const user = await getOrCreateUser(ctx.from);
-    const minutes = Number(user.minutes || 0);
+    const minutes = Math.max(0, Number(user.minutes) || 0);
 
     await ctx.reply(balanceCard(minutes), {
       parse_mode: "Markdown",
       ...mainMenu(),
     });
   } catch (error) {
-    console.error("Balance error:", error);
-
-    await ctx.reply(
-      errorCard(
-        "BALANCE ERROR",
-        "Unable to load your balance right now."
-      ),
-      {
-        parse_mode: "Markdown",
-        ...mainMenu(),
-      }
+    console.error("Balance handler failed:", error?.message);
+    await replyError(
+      ctx,
+      "BALANCE ERROR",
+      "Unable to load your balance right now."
     );
   }
-});// ============================================================
+});
+
+// ============================================================
 // FIND SOMEONE
 // ============================================================
 
 bot.action("find_someone", async (ctx) => {
   try {
-    await ctx.answerCbQuery();
+    await answerCallback(ctx);
 
     const user = await getOrCreateUser(ctx.from);
 
     if (user.verificationStatus !== "approved") {
+      const status =
+        user.verificationStatus === "rejected"
+          ? "rejected"
+          : "pending";
+
       await ctx.reply(
         verificationCard({
-          status:
-            user.verificationStatus === "rejected"
-              ? "rejected"
-              : "pending",
+          status,
           message:
-            `Your account has not been approved yet.\n\n` +
-            `Please complete verification before requesting a call.`,
+            "Your account has not been approved yet.\n\n" +
+            "Please complete verification before requesting a call.",
         }),
         {
           parse_mode: "Markdown",
           ...mainMenu(),
         }
       );
-
       return;
     }
 
-    if (Number(user.minutes || 0) <= 0) {
+    if (!Number.isFinite(Number(user.minutes)) || Number(user.minutes) <= 0) {
       await ctx.reply(balanceCard(0), {
         parse_mode: "Markdown",
         ...mainMenu(),
       });
-
       return;
     }
 
@@ -461,13 +504,13 @@ bot.action("find_someone", async (ctx) => {
       await ctx.reply(
         errorCard(
           "CALL ALREADY ACTIVE",
-          "You already have an active call. Please finish your current call before requesting another one."
+          "You already have an active call. Finish your current call before requesting another one."
         ),
         {
           parse_mode: "Markdown",
+          ...mainMenu(),
         }
       );
-
       return;
     }
 
@@ -477,12 +520,11 @@ bot.action("find_someone", async (ctx) => {
 
     const result = await matchUserToHost(user.id);
 
-    if (!result.matched) {
+    if (!result?.matched) {
       await ctx.reply(noHostCard(), {
         parse_mode: "Markdown",
         ...mainMenu(),
       });
-
       return;
     }
 
@@ -491,29 +533,23 @@ bot.action("find_someone", async (ctx) => {
     });
 
     await ctx.reply(
-      `🎥 *SA LIVE VIDEO ROOM*\n\n` +
-      `Your host has been matched successfully.\n\n` +
-      `🔐 Your private room is being prepared.\n\n` +
-      `The video room generation system will be connected next.\n\n` +
-      `━━━━━━━━━━━━━━━━━━\n` +
-      `_SA LIVE — More than just a call._`,
+      "🎥 *SA LIVE VIDEO ROOM*\n\n" +
+        "Your host has been matched successfully.\n\n" +
+        "🔐 Your private room is being prepared.\n\n" +
+        "The video room generation system must be connected before a real call can begin.\n\n" +
+        "━━━━━━━━━━━━━━━━━━\n" +
+        "_SA LIVE — More than just a call._",
       {
         parse_mode: "Markdown",
         ...mainMenu(),
       }
     );
   } catch (error) {
-    console.error("Matching request error:", error);
-
-    await ctx.reply(
-      errorCard(
-        "MATCHING ERROR",
-        "Unable to find an available host right now. Please try again."
-      ),
-      {
-        parse_mode: "Markdown",
-        ...mainMenu(),
-      }
+    console.error("Matching request failed:", error?.message);
+    await replyError(
+      ctx,
+      "MATCHING ERROR",
+      "Unable to find an available host right now. Please try again."
     );
   }
 });
@@ -524,31 +560,25 @@ bot.action("find_someone", async (ctx) => {
 
 bot.action("call_history", async (ctx) => {
   try {
-    await ctx.answerCbQuery();
+    await answerCallback(ctx);
 
     await ctx.reply(
-      `📋 *SA LIVE CALL HISTORY*\n\n` +
-      `You don't have any completed calls yet.\n\n` +
-      `Start your first connection from *Find Someone*.\n\n` +
-      `━━━━━━━━━━━━━━━━━━\n` +
-      `_SA LIVE — More than just a call._`,
+      "📋 *SA LIVE CALL HISTORY*\n\n" +
+        "Call history will appear here when completed calls are saved by the backend.\n\n" +
+        "Start a connection from *Find Someone*.\n\n" +
+        "━━━━━━━━━━━━━━━━━━\n" +
+        "_SA LIVE — More than just a call._",
       {
         parse_mode: "Markdown",
         ...mainMenu(),
       }
     );
   } catch (error) {
-    console.error("Call history error:", error);
-
-    await ctx.reply(
-      errorCard(
-        "CALL HISTORY ERROR",
-        "Unable to load your call history right now."
-      ),
-      {
-        parse_mode: "Markdown",
-        ...mainMenu(),
-      }
+    console.error("Call history handler failed:", error?.message);
+    await replyError(
+      ctx,
+      "CALL HISTORY ERROR",
+      "Unable to load your call history right now."
     );
   }
 });
@@ -559,61 +589,56 @@ bot.action("call_history", async (ctx) => {
 
 bot.action("back_to_main", async (ctx) => {
   try {
-    await ctx.answerCbQuery();
+    await answerCallback(ctx);
 
     await ctx.reply(
-      `🟢 *SA LIVE*\n\n` +
-      `*Main Menu*\n\n` +
-      `Choose an option below to continue.\n\n` +
-      `_MEET • TALK • CONNECT_`,
+      "🟢 *SA LIVE*\n\n" +
+        "*Main Menu*\n\n" +
+        "Choose an option below to continue.\n\n" +
+        "_MEET • TALK • CONNECT_",
       {
         parse_mode: "Markdown",
         ...mainMenu(),
       }
     );
   } catch (error) {
-    console.error("Back to main menu error:", error);
+    console.error("Main menu handler failed:", error?.message);
   }
 });
 
 // ============================================================
-// ADMIN PANEL
+// ADMIN: VERIFICATION DASHBOARD
 // ============================================================
 
 bot.command("admin", async (ctx) => {
   try {
     if (!isAdmin(ctx)) {
-      await ctx.reply(
-        "You are not authorized to access the admin panel."
-      );
-
+      await ctx.reply("You are not authorized to access the admin panel.");
       return;
     }
 
     const pendingUsers = await getPendingVerificationUsers();
 
-    const message = [
-      "SA LIVE ADMIN",
-      "",
-      "Verification Dashboard",
-      "",
-      `Pending verification requests: ${pendingUsers.length}`,
-      "",
-      "Use /verify_pending to review pending users.",
-    ].join("\n");
-
-    await ctx.reply(message);
-  } catch (error) {
-    console.error("Admin command error:", error);
-
     await ctx.reply(
-      "Unable to load the admin panel. Please try again."
+      [
+        "SA LIVE ADMIN",
+        "",
+        "Verification Dashboard",
+        "",
+        `Pending verification requests: ${pendingUsers.length}`,
+        "",
+        "Use /verify_pending to review pending users.",
+        "Use /host_pending to review host applications.",
+      ].join("\n")
     );
+  } catch (error) {
+    console.error("Admin dashboard failed:", error?.message);
+    await ctx.reply("Unable to load the admin panel. Please try again.");
   }
 });
 
 // ============================================================
-// VIEW PENDING VERIFICATIONS
+// ADMIN: VIEW PENDING VERIFICATIONS
 // ============================================================
 
 bot.command("verify_pending", async (ctx) => {
@@ -625,41 +650,37 @@ bot.command("verify_pending", async (ctx) => {
 
     const pendingUsers = await getPendingVerificationUsers();
 
-    if (pendingUsers.length === 0) {
-      await ctx.reply(
-        "✅ There are no pending verification requests."
-      );
-
+    if (!Array.isArray(pendingUsers) || pendingUsers.length === 0) {
+      await ctx.reply("✅ There are no pending verification requests.");
       return;
     }
 
     await ctx.reply(
-      `🔐 *SA LIVE VERIFICATIONS*\n\n` +
-      `Found *${pendingUsers.length}* pending request${
-        pendingUsers.length === 1 ? "" : "s"
-      }.`,
-      {
-        parse_mode: "Markdown",
-      }
+      `🔐 SA LIVE VERIFICATIONS\n\nFound ${pendingUsers.length} pending request(s).`
     );
 
     for (const user of pendingUsers) {
+      if (!validDocumentId(String(user.id ?? ""))) {
+        console.warn("Skipping verification record with invalid document ID.");
+        continue;
+      }
+
+      const displayName = cleanText(
+        user.profile?.displayName || "Unknown",
+        100
+      );
+
       const username = user.username
-        ? `@${user.username}`
+        ? `@${cleanText(user.username, 64)}`
         : "No username";
 
       await ctx.reply(
-        `👤 *VERIFICATION REQUEST*\n\n` +
-        `*Name*\n` +
-        `${user.profile?.displayName || "Unknown"}\n\n` +
-        `*Telegram*\n` +
-        `${username}\n\n` +
-        `*Telegram ID*\n` +
-        `${user.telegramId}\n\n` +
-        `*Status*\n` +
-        `🟡 Pending`,
+        "👤 VERIFICATION REQUEST\n\n" +
+          `Name: ${displayName}\n` +
+          `Telegram: ${username}\n` +
+          `Telegram ID: ${cleanText(user.telegramId || user.id, 32)}\n` +
+          "Status: Pending",
         {
-          parse_mode: "Markdown",
           reply_markup: {
             inline_keyboard: [
               [
@@ -678,114 +699,87 @@ bot.command("verify_pending", async (ctx) => {
       );
     }
   } catch (error) {
-    console.error("Pending verification error:", error);
+    console.error("Pending verification listing failed:", error?.message);
+    await ctx.reply("⚠️ Unable to load verification requests.");
+  }
+});
+
+// ============================================================
+// ADMIN: APPROVE VERIFICATION
+// ============================================================
+
+bot.action(/^approve_verification:([A-Za-z0-9_-]{1,128})$/, async (ctx) => {
+  try {
+    if (!isAdmin(ctx)) {
+      await answerCallback(ctx, "Not authorized.");
+      return;
+    }
+
+    const userId = ctx.match[1];
+
+    await answerCallback(ctx, "Processing approval...");
+
+    const result = await approveUser(userId, String(ctx.from.id));
+
+    if (result?.alreadyApproved) {
+      await ctx.reply(
+        "ℹ️ USER ALREADY VERIFIED\n\n" +
+          `Current balance: ${Math.max(0, Number(result.minutes) || 0)} minutes`
+      );
+      return;
+    }
 
     await ctx.reply(
-      "⚠️ Unable to load verification requests."
+  "✅ USER VERIFIED\n\n" +
+    "The user has been approved.\n\n" +
+    "No free minutes were added.\n\n" +
+    `Current balance: ${Math.max(
+      0,
+      Number(result?.minutes) || 0
+    )} minutes`
+);
+  } catch (error) {
+    console.error("Approve verification failed:", error?.message);
+    await ctx.reply("⚠️ Unable to approve this user. Please check the request and try again.");
+  }
+});
+
+// ============================================================
+// ADMIN: REJECT VERIFICATION
+// ============================================================
+
+bot.action(/^reject_verification:([A-Za-z0-9_-]{1,128})$/, async (ctx) => {
+  try {
+    if (!isAdmin(ctx)) {
+      await answerCallback(ctx, "Not authorized.");
+      return;
+    }
+
+    await answerCallback(ctx, "Processing rejection...");
+
+    await rejectUser(ctx.match[1], String(ctx.from.id));
+
+    await ctx.reply(
+      "❌ VERIFICATION REJECTED\n\nThe user's verification request has been rejected."
     );
+  } catch (error) {
+    console.error("Reject verification failed:", error?.message);
+    await ctx.reply("⚠️ Unable to reject this user.");
   }
-});// ============================================================
-// APPROVE VERIFICATION
-// ============================================================
-
-bot.action(
-  /^approve_verification:(.+)$/,
-  async (ctx) => {
-    try {
-      if (!isAdmin(ctx)) {
-        await ctx.answerCbQuery("Not authorized.");
-        return;
-      }
-
-      await ctx.answerCbQuery("Approving user...");
-
-      const userId = ctx.match[1];
-
-      const result = await approveUser(
-        userId,
-        ctx.from.id
-      );
-
-      if (result.alreadyApproved) {
-        await ctx.reply(
-          `ℹ️ *USER ALREADY VERIFIED*\n\n` +
-          `Current balance:\n` +
-          `⏱️ *${result.minutes} minutes*`,
-          {
-            parse_mode: "Markdown",
-          }
-        );
-
-        return;
-      }
-
-      await ctx.reply(
-        `✅ *USER VERIFIED*\n\n` +
-        `The user has been approved.\n\n` +
-        `🎉 *5 free minutes added.*\n\n` +
-        `New balance:\n` +
-        `⏱️ *${result.minutes} minutes*`,
-        {
-          parse_mode: "Markdown",
-        }
-      );
-    } catch (error) {
-      console.error("Approve verification error:", error);
-
-      await ctx.reply(
-        "⚠️ Unable to approve this user."
-      );
-    }
-  }
-);
+});
 
 // ============================================================
-// REJECT VERIFICATION
+// HOST: START APPLICATION
 // ============================================================
-
-bot.action(
-  /^reject_verification:(.+)$/,
-  async (ctx) => {
-    try {
-      if (!isAdmin(ctx)) {
-        await ctx.answerCbQuery("Not authorized.");
-        return;
-      }
-
-      await ctx.answerCbQuery("Rejecting user...");
-
-      const userId = ctx.match[1];
-
-      await rejectUser(userId, ctx.from.id);
-
-      await ctx.reply(
-        `❌ *VERIFICATION REJECTED*\n\n` +
-        `The user's verification request has been rejected.`,
-        {
-          parse_mode: "Markdown",
-        }
-      );
-    } catch (error) {
-      console.error("Reject verification error:", error);
-
-      await ctx.reply(
-        "⚠️ Unable to reject this user."
-      );
-    }
-  }
-);
-
-
-/* HOST APPLICATION COMMAND */
 
 bot.command("host", async (ctx) => {
-  const args = (ctx.message.text || "")
+  const args = (ctx.message?.text || "")
     .trim()
     .split(/\s+/)
     .slice(1);
 
   if (args.length !== 1 || args[0].toLowerCase() !== "application") {
-    await ctx.reply("Use this command to apply:\n\n/host application");
+    await ctx.reply("To apply to become a host, use:\n\n/host application");
     return;
   }
 
@@ -798,40 +792,41 @@ bot.command("host", async (ctx) => {
     }
 
     if (result.status === "pending") {
-      await ctx.reply("⏳ Your host application is already awaiting admin approval.");
+      await ctx.reply(
+        "⏳ Your host application is already awaiting administrator approval."
+      );
       return;
     }
 
     await ctx.reply(
       "🎤 SA LIVE HOST APPLICATION\n\n" +
-      "Please send the email address you will use for your SA LIVE Firebase website account.\n\n" +
-      "Do not send your password here. After submitting your email, create your account through the website signup page.\n\n" +
-      "Your host access will remain pending until an administrator approves your application."
+        "Please send the email address you will use for your SA LIVE website account.\n\n" +
+        "Do not send your password here. Create your account through the website signup page.\n\n" +
+        "Host access remains pending until an administrator approves your application."
     );
   } catch (error) {
-    console.error("Start host application error:", error);
+    console.error("Start host application failed:", error?.message);
     await ctx.reply("Unable to start your application right now. Please try again.");
   }
 });
 
-/* COLLECT THE APPLICANT'S EMAIL */
+// ============================================================
+// HOST: COLLECT APPLICATION EMAIL
+// ============================================================
 
 bot.on("text", async (ctx, next) => {
   const text = ctx.message?.text?.trim() || "";
 
-  // Don't intercept commands.
-  if (text.startsWith("/")) {
+  // Commands must be handled by their dedicated handlers.
+  if (!text || text.startsWith("/")) {
     return next();
   }
 
   try {
-    const result = await submitHostApplicationEmail(
-      ctx.from.id,
-      text
-    );
+    const result = await submitHostApplicationEmail(ctx.from.id, text);
 
     if (result.status === "already_host") {
-      await ctx.reply("✅ This Firebase account already has host access.");
+      await ctx.reply("✅ This account already has host access.");
       return;
     }
 
@@ -841,28 +836,31 @@ bot.on("text", async (ctx, next) => {
     }
 
     const signupMessage = result.firebaseAccountExists
-      ? "Your Firebase account already exists. Make sure you can sign in to the website using this email."
-      : "Please create your Firebase account on the SA LIVE website using this email and choose your password there.";
+      ? "Your Firebase account already exists. Make sure you can sign in to the website with this email."
+      : "Create your Firebase account on the SA LIVE website using this email and choose your password there.";
 
     await ctx.reply(
       "✅ HOST APPLICATION SUBMITTED\n\n" +
-      `Email: ${result.email}\n\n` +
-      `${signupMessage}\n\n` +
-      "⏳ Your application is pending admin approval. Host access will only be enabled after approval."
+        `Email: ${cleanText(result.email, 254)}\n\n` +
+        `${signupMessage}\n\n` +
+        "⏳ Your application is pending administrator approval. Host access will only be enabled after approval."
     );
   } catch (error) {
-    if (error.message === "Please start with /host application first.") {
+    if (error?.message === "Please start with /host application first.") {
       return next();
     }
 
-    console.error("Host application email error:", error);
+    console.error("Host application email submission failed:", error?.message);
+
     await ctx.reply(
       "That email could not be submitted. Please enter a valid email address, or start again with /host application."
     );
   }
 });
 
-/* ADMIN: REVIEW PENDING HOST APPLICATIONS */
+// ============================================================
+// ADMIN: VIEW PENDING HOST APPLICATIONS
+// ============================================================
 
 bot.command("host_pending", async (ctx) => {
   if (!isAdmin(ctx)) {
@@ -873,7 +871,7 @@ bot.command("host_pending", async (ctx) => {
   try {
     const pending = await getPendingHostApplications();
 
-    if (pending.length === 0) {
+    if (!Array.isArray(pending) || pending.length === 0) {
       await ctx.reply("✅ There are no pending host applications.");
       return;
     }
@@ -881,78 +879,104 @@ bot.command("host_pending", async (ctx) => {
     await ctx.reply(`🎤 Pending host applications: ${pending.length}`);
 
     for (const application of pending) {
+      if (!validDocumentId(String(application.id ?? ""))) {
+        console.warn("Skipping host application with invalid document ID.");
+        continue;
+      }
+
       await ctx.reply(
-        `HOST APPLICATION\n\n` +
-        `Name: ${application.firstName || ""} ${application.lastName || ""}\n` +
-        `Email: ${application.email}\n` +
-        `Telegram: ${application.telegramUsername ? "@" + application.telegramUsername : "Not set"}\n` +
-        `Status: Pending`,
+        "HOST APPLICATION\n\n" +
+          `Name: ${cleanText(
+            `${application.firstName || ""} ${application.lastName || ""}`,
+            120
+          )}\n` +
+          `Email: ${cleanText(application.email || "", 254)}\n` +
+          `Telegram: ${
+            application.telegramUsername
+              ? `@${cleanText(application.telegramUsername, 64)}`
+              : "Not set"
+          }\n` +
+          "Status: Pending",
         {
           reply_markup: {
-            inline_keyboard: [[
-              {
-                text: "✅ Approve",
-                callback_data: `approve_host:${application.id}`,
-              },
-              {
-                text: "❌ Reject",
-                callback_data: `reject_host:${application.id}`,
-              },
-            ]],
+            inline_keyboard: [
+              [
+                {
+                  text: "✅ Approve",
+                  callback_data: `approve_host:${application.id}`,
+                },
+                {
+                  text: "❌ Reject",
+                  callback_data: `reject_host:${application.id}`,
+                },
+              ],
+            ],
           },
         }
       );
     }
   } catch (error) {
-    console.error("Pending host applications error:", error);
+    console.error("Pending host applications failed:", error?.message);
     await ctx.reply("Unable to load pending host applications.");
   }
 });
 
-/* ADMIN: APPROVE HOST */
+// ============================================================
+// ADMIN: APPROVE HOST APPLICATION
+// ============================================================
 
-bot.action(/^approve_host:(.+)$/, async (ctx) => {
+bot.action(/^approve_host:([A-Za-z0-9_-]{1,128})$/, async (ctx) => {
   if (!isAdmin(ctx)) {
-    await ctx.answerCbQuery("Not authorized.");
+    await answerCallback(ctx, "Not authorized.");
     return;
   }
 
   try {
-    await ctx.answerCbQuery("Approving host...");
-    const result = await approveHostApplication(ctx.match[1], ctx.from.id);
+    await answerCallback(ctx, "Processing host approval...");
+
+    const result = await approveHostApplication(
+      ctx.match[1],
+      String(ctx.from.id)
+    );
 
     await ctx.reply(
-      `✅ HOST APPROVED\n\n` +
-      `Email: ${result.email}\n\n` +
-      "Host access has been assigned. The host must sign out and sign in again to refresh their Firebase token."
+      "✅ HOST APPROVED\n\n" +
+        `Email: ${cleanText(result.email || "", 254)}\n\n` +
+        "Host access has been assigned. The host may need to sign out and sign in again to refresh their Firebase token."
     );
   } catch (error) {
-    console.error("Approve host error:", error);
+    console.error("Approve host application failed:", error?.message);
     await ctx.reply(
-      "⚠️ Approval failed. Confirm that the applicant has created their Firebase account with the submitted email, then try again."
+      "⚠️ Host approval failed. Confirm that the applicant has created their Firebase account with the submitted email, then try again."
     );
   }
 });
 
-/* ADMIN: REJECT HOST */
+// ============================================================
+// ADMIN: REJECT HOST APPLICATION
+// ============================================================
 
-bot.action(/^reject_host:(.+)$/, async (ctx) => {
+bot.action(/^reject_host:([A-Za-z0-9_-]{1,128})$/, async (ctx) => {
   if (!isAdmin(ctx)) {
-    await ctx.answerCbQuery("Not authorized.");
+    await answerCallback(ctx, "Not authorized.");
     return;
   }
 
   try {
-    await ctx.answerCbQuery("Rejecting application...");
-    await rejectHostApplication(ctx.match[1], ctx.from.id);
+    await answerCallback(ctx, "Processing rejection...");
+
+    await rejectHostApplication(ctx.match[1], String(ctx.from.id));
+
     await ctx.reply("❌ The host application has been rejected.");
   } catch (error) {
-    console.error("Reject host error:", error);
+    console.error("Reject host application failed:", error?.message);
     await ctx.reply("Unable to reject this application.");
   }
 });
 
-/* APPLICANT: CHECK APPLICATION STATUS */
+// ============================================================
+// HOST: CHECK APPLICATION STATUS
+// ============================================================
 
 bot.command("hoststatus", async (ctx) => {
   try {
@@ -964,22 +988,21 @@ bot.command("hoststatus", async (ctx) => {
     }
 
     const labels = {
-      pending: "⏳ Pending admin approval",
+      pending: "⏳ Pending administrator approval",
       approved: "✅ Approved",
       rejected: "❌ Rejected",
     };
 
     await ctx.reply(
-      `HOST APPLICATION STATUS\n\n` +
-      `Status: ${labels[result.status] || result.status}\n` +
-      `Email: ${result.email || "Not provided"}`
+      "HOST APPLICATION STATUS\n\n" +
+        `Status: ${labels[result.status] || "Unknown"}\n` +
+        `Email: ${cleanText(result.email || "Not provided", 254)}`
     );
   } catch (error) {
-    console.error("Host status error:", error);
+    console.error("Host application status failed:", error?.message);
     await ctx.reply("Unable to check your host application status right now.");
   }
 });
-
 
 // ============================================================
 // UNKNOWN TEXT MESSAGE
@@ -993,27 +1016,21 @@ bot.on("text", async (ctx) => {
       return;
     }
 
-    if (
-      text === "hi" ||
-      text === "hello" ||
-      text === "hey" ||
-      text === "start" ||
-      text === "begin"
-    ) {
+    if (/^(hi|hello|hey|start|begin)$/i.test(text)) {
       return;
     }
 
     await ctx.reply(
-      `🟢 *SA LIVE*\n\n` +
-      `I didn't recognise that command.\n\n` +
-      `Use the buttons below to continue.`,
+      "🟢 *SA LIVE*\n\n" +
+        "I didn't recognise that message.\n\n" +
+        "Use the buttons below to continue.",
       {
         parse_mode: "Markdown",
         ...mainMenu(),
       }
     );
   } catch (error) {
-    console.error("Unknown text handler error:", error);
+    console.error("Unknown text handler failed:", error?.message);
   }
 });
 
@@ -1021,20 +1038,23 @@ bot.on("text", async (ctx) => {
 // PAYMENT HANDLERS
 // ============================================================
 
+// Keep payment commands and callbacks registered through the existing
+// payment module. Payment validation and crediting must happen server-side.
 registerPaymentHandlers(bot);
 
 // ============================================================
 // TELEGRAM ERROR HANDLER
 // ============================================================
 
-bot.catch((error) => {
-  console.error("Telegram bot error:", error);
+bot.catch((error, ctx) => {
+  console.error("Telegram bot handler error:", {
+    updateType: ctx?.updateType || "unknown",
+    message: error?.message || "Unknown Telegram error",
+  });
 });
 
 // ============================================================
-// EXPORT BOT
+// EXPORT
 // ============================================================
 
-export {
-  bot,
-};
+export { bot };

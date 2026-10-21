@@ -1,113 +1,243 @@
+// ============================================================
+// SA LIVE — AUTHENTICATION & AUTHORIZATION MIDDLEWARE
+// ============================================================
+// Firebase Admin SDK
+// Express ES modules
+//
+// Exports:
+//   verifyFirebaseToken
+//   requireAdmin
+//   requireHost
+// ============================================================
 
 import { getAuth } from "firebase-admin/auth";
 import { db } from "../config/firebase.js";
 
+// ============================================================
+// STANDARD ERROR RESPONSE
+// ============================================================
+
+function sendError(res, status, message) {
+  return res.status(status).json({
+    success: false,
+    message,
+  });
+}
+
+// ============================================================
+// VERIFY FIREBASE ID TOKEN
+// ============================================================
+
 export async function verifyFirebaseToken(req, res, next) {
   try {
-    const authorization = req.headers.authorization || "";
-    const [scheme, token] = authorization.split(" ");
+    const authorization = req.get("authorization");
 
-    if (scheme !== "Bearer" || !token) {
-      return res.status(401).json({
-        success: false,
-        message: "Authentication required.",
-      });
+    if (
+      typeof authorization !== "string" ||
+      authorization.length > 10000
+    ) {
+      return sendError(
+        res,
+        401,
+        "Authentication required."
+      );
     }
 
-    const decodedToken = await getAuth().verifyIdToken(token);
+    const match = /^Bearer\s+(\S+)$/i.exec(
+      authorization.trim()
+    );
 
-    req.user = {
+    if (!match) {
+      return sendError(
+        res,
+        401,
+        "Authentication required."
+      );
+    }
+
+    const token = match[1];
+
+    // Verify the token signature, issuer, audience and expiry.
+    // Also check Firebase revocation status.
+    const decodedToken = await getAuth().verifyIdToken(
+      token,
+      true
+    );
+
+    if (
+      !decodedToken.uid ||
+      typeof decodedToken.uid !== "string"
+    ) {
+      return sendError(
+        res,
+        401,
+        "Invalid authentication token."
+      );
+    }
+
+    req.user = Object.freeze({
       uid: decodedToken.uid,
-      email: decodedToken.email || null,
-    };
-
-    next();
-  } catch (error) {
-    console.error("Authentication failed:", error.message);
-
-    return res.status(401).json({
-      success: false,
-      message: "Invalid or expired authentication token.",
+      email:
+        typeof decodedToken.email === "string"
+          ? decodedToken.email
+          : null,
+      emailVerified:
+        decodedToken.email_verified === true,
     });
+
+    return next();
+  } catch (error) {
+    // Do not log the token or authorization header.
+    // Invalid, expired and revoked tokens are unauthorized.
+    if (
+      error?.code === "auth/id-token-expired" ||
+      error?.code === "auth/id-token-revoked" ||
+      error?.code === "auth/invalid-id-token" ||
+      error?.code === "auth/argument-error"
+    ) {
+      return sendError(
+        res,
+        401,
+        "Invalid or expired authentication token."
+      );
+    }
+
+    console.error(
+      "Firebase authentication verification failed:",
+      error?.code || "UNKNOWN_ERROR"
+    );
+
+    return sendError(
+      res,
+      503,
+      "Authentication service is temporarily unavailable."
+    );
   }
 }
+
+// ============================================================
+// REQUIRE ACTIVE ADMINISTRATOR
+// ============================================================
 
 export async function requireAdmin(req, res, next) {
   try {
-    if (!req.user?.uid) {
-      return res.status(401).json({
-        success: false,
-        message: "Authentication required.",
-      });
+    const uid = req.user?.uid;
+
+    if (!uid) {
+      return sendError(
+        res,
+        401,
+        "Authentication required."
+      );
     }
 
-    const adminDoc = await db
+    const adminSnapshot = await db
       .collection("admins")
-      .doc(req.user.uid)
+      .doc(uid)
       .get();
 
-    if (!adminDoc.exists || adminDoc.data()?.active !== true) {
-      return res.status(403).json({
-        success: false,
-        message: "Administrator access denied.",
-      });
+    if (
+      !adminSnapshot.exists ||
+      adminSnapshot.data()?.active !== true
+    ) {
+      return sendError(
+        res,
+        403,
+        "Administrator access denied."
+      );
     }
 
-    req.admin = {
-      uid: req.user.uid,
-    };
-
-    next();
-  } catch (error) {
-    console.error("Admin authorization failed:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Unable to verify administrator access.",
+    req.admin = Object.freeze({
+      uid,
     });
+
+    return next();
+  } catch (error) {
+    console.error(
+      "Administrator authorization failed:",
+      error?.code || "UNKNOWN_ERROR"
+    );
+
+    return sendError(
+      res,
+      503,
+      "Administrator authorization is temporarily unavailable."
+    );
   }
 }
 
+// ============================================================
+// REQUIRE ACTIVE HOST
+// ============================================================
+
 export async function requireHost(req, res, next) {
   try {
-    if (!req.user?.uid) {
-      return res.status(401).json({
-        success: false,
-        message: "Authentication required.",
-      });
+    const uid = req.user?.uid;
+
+    if (!uid) {
+      return sendError(
+        res,
+        401,
+        "Authentication required."
+      );
     }
 
-    const snapshot = await db
+    const hostSnapshot = await db
       .collection("hosts")
-      .where("firebaseUid", "==", req.user.uid)
-      .limit(1)
+      .where("firebaseUid", "==", uid)
+      .limit(2)
       .get();
 
-    if (snapshot.empty) {
-      return res.status(403).json({
-        success: false,
-        message: "No host account is linked to this user.",
-      });
+    if (hostSnapshot.empty) {
+      return sendError(
+        res,
+        403,
+        "No host account is linked to this user."
+      );
     }
 
-    const doc = snapshot.docs[0];
-    const host = { id: doc.id, ...doc.data() };
+    // Multiple records for one Firebase UID indicate
+    // inconsistent host-account data. Fail closed.
+    if (hostSnapshot.size !== 1) {
+      console.error(
+        "Host authorization failed: duplicate host records."
+      );
 
-    if (host.status !== "active") {
-      return res.status(403).json({
-        success: false,
-        message: "Your host account is not active.",
-      });
+      return sendError(
+        res,
+        403,
+        "Host account requires administrator review."
+      );
     }
 
-    req.host = host;
-    next();
-  } catch (error) {
-    console.error("Host authorization failed:", error);
+    const hostDoc = hostSnapshot.docs[0];
+    const hostData = hostDoc.data();
 
-    return res.status(500).json({
-      success: false,
-      message: "Unable to verify host access.",
+    if (hostData.status !== "active") {
+      return sendError(
+        res,
+        403,
+        "Your host account is not active."
+      );
+    }
+
+    // Return only server-loaded host data.
+    req.host = Object.freeze({
+      ...hostData,
+      id: hostDoc.id,
     });
+
+    return next();
+  } catch (error) {
+    console.error(
+      "Host authorization failed:",
+      error?.code || "UNKNOWN_ERROR"
+    );
+
+    return sendError(
+      res,
+      503,
+      "Host authorization is temporarily unavailable."
+    );
   }
 }

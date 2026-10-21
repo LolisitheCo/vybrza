@@ -1,78 +1,147 @@
 
-import { Markup } from "telegraf";
-import crypto from "node:crypto";
-
 import {
-  getOrCreateUser,
-  updateUserPaymentEmail,
-  setPendingPaymentPackage,
-  clearPendingPayment,
-} from "../services/userService.js";
+  Markup,
+} from "telegraf";
 
 import {
   getPaymentPackage,
-  createPaymentRecord,
 } from "../services/paymentService.js";
 
 import {
   initializePayfastTransaction,
 } from "../services/payfastService.js";
 
+import {
+  getOrCreateUser,
+} from "../services/userService.js";
+
 // ============================================================
-// EMAIL VALIDATION
+// SA LIVE PAYMENT BOT
+// PayFast integration
 // ============================================================
 
-function isValidEmail(email) {
-  return (
-    typeof email === "string" &&
-    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
-  );
+const PAYMENT_PACKAGES = [
+  "starter",
+  "ten_minutes",
+  "thirty_minutes",
+  "sixty_minutes",
+  "three_hour",
+];
+
+const MAX_URL_LENGTH = 2048;
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function getPublicFrontendUrl() {
+  const value = process.env.FRONTEND_URL;
+
+  if (!value) {
+    throw new Error("FRONTEND_URL is not configured.");
+  }
+
+  let url;
+
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("FRONTEND_URL is invalid.");
+  }
+
+  if (
+    url.protocol !== "https:" &&
+    url.hostname !== "localhost"
+  ) {
+    throw new Error(
+      "FRONTEND_URL must use HTTPS in production."
+    );
+  }
+
+  return url.origin;
 }
 
-// ============================================================
-// PACKAGE MENU
-// Package IDs must match paymentService.js exactly.
-// ============================================================
+function getSafePaymentUrl(value) {
+  if (
+    typeof value !== "string" ||
+    value.length > MAX_URL_LENGTH
+  ) {
+    throw new Error("Payment URL is invalid.");
+  }
 
-function buyMinutesMenu() {
+  let url;
+
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("Payment URL is invalid.");
+  }
+
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password
+  ) {
+    throw new Error(
+      "Payment provider URL is not secure."
+    );
+  }
+
+  const allowedHosts = new Set([
+    "www.payfast.co.za",
+    "sandbox.payfast.co.za",
+  ]);
+
+  if (!allowedHosts.has(url.hostname)) {
+    throw new Error(
+      "Payment URL is not an approved PayFast destination."
+    );
+  }
+
+  return url.toString();
+}
+
+function getPackageKeyboard() {
+  const labels = {
+    starter: "⏱️ 5 Minutes — R30",
+    ten_minutes: "⏱️ 10 Minutes — R60",
+    thirty_minutes: "⏱️ 30 Minutes — R180",
+    sixty_minutes: "⏱️ 60 Minutes — R360",
+    three_hour: "⏱️ 3 Hours — R1,080",
+  };
+
   return Markup.inlineKeyboard([
+    ...PAYMENT_PACKAGES.map((packageId) => [
+      Markup.button.callback(
+        labels[packageId],
+        `buy_minutes:${packageId}`
+      ),
+    ]),
     [
       Markup.button.callback(
-        "R30 — 5 Minutes",
-        "buy_package:starter"
+        "🔄 Refresh Balance",
+        "payment_balance"
       ),
     ],
     [
       Markup.button.callback(
-        "R60 — 10 Minutes",
-        "buy_package:ten_minutes"
-      ),
-    ],
-    [
-      Markup.button.callback(
-        "R180 — 30 Minutes",
-        "buy_package:thirty_minutes"
-      ),
-    ],
-    [
-      Markup.button.callback(
-        "R360 — 60 Minutes",
-        "buy_package:sixty_minutes"
-      ),
-    ],
-    [
-      Markup.button.callback(
-        "R1080 — 3 Hours",
-        "buy_package:three_hour"
-      ),
-    ],
-    [
-      Markup.button.callback(
-        "⬅️ Back",
-        "back_to_main"
+        "⬅️ Main Menu",
+        "payment_main_menu"
       ),
     ],
   ]);
+}
+
+function formatPackage(paymentPackage) {
+  return (
+    `💳 *SA LIVE — BUY MINUTES*\n\n` +
+    `📦 Package: *${paymentPackage.name}*\n` +
+    `💵 Price: *R${paymentPackage.amount.toFixed(2)}*\n` +
+    `⏱️ Minutes: *${paymentPackage.minutes}*\n\n` +
+    `🔐 Payments are processed securely through PayFast.\n\n` +
+    `Your minutes are credited only after the backend verifies the payment.\n\n` +
+    `_SA LIVE — More than just a call._`
+  );
 }
 
 // ============================================================
@@ -80,302 +149,304 @@ function buyMinutesMenu() {
 // ============================================================
 
 export function registerPaymentHandlers(bot) {
+  if (!bot || typeof bot.action !== "function") {
+    throw new Error(
+      "A valid Telegraf bot instance is required."
+    );
+  }
+
   // ----------------------------------------------------------
-  // BUY MINUTES
+  // OPEN PACKAGE MENU
   // ----------------------------------------------------------
 
   bot.action("buy_minutes", async (ctx) => {
     try {
       await ctx.answerCbQuery();
 
-      await getOrCreateUser(String(ctx.from.id));
-
       await ctx.reply(
-        "💳 Buy SA LIVE Minutes\n\n" +
-        "Choose a package:\n\n" +
-        "🟢 R30 — 5 minutes\n" +
-        "🟢 R60 — 10 minutes\n" +
-        "🟢 R180 — 30 minutes\n" +
-        "🟢 R360 — 60 minutes\n" +
-        "🟢 R1080 — 3 hours",
-        buyMinutesMenu()
+        "💳 *SA LIVE — BUY MINUTES*\n\n" +
+        "Choose a package below.\n\n" +
+        "💵 R6 per minute\n" +
+        "🔐 Payments powered by PayFast",
+        {
+          parse_mode: "Markdown",
+          ...getPackageKeyboard(),
+        }
       );
     } catch (error) {
-      console.error("Buy minutes error:", error);
+      console.error(
+        "Open payment menu failed:",
+        error.message
+      );
 
       await ctx.reply(
-        "Unable to open the payment menu. Please try again."
+        "Unable to open the payment menu right now. Please try again."
       );
     }
   });
 
   // ----------------------------------------------------------
-  // SELECT PACKAGE
+  // SELECT PACKAGE AND INITIALIZE PAYMENT
   // ----------------------------------------------------------
 
-  bot.action(/^buy_package:(.+)$/, async (ctx) => {
+  bot.action(
+    /^buy_minutes:(starter|ten_minutes|thirty_minutes|sixty_minutes|three_hour)$/,
+    async (ctx) => {
+      let callbackAnswered = false;
+
+      try {
+        await ctx.answerCbQuery(
+          "Preparing your secure payment..."
+        );
+
+        callbackAnswered = true;
+
+        const telegramId = String(ctx.from.id);
+
+        const user = await getOrCreateUser(
+          telegramId
+        );
+
+        if (
+          !user ||
+          typeof user.id !== "string" ||
+          user.id !== telegramId
+        ) {
+          throw new Error(
+            "Unable to identify your SA LIVE account."
+          );
+        }
+
+        if (
+          user.verificationStatus !== "approved"
+        ) {
+          await ctx.reply(
+            "🛡️ *VERIFICATION REQUIRED*\n\n" +
+            "Your account must be approved before you can purchase and use SA LIVE minutes.",
+            {
+              parse_mode: "Markdown",
+            }
+          );
+
+          return;
+        }
+
+        const packageId = ctx.match[1];
+
+        if (!PAYMENT_PACKAGES.includes(packageId)) {
+          await ctx.reply(
+            "That payment package is unavailable. Please select another."
+          );
+
+          return;
+        }
+
+        const paymentPackage =
+          getPaymentPackage(packageId);
+
+        if (!paymentPackage) {
+          throw new Error(
+            "Selected payment package was not found."
+          );
+        }
+
+        const frontendUrl =
+          getPublicFrontendUrl();
+
+        /*
+         * IMPORTANT:
+         * This function must create a pending payment
+         * server-side before redirecting the customer.
+         *
+         * Do not trust the browser return URL to credit
+         * minutes. Only verified PayFast ITNs may do that.
+         */
+
+        const transaction =
+          await initializePayfastTransaction({
+            userId: user.id,
+            packageId: paymentPackage.id,
+            email: user.email || undefined,
+          });
+
+        if (
+          !transaction ||
+          typeof transaction !== "object"
+        ) {
+          throw new Error(
+            "PayFast did not return a valid transaction."
+          );
+        }
+
+        /*
+         * Supports the common result names used by payment
+         * services. Confirm the actual return shape of your
+         * payfastService.js before deploying.
+         */
+
+        const rawPaymentUrl =
+          transaction.paymentUrl ||
+          transaction.redirectUrl ||
+          transaction.checkoutUrl ||
+          transaction.url;
+
+        const paymentUrl =
+          getSafePaymentUrl(rawPaymentUrl);
+
+        const reference =
+          transaction.reference ||
+          transaction.paymentReference ||
+          transaction.m_payment_id;
+
+        if (
+          typeof reference !== "string" ||
+          reference.trim().length === 0
+        ) {
+          throw new Error(
+            "Payment reference is missing."
+          );
+        }
+
+        const message =
+          formatPackage(paymentPackage) +
+          `\n\n🧾 Reference: \`${reference}\`\n\n` +
+          `Select the button below to continue to PayFast.`;
+
+        await ctx.reply(
+          message,
+          {
+            parse_mode: "Markdown",
+            ...Markup.inlineKeyboard([
+              [
+                Markup.button.url(
+                  "🔐 Pay securely with PayFast",
+                  paymentUrl
+                ),
+              ],
+              [
+                Markup.button.callback(
+                  "💳 Other Packages",
+                  "buy_minutes"
+                ),
+              ],
+              [
+                Markup.button.callback(
+                  "⬅️ Main Menu",
+                  "payment_main_menu"
+                ),
+              ],
+            ]),
+          }
+        );
+      } catch (error) {
+        console.error(
+          "Initialize payment failed:",
+          error.message
+        );
+
+        if (!callbackAnswered) {
+          try {
+            await ctx.answerCbQuery(
+              "Unable to prepare payment."
+            );
+          } catch {
+            // Telegram callback may have expired.
+          }
+        }
+
+        await ctx.reply(
+          "❌ *PAYMENT SETUP FAILED*\n\n" +
+          "We couldn't prepare your payment. No minutes have been added.\n\n" +
+          "Please try again later. If money was deducted, contact SA LIVE support before retrying.",
+          {
+            parse_mode: "Markdown",
+          }
+        );
+      }
+    }
+  );
+
+  // ----------------------------------------------------------
+  // REFRESH BALANCE
+  // ----------------------------------------------------------
+
+  bot.action("payment_balance", async (ctx) => {
     try {
       await ctx.answerCbQuery();
-
-      const packageId = ctx.match[1];
-      const paymentPackage = getPaymentPackage(packageId);
-
-      if (!paymentPackage) {
-        await ctx.reply(
-          "This package is unavailable. Please reopen Buy Minutes."
-        );
-        return;
-      }
 
       const user = await getOrCreateUser(
         String(ctx.from.id)
       );
 
-      await setPendingPaymentPackage(
-        user.id,
-        packageId
-      );
+      const minutes = Number(user.minutes ?? 0);
 
-      if (user.paymentEmail && isValidEmail(user.paymentEmail)) {
-        await createCheckout(
-          ctx,
-          user,
-          user.paymentEmail,
-          paymentPackage
+      if (
+        !Number.isSafeInteger(minutes) ||
+        minutes < 0
+      ) {
+        throw new Error(
+          "Stored minute balance is invalid."
         );
-        return;
       }
 
       await ctx.reply(
-        "📧 EMAIL REQUIRED\n\n" +
-        "Enter your email using this command:\n\n" +
-        "/email your@gmail.com\n\n" +
-        `Selected package: ${paymentPackage.name}\n` +
-        `Price: R${paymentPackage.amount}\n` +
-        `Minutes: ${paymentPackage.minutes}\n\n` +
-        "Your email will be used for your PayFast payment."
+        "💰 *SA LIVE BALANCE*\n\n" +
+        `⏱️ Available minutes: *${minutes}*\n\n` +
+        "Purchase a package when you need more time.",
+        {
+          parse_mode: "Markdown",
+          ...getPackageKeyboard(),
+        }
       );
     } catch (error) {
-      console.error("Package selection error:", error);
+      console.error(
+        "Payment balance failed:",
+        error.message
+      );
 
       await ctx.reply(
-        "Unable to select this package. Please try again."
+        "Unable to retrieve your balance right now."
       );
     }
   });
 
   // ----------------------------------------------------------
-  // EMAIL COMMAND
-  // IMPORTANT: Register this command before the general
-  // bot.on("text") unknown-message handler in bot.js.
+  // RETURN TO MAIN MENU
   // ----------------------------------------------------------
 
-  bot.command("email", async (ctx) => {
+  bot.action("payment_main_menu", async (ctx) => {
     try {
-      const telegramId = String(ctx.from.id);
-
-      // Handles "/email address@example.com" and commands
-      // sent with a Telegram bot username suffix.
-      const messageText = ctx.message?.text || "";
-      const email = messageText
-        .replace(/^\/email(?:@\w+)?\s*/i, "")
-        .trim()
-        .toLowerCase();
-
-      if (!isValidEmail(email)) {
-        await ctx.reply(
-          "📧 Please enter a valid email address.\n\n" +
-          "Example:\n" +
-          "/email your@gmail.com"
-        );
-        return;
-      }
-
-      const user = await getOrCreateUser(telegramId);
-
-      await updateUserPaymentEmail(user.id, email);
-
-      // Reload the user so we use the actual saved fields.
-      const updatedUser = await getOrCreateUser(telegramId);
-
-      const pendingPackageId =
-        updatedUser.pendingPaymentPackageId ??
-        updatedUser.pendingPaymentPackage ??
-        null;
-
-      if (!pendingPackageId) {
-        await ctx.reply(
-          "✅ Your payment email has been saved.\n\n" +
-          "Now select Buy Minutes and choose a package."
-        );
-        return;
-      }
-
-      const paymentPackage = getPaymentPackage(
-        pendingPackageId
-      );
-
-      if (!paymentPackage) {
-        await clearPendingPayment(updatedUser.id);
-
-        await ctx.reply(
-          "Your email was saved, but that package is no longer available.\n\n" +
-          "Please select Buy Minutes and choose a package again."
-        );
-        return;
-      }
+      await ctx.answerCbQuery();
 
       await ctx.reply(
-        "✅ Email saved.\nPreparing your secure PayFast checkout..."
-      );
-
-      await createCheckout(
-        ctx,
-        updatedUser,
-        email,
-        paymentPackage
+        "🟢 *SA LIVE*\n\n" +
+        "*MEET • TALK • CONNECT*\n\n" +
+        "Choose an option below to continue.",
+        {
+          parse_mode: "Markdown",
+          reply_markup: {
+            inline_keyboard: [
+              [
+                Markup.button.callback(
+                  "💳 Buy Minutes",
+                  "buy_minutes"
+                ),
+              ],
+              [
+                Markup.button.callback(
+                  "💰 My Balance",
+                  "payment_balance"
+                ),
+              ],
+            ],
+          },
+        }
       );
     } catch (error) {
-      console.error("Email command error:", error);
-
-      await ctx.reply(
-        "Unable to process your email or create checkout.\n\n" +
-        "Please try Buy Minutes again."
+      console.error(
+        "Return to payment menu failed:",
+        error.message
       );
     }
   });
-}
-
-// ============================================================
-// CREATE PAYFAST CHECKOUT
-// ============================================================
-
-async function createCheckout(
-  ctx,
-  user,
-  email,
-  paymentPackage
-) {
-  let reference;
-
-  try {
-    if (!user?.id || !paymentPackage?.id) {
-      throw new Error("User or package information is missing.");
-    }
-
-    if (!isValidEmail(email)) {
-      throw new Error("Invalid payment email.");
-    }
-
-    reference =
-      `SALIVE-${crypto.randomUUID().replace(/-/g, "").toUpperCase()}`;
-
-    // Create the pending payment record before checkout.
-    await createPaymentRecord({
-      userId: user.id,
-      reference,
-      packageId: paymentPackage.id,
-      email: email.trim().toLowerCase(),
-    });
-
-    // Initialise PayFast using the existing service.
-    const checkout = await initializePayfastTransaction({
-      email: email.trim().toLowerCase(),
-      amount: paymentPackage.amount,
-      reference,
-      metadata: {
-        custom_str1: paymentPackage.id,
-      },
-    });
-
-    if (
-      !checkout?.paymentUrl ||
-      !checkout?.fields ||
-      typeof checkout.fields !== "object"
-    ) {
-      throw new Error("PayFast returned incomplete checkout details.");
-    }
-
-    // Save/clear the pending selection after checkout is created.
-    await clearPendingPayment(user.id);
-
-    // Build a form that POSTs the signed fields to PayFast.
-    // The payment URL is the PayFast hosted checkout endpoint.
-    const formFields = Object.entries(checkout.fields)
-      .map(([key, value]) => {
-        const safeKey = escapeHtml(key);
-        const safeValue = escapeHtml(value);
-
-        return (
-          `<input type="hidden" name="${safeKey}" ` +
-          `value="${safeValue}">`
-        );
-      })
-      .join("\n");
-
-    const html =
-      "<!doctype html>" +
-      '<html lang="en"><head><meta charset="utf-8">' +
-      '<meta name="viewport" content="width=device-width, initial-scale=1">' +
-      "<title>SA LIVE PayFast Checkout</title></head>" +
-      '<body style="background:#020617;color:#fff;font-family:Arial,sans-serif;' +
-      "display:grid;place-items:center;min-height:100vh;margin:0;padding:24px\">" +
-      '<main style="max-width:420px;text-align:center;background:#0f172a;' +
-      'padding:28px;border-radius:16px">' +
-      '<h2 style="color:#4ade80">SA LIVE Payment</h2>' +
-      `<p>Package: ${escapeHtml(paymentPackage.name)}</p>` +
-      `<p>Amount: R${escapeHtml(paymentPackage.amount)}</p>` +
-      `<p>Minutes: ${escapeHtml(paymentPackage.minutes)}</p>` +
-      `<form id="payfast-form" method="POST" action="${escapeHtml(checkout.paymentUrl)}">` +
-      formFields +
-      '<button type="submit" style="padding:14px 22px;background:#4ade80;' +
-      'border:0;border-radius:8px;font-weight:bold;cursor:pointer">' +
-      "Continue to PayFast</button></form>" +
-      "<p>If the redirect does not happen, use the button.</p>" +
-      '<script>document.getElementById("payfast-form").submit();</script>' +
-      "</main></body></html>";
-
-    // Send the HTML page as a Telegram attachment is not suitable.
-    // The bot needs a publicly hosted checkout page to serve this HTML.
-    // Therefore, don't claim the checkout is usable until you host it.
-    //
-    // This bot-only file cannot expose a local HTML page to the user.
-    // Your backend should provide a route that serves this form.
-
-    await ctx.reply(
-      "💳 PAYFAST CHECKOUT CREATED\n\n" +
-      `Package: ${paymentPackage.name}\n` +
-      `Amount: R${paymentPackage.amount}\n` +
-      `Minutes: ${paymentPackage.minutes}\n\n` +
-      "Your payment record has been created, but the secure PayFast form needs to be served by your backend before payment can continue.\n\n" +
-      `Payment reference: ${reference}`
-    );
-
-    console.log(
-      "PayFast checkout prepared:",
-      reference,
-      "HTML length:",
-      html.length
-    );
-  } catch (error) {
-    console.error("Create PayFast checkout error:", error);
-
-    await ctx.reply(
-      "❌ We couldn't create your PayFast checkout.\n\n" +
-      "Please try again shortly. If this keeps happening, check the backend logs."
-    );
-  }
-}
-
-// ============================================================
-// HTML ESCAPING
-// ============================================================
-
-function escapeHtml(value) {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 }

@@ -1,3 +1,4 @@
+
 import crypto from "node:crypto";
 
 import {
@@ -12,13 +13,26 @@ import {
 } from "../services/payfastService.js";
 
 // ============================================================
-// PAYFAST CONFIGURATION
+// CONFIGURATION
 // ============================================================
 
-const PAYFAST_HOSTS = {
+const PAYFAST_HOSTS = Object.freeze({
   live: "www.payfast.co.za",
   sandbox: "sandbox.payfast.co.za",
-};
+});
+
+const PAYMENT_REFERENCE_PATTERN = /^SALIVE-[A-F0-9]{32}$/;
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MAX_ITN_FIELDS = 100;
+const REQUEST_TIMEOUT_MS = 15000;
+
+const PAYFAST_SOURCE_RANGES = Object.freeze([
+  "197.97.145.144/28",
+  "41.74.179.192/27",
+  "102.216.36.0/28",
+  "102.216.36.128/28",
+  "144.126.193.139/32",
+]);
 
 function getPayfastMode() {
   const mode = (
@@ -33,37 +47,89 @@ function getPayfastMode() {
 }
 
 function getPassphrase() {
-  const passphrase =
-    process.env.PAYFAST_PASSPHRASE;
+  const value = process.env.PAYFAST_PASSPHRASE;
 
   if (
-    typeof passphrase !== "string" ||
-    !passphrase.trim()
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value !== value.trim()
   ) {
-    throw new Error(
-      "PAYFAST_PASSPHRASE is missing."
-    );
+    throw new Error("PayFast passphrase is missing or invalid.");
   }
 
-  return passphrase;
+  return value;
 }
 
 function getMerchantId() {
-  const merchantId =
-    process.env.PAYFAST_MERCHANT_ID;
+  const merchantId = process.env.PAYFAST_MERCHANT_ID;
 
   if (!/^\d{8}$/.test(merchantId || "")) {
-    throw new Error(
-      "PAYFAST_MERCHANT_ID is invalid."
-    );
+    throw new Error("PayFast merchant ID is invalid.");
   }
 
   return merchantId;
 }
 
 // ============================================================
-// GENERAL HELPERS
+// AUTHENTICATION HELPERS
 // ============================================================
+
+/*
+ * Authentication middleware must establish the identity from
+ * a verified session, Firebase token, or verified Telegram
+ * identity. Never establish identity from an arbitrary body ID.
+ *
+ * Adapt the property names here to match your existing,
+ * trusted authentication middleware.
+ */
+
+function getAuthenticatedUserId(req) {
+  const candidates = [
+    req.authenticatedUserId,
+    req.user?.uid,
+    req.user?.telegramId,
+    req.auth?.uid,
+    req.auth?.telegramId,
+  ];
+
+  for (const candidate of candidates) {
+    if (
+      (typeof candidate === "string" ||
+        typeof candidate === "number") &&
+      String(candidate).trim() &&
+      String(candidate).length <= 128
+    ) {
+      return String(candidate).trim();
+    }
+  }
+
+  return null;
+}
+
+function isPaymentOwner(payment, userId) {
+  return (
+    payment &&
+    userId &&
+    String(payment.userId) === userId
+  );
+}
+
+// ============================================================
+// HTTP RESPONSE HELPERS
+// ============================================================
+
+function setSecurityHeaders(res) {
+  res.set({
+    "Cache-Control": "no-store, max-age=0",
+    "Pragma": "no-cache",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy":
+      "default-src 'none'; style-src 'unsafe-inline'; " +
+      "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  });
+}
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -127,15 +193,41 @@ function renderPaymentPage({
 </html>`;
 }
 
-function sendPaymentPage(
-  res,
-  statusCode,
-  page
-) {
+function sendPaymentPage(res, statusCode, page) {
+  setSecurityHeaders(res);
+
   return res
     .status(statusCode)
     .type("html")
     .send(page);
+}
+
+// ============================================================
+// INPUT VALIDATION
+// ============================================================
+
+function isValidReference(reference) {
+  return (
+    typeof reference === "string" &&
+    PAYMENT_REFERENCE_PATTERN.test(reference)
+  );
+}
+
+function isValidEmail(email) {
+  return (
+    typeof email === "string" &&
+    email.length <= 254 &&
+    email === email.trim() &&
+    EMAIL_PATTERN.test(email)
+  );
+}
+
+function isScalarPayfastField(value) {
+  return (
+    typeof value === "string" ||
+    (typeof value === "number" &&
+      Number.isFinite(value))
+  );
 }
 
 // ============================================================
@@ -145,15 +237,13 @@ function sendPaymentPage(
 function payfastEncode(value) {
   return encodeURIComponent(String(value).trim())
     .replace(/%20/g, "+")
-    .replace(/[!'()*]/g, (character) => {
-      return (
-        "%" +
-        character
-          .charCodeAt(0)
-          .toString(16)
-          .toUpperCase()
-      );
-    });
+    .replace(/[!'()*]/g, (character) =>
+      "%" +
+      character
+        .charCodeAt(0)
+        .toString(16)
+        .toUpperCase()
+    );
 }
 
 function buildPayfastParameterString(
@@ -162,30 +252,30 @@ function buildPayfastParameterString(
 ) {
   const parts = [];
 
-  for (const [key, rawValue] of Object.entries(fields)) {
+  for (const [key, value] of Object.entries(fields)) {
     if (key === "signature") {
       continue;
     }
 
     if (
-      rawValue === undefined ||
-      rawValue === null ||
-      String(rawValue).trim() === ""
+      typeof key !== "string" ||
+      !/^[a-zA-Z0-9_]+$/.test(key)
     ) {
+      throw new Error("Invalid PayFast parameter name.");
+    }
+
+    if (!isScalarPayfastField(value)) {
+      throw new Error("Invalid PayFast parameter value.");
+    }
+
+    const normalizedValue = String(value).trim();
+
+    if (normalizedValue === "") {
       continue;
     }
 
-    if (
-      typeof rawValue !== "string" &&
-      typeof rawValue !== "number"
-    ) {
-      throw new Error(
-        "Unexpected PayFast notification field."
-      );
-    }
-
     parts.push(
-      `${key}=${payfastEncode(rawValue)}`
+      `${key}=${payfastEncode(normalizedValue)}`
     );
   }
 
@@ -199,35 +289,39 @@ function buildPayfastParameterString(
 }
 
 function verifyPayfastSignature(fields) {
-  const receivedSignature = fields.signature;
+  try {
+    const receivedSignature = fields.signature;
 
-  if (
-    typeof receivedSignature !== "string" ||
-    !/^[a-f0-9]{32}$/i.test(receivedSignature)
-  ) {
+    if (
+      typeof receivedSignature !== "string" ||
+      !/^[a-f0-9]{32}$/i.test(receivedSignature)
+    ) {
+      return false;
+    }
+
+    const parameterString =
+      buildPayfastParameterString(fields, true);
+
+    const expectedSignature = crypto
+      .createHash("md5")
+      .update(parameterString, "utf8")
+      .digest();
+
+    const actualSignature = Buffer.from(
+      receivedSignature,
+      "hex"
+    );
+
+    return (
+      actualSignature.length === expectedSignature.length &&
+      crypto.timingSafeEqual(
+        actualSignature,
+        expectedSignature
+      )
+    );
+  } catch {
     return false;
   }
-
-  const parameterString =
-    buildPayfastParameterString(fields);
-
-  const expectedSignature = crypto
-    .createHash("md5")
-    .update(parameterString, "utf8")
-    .digest();
-
-  const actualSignature = Buffer.from(
-    receivedSignature,
-    "hex"
-  );
-
-  return (
-    actualSignature.length === expectedSignature.length &&
-    crypto.timingSafeEqual(
-      actualSignature,
-      expectedSignature
-    )
-  );
 }
 
 // ============================================================
@@ -277,8 +371,8 @@ function isIPv4InCidr(ip, cidr) {
       : (0xffffffff << (32 - prefix)) >>> 0;
 
   return (
-    (addressNumber & mask) >>> 0 ===
-    (networkNumber & mask) >>> 0
+    ((addressNumber & mask) >>> 0) ===
+    ((networkNumber & mask) >>> 0)
   );
 }
 
@@ -299,29 +393,13 @@ function normalizeRemoteAddress(address) {
 function isPayfastSourceIp(ip) {
   const address = normalizeRemoteAddress(ip);
 
-  /*
-   * PayFast's published ITN source ranges.
-   * Review against current official documentation periodically.
-   *
-   * Do not trust X-Forwarded-For directly. Configure Express's
-   * trusted proxy settings correctly if deployed behind a proxy.
-   */
-
-  const ranges = [
-    "197.97.145.144/28",
-    "41.74.179.192/27",
-    "102.216.36.0/28",
-    "102.216.36.128/28",
-    "144.126.193.139/32",
-  ];
-
-  return ranges.some(
-    (range) => isIPv4InCidr(address, range)
+  return PAYFAST_SOURCE_RANGES.some((range) =>
+    isIPv4InCidr(address, range)
   );
 }
 
 // ============================================================
-// SERVER-TO-SERVER ITN VALIDATION
+// PAYFAST SERVER-TO-SERVER ITN VALIDATION
 // ============================================================
 
 async function validatePayfastWithServer(fields) {
@@ -329,10 +407,7 @@ async function validatePayfastWithServer(fields) {
   const host = PAYFAST_HOSTS[mode];
 
   const parameterString =
-    buildPayfastParameterString(
-      fields,
-      false
-    );
+    buildPayfastParameterString(fields, false);
 
   const response = await fetch(
     `https://${host}/eng/query/validate`,
@@ -344,13 +419,14 @@ async function validatePayfastWithServer(fields) {
         Accept: "text/plain",
       },
       body: parameterString,
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      redirect: "error",
     }
   );
 
   if (!response.ok) {
     throw new Error(
-      `PayFast validation endpoint returned HTTP ${response.status}.`
+      `PayFast validation returned HTTP ${response.status}.`
     );
   }
 
@@ -366,9 +442,17 @@ async function validatePayfastWithServer(fields) {
 // ============================================================
 
 export async function initializePayment(req, res) {
-  let reference;
-
   try {
+    const authenticatedUserId =
+      getAuthenticatedUserId(req);
+
+    if (!authenticatedUserId) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication is required.",
+      });
+    }
+
     const {
       userId,
       packageId,
@@ -376,38 +460,34 @@ export async function initializePayment(req, res) {
     } = req.body ?? {};
 
     /*
-     * SECURITY:
-     * This preserves the existing request contract, but userId
-     * must ultimately come from a verified Telegram identity or
-     * authenticated server session. Do not trust an arbitrary
-     * userId supplied by a public client.
+     * If the existing client sends userId, it must match the
+     * authenticated identity. It can never select another user.
      */
 
     if (
-      typeof userId !== "string" ||
-      !userId.trim()
+      userId !== undefined &&
+      String(userId) !== authenticatedUserId
     ) {
-      return res.status(400).json({
+      return res.status(403).json({
         success: false,
-        message: "A valid user ID is required.",
+        message: "User identity mismatch.",
       });
     }
 
     if (
       typeof packageId !== "string" ||
-      !packageId.trim()
+      packageId.length > 64 ||
+      !/^[a-zA-Z0-9_-]+$/.test(packageId)
     ) {
       return res.status(400).json({
         success: false,
-        message: "A valid package ID is required.",
+        message: "Invalid payment package.",
       });
     }
 
     if (
       typeof email !== "string" ||
-      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(
-        email.trim()
-      )
+      !isValidEmail(email)
     ) {
       return res.status(400).json({
         success: false,
@@ -418,35 +498,71 @@ export async function initializePayment(req, res) {
     const paymentPackage =
       getPaymentPackage(packageId);
 
-    if (!paymentPackage) {
+    if (
+      !paymentPackage ||
+      !Number.isSafeInteger(paymentPackage.minutes) ||
+      paymentPackage.minutes <= 0 ||
+      !Number.isFinite(Number(paymentPackage.amount)) ||
+      Number(paymentPackage.amount) <= 0
+    ) {
       return res.status(400).json({
         success: false,
         message: "Invalid payment package.",
       });
     }
 
-    reference =
+    const reference =
       `SALIVE-${crypto.randomUUID()
         .replace(/-/g, "")
         .toUpperCase()}`;
 
-    // Create the server-side payment record first.
+    const normalizedEmail = email.toLowerCase();
+
+    /*
+     * Store the pending payment before creating checkout.
+     * Package price and minutes must come from the trusted
+     * server-side package configuration/service.
+     */
+
     await createPaymentRecord({
-      userId: userId.trim(),
+      userId: authenticatedUserId,
       reference,
-      packageId,
-      email: email.trim().toLowerCase(),
+      packageId: paymentPackage.id,
+      email: normalizedEmail,
     });
 
     const checkout =
       await initializePayfastTransaction({
-        email: email.trim().toLowerCase(),
+        email: normalizedEmail,
         amount: paymentPackage.amount,
         reference,
         metadata: {
-          custom_str1: packageId,
+          custom_str1: paymentPackage.id,
         },
       });
+
+    if (
+  !checkout ||
+  typeof checkout.paymentUrl !== "string" ||
+  !checkout.fields ||
+  typeof checkout.fields !== "object" ||
+  Array.isArray(checkout.fields) ||
+  !checkout.paymentUrl.startsWith("https://")
+) {
+  throw new Error("Invalid PayFast checkout response.");
+}
+
+    const expectedHost =
+      PAYFAST_HOSTS[getPayfastMode()];
+
+    const checkoutUrl = new URL(checkout.paymentUrl);
+
+    if (
+      checkoutUrl.hostname !== expectedHost ||
+      checkoutUrl.protocol !== "https:"
+    ) {
+      throw new Error("Unexpected PayFast checkout host.");
+    }
 
     return res.status(200).json({
       success: true,
@@ -458,15 +574,13 @@ export async function initializePayment(req, res) {
         amount: paymentPackage.amount,
         currency: "ZAR",
         minutes: paymentPackage.minutes,
-
-        // Submit these fields using an HTML POST form.
         paymentUrl: checkout.paymentUrl,
         fields: checkout.fields,
       },
     });
   } catch (error) {
     console.error(
-      "Initialize PayFast payment error:",
+      "Initialize PayFast payment failed:",
       error.message
     );
 
@@ -484,22 +598,27 @@ export async function initializePayment(req, res) {
 
 export async function verifyPayment(req, res) {
   try {
-    const reference = req.params.reference;
+    const authenticatedUserId =
+      getAuthenticatedUserId(req);
 
-    if (
-      typeof reference !== "string" ||
-      !reference.trim()
-    ) {
+    if (!authenticatedUserId) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication is required.",
+      });
+    }
+
+    const reference = req.params?.reference;
+
+    if (!isValidReference(reference)) {
       return res.status(400).json({
         success: false,
-        message: "Payment reference is required.",
+        message: "Invalid payment reference.",
       });
     }
 
     const payment =
-      await getPaymentByReference(
-        reference.trim()
-      );
+      await getPaymentByReference(reference);
 
     if (!payment) {
       return res.status(404).json({
@@ -508,10 +627,12 @@ export async function verifyPayment(req, res) {
       });
     }
 
-    /*
-     * Status is read from Firestore. This endpoint does not
-     * credit minutes based on a client request.
-     */
+    if (!isPaymentOwner(payment, authenticatedUserId)) {
+      return res.status(404).json({
+        success: false,
+        message: "Payment record not found.",
+      });
+    }
 
     return res.status(200).json({
       success: true,
@@ -526,7 +647,7 @@ export async function verifyPayment(req, res) {
     });
   } catch (error) {
     console.error(
-      "Payment status error:",
+      "Payment status lookup failed:",
       error.message
     );
 
@@ -549,65 +670,62 @@ export async function paymentITN(req, res) {
       !fields ||
       typeof fields !== "object" ||
       Array.isArray(fields) ||
-      Object.keys(fields).length === 0
+      Object.keys(fields).length === 0 ||
+      Object.keys(fields).length > MAX_ITN_FIELDS
     ) {
       return res.status(400).send("Invalid notification");
     }
 
     /*
-     * Express must parse the ITN body using
-     * express.urlencoded({ extended: false }).
+     * The Express route must parse this endpoint as URL-encoded
+     * form data. Do not trust arbitrary forwarded IP headers.
+     * Configure Express trusted proxies correctly in production.
      */
 
-    const remoteAddress =
-      normalizeRemoteAddress(req.ip || req.socket?.remoteAddress);
+    const remoteAddress = normalizeRemoteAddress(
+      req.ip || req.socket?.remoteAddress || ""
+    );
 
     if (!isPayfastSourceIp(remoteAddress)) {
       console.warn(
-        "Rejected PayFast ITN from unrecognized source IP:",
-        remoteAddress
+        "Rejected PayFast ITN from unrecognized source."
       );
 
       return res.status(403).send("Forbidden");
     }
 
     if (!verifyPayfastSignature(fields)) {
-      console.warn(
-        "Rejected PayFast ITN: invalid signature."
-      );
+      console.warn("Rejected PayFast ITN: invalid signature.");
 
       return res.status(400).send("Invalid signature");
     }
 
-    const expectedMerchantId =
-      getMerchantId();
+    if (
+      typeof fields.merchant_id !== "string" &&
+      typeof fields.merchant_id !== "number"
+    ) {
+      return res.status(400).send("Invalid merchant");
+    }
 
     if (
-      String(fields.merchant_id) !==
-      expectedMerchantId
+      String(fields.merchant_id) !== getMerchantId()
     ) {
       return res.status(400).send("Invalid merchant");
     }
 
     const reference = fields.m_payment_id;
 
-    if (
-      typeof reference !== "string" ||
-      !reference.trim()
-    ) {
-      return res.status(400).send("Missing payment reference");
+    if (!isValidReference(reference)) {
+      return res.status(400).send("Invalid payment reference");
     }
 
     const payment =
-      await getPaymentByReference(
-        reference.trim()
-      );
+      await getPaymentByReference(reference);
 
     if (!payment) {
       return res.status(404).send("Unknown payment");
     }
 
-    // Do not process an unexpected payment provider or currency.
     if (
       payment.provider !== "payfast" ||
       payment.currency !== "ZAR"
@@ -615,16 +733,23 @@ export async function paymentITN(req, res) {
       return res.status(400).send("Payment mismatch");
     }
 
+    /*
+     * Compare integer cents to avoid floating-point money errors.
+     */
+
     const expectedAmount = Number(payment.amount);
     const receivedGross = Number(fields.amount_gross);
 
     if (
       !Number.isFinite(expectedAmount) ||
       !Number.isFinite(receivedGross) ||
-      Math.abs(expectedAmount - receivedGross) > 0.01
+      expectedAmount <= 0 ||
+      receivedGross <= 0 ||
+      Math.round(expectedAmount * 100) !==
+        Math.round(receivedGross * 100)
     ) {
       console.warn(
-        "PayFast amount mismatch:",
+        "PayFast amount mismatch for reference:",
         reference
       );
 
@@ -632,23 +757,22 @@ export async function paymentITN(req, res) {
     }
 
     /*
-     * PayFast can send notifications for different statuses.
-     * Only COMPLETE payments may credit call minutes.
+     * Never credit minutes for FAILED, PENDING, CANCELLED,
+     * or any other non-COMPLETE notification.
      */
 
     if (fields.payment_status !== "COMPLETE") {
       console.info(
-        "PayFast notification received with non-complete status:",
+        "PayFast non-complete notification:",
         fields.payment_status
       );
 
-      // A non-complete notification does not credit minutes.
       return res.status(200).send("OK");
     }
 
     /*
-     * Final server-to-server confirmation.
-     * No balance update occurs unless PayFast confirms VALID.
+     * Confirm the ITN directly with PayFast before touching
+     * any account balance.
      */
 
     const serverConfirmed =
@@ -656,7 +780,7 @@ export async function paymentITN(req, res) {
 
     if (!serverConfirmed) {
       console.warn(
-        "PayFast server validation failed:",
+        "PayFast server validation failed for:",
         reference
       );
 
@@ -664,33 +788,35 @@ export async function paymentITN(req, res) {
     }
 
     /*
-     * This Firestore transaction is idempotent:
-     * duplicate COMPLETE notifications cannot credit twice.
+     * CRITICAL:
+     * creditSuccessfulPayment MUST perform an atomic Firestore
+     * transaction, validate the pending payment, and ensure that
+     * the payment can only be credited once.
+     *
+     * This controller deliberately does not update balances.
      */
 
     const result =
-      await creditSuccessfulPayment(
-        reference.trim()
-      );
+      await creditSuccessfulPayment(reference);
 
     console.info(
       "PayFast ITN processed:",
       reference,
-      result.alreadyCredited
+      result?.alreadyCredited
         ? "already credited"
-        : "minutes credited"
+        : "processed"
     );
 
     return res.status(200).send("OK");
   } catch (error) {
     console.error(
-      "PayFast ITN processing error:",
+      "PayFast ITN processing failed:",
       error.message
     );
 
     /*
-     * A non-2xx response permits notification retries.
-     * Investigate errors before manually changing balances.
+     * Return a failure status for transient processing errors
+     * so the notification can be investigated or retried.
      */
 
     return res.status(500).send(
@@ -706,13 +832,10 @@ export async function paymentITN(req, res) {
 export async function paymentCallback(req, res) {
   try {
     const reference =
-      req.query.m_payment_id ||
-      req.query.reference;
+      req.query?.m_payment_id ??
+      req.query?.reference;
 
-    if (
-      typeof reference !== "string" ||
-      !reference.trim()
-    ) {
+    if (!isValidReference(reference)) {
       return sendPaymentPage(
         res,
         400,
@@ -720,15 +843,13 @@ export async function paymentCallback(req, res) {
           title: "SA LIVE Payment",
           heading: "Payment status unavailable",
           message:
-            "The payment reference is missing. Return to Telegram and check your balance.",
+            "The payment reference is invalid. Return to Telegram and check your balance.",
         })
       );
     }
 
     const payment =
-      await getPaymentByReference(
-        reference.trim()
-      );
+      await getPaymentByReference(reference);
 
     if (!payment) {
       return sendPaymentPage(
@@ -744,11 +865,12 @@ export async function paymentCallback(req, res) {
     }
 
     /*
-     * Do not trust the return URL as proof of payment.
-     * The ITN handler is responsible for crediting minutes.
+     * A browser redirect is not proof of payment.
+     * Only the verified ITN processing flow can credit minutes.
      */
 
     if (
+      payment.provider === "payfast" &&
       payment.status === "complete" &&
       payment.credited === true
     ) {
@@ -759,7 +881,7 @@ export async function paymentCallback(req, res) {
           title: "SA LIVE Payment Successful",
           heading: "Payment successful",
           message:
-            "Your payment has been confirmed and your call minutes are available.",
+            "Your payment has been confirmed. Your minutes are available in Telegram.",
           minutes: payment.minutes,
         })
       );
@@ -773,7 +895,7 @@ export async function paymentCallback(req, res) {
           title: "SA LIVE Payment Pending",
           heading: "Payment confirmation pending",
           message:
-            "We have not confirmed your payment yet. Please wait briefly, then check your balance in Telegram. Do not pay again unless your payment status confirms that the original transaction failed.",
+            "Your payment has not been confirmed yet. Check your balance in Telegram shortly. Avoid making another payment until you have checked the original transaction.",
         })
       );
     }
@@ -783,14 +905,14 @@ export async function paymentCallback(req, res) {
       200,
       renderPaymentPage({
         title: "SA LIVE Payment",
-        heading: "Payment not completed",
+        heading: "Payment not confirmed",
         message:
-          "Your payment has not been confirmed. Return to Telegram to check its status.",
+          "Your payment has not been confirmed as successful. Return to Telegram to check its status.",
       })
     );
   } catch (error) {
     console.error(
-      "PayFast return callback error:",
+      "PayFast return callback failed:",
       error.message
     );
 

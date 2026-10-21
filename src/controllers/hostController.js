@@ -1,27 +1,53 @@
+// ============================================================
+// SA LIVE — HOST CONTROLLER
+// ============================================================
 
 import {
   hostHeartbeat,
 } from "../services/hostService.js";
 
+// ============================================================
+// HOST HEARTBEAT
+// ============================================================
+// Expected middleware order:
+//   verifyFirebaseToken
+//   requireHost
+//   heartbeat
+//
+// Host identity comes exclusively from req.host,
+// populated by trusted backend authorization middleware.
+// ============================================================
+
 export async function heartbeat(req, res) {
   try {
-    // Use the host identity verified by the backend.
-    // Never trust a hostId supplied by the browser.
-    const result = await hostHeartbeat(req.host.id);
+    const hostId = req.host?.id;
 
-    return res.json({
+    if (
+      typeof hostId !== "string" ||
+      !hostId.trim()
+    ) {
+      return res.status(401).json({
+        success: false,
+        message: "Authenticated host account required.",
+      });
+    }
+
+    const result = await hostHeartbeat(hostId);
+
+    return res.status(200).json({
       success: true,
       message: "Host heartbeat received.",
       host: result,
     });
   } catch (error) {
-    console.error("Host heartbeat error:", error);
+    console.error(
+      "Host heartbeat failed:",
+      error?.code || "UNKNOWN_ERROR"
+    );
 
     return res.status(500).json({
       success: false,
-      message:
-        error.message ||
-        "Unable to update host presence.",
+      message: "Unable to update host presence. Please try again.",
     });
   }
 }

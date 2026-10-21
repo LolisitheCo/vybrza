@@ -1,99 +1,247 @@
+
 import { db } from "../config/firebase.js";
 
 const usersCollection = db.collection("users");
+const hostsCollection = db.collection("hosts");
 const paymentsCollection = db.collection("payments");
 const withdrawalsCollection = db.collection("withdrawals");
 const earningsCollection = db.collection("hostEarnings");
+const callsCollection = db.collection("callSessions");
 
-/*
-|--------------------------------------------------------------------------
-| SA LIVE PAYMENT RULES
-|--------------------------------------------------------------------------
-| Customer: R30 per 5 minutes.
-| Host: R2 per completed eligible minute.
-| Platform: R10 gross per 5 fully completed minutes, before fees.
-|
-| All monetary values are stored as integer cents internally when
-| calculating amounts. Existing package amounts remain in rand.
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// SA LIVE FINANCIAL CONFIGURATION
+// ============================================================
 
-export const HOST_EARNINGS_PER_MINUTE = 2;
 export const CUSTOMER_PRICE_PER_MINUTE = 6;
+export const HOST_EARNINGS_PER_MINUTE = 2;
 
-export const PAYMENT_PACKAGES = {
-  starter: {
+export const PAYMENT_PACKAGES = Object.freeze({
+  starter: Object.freeze({
     id: "starter",
     name: "5 Minutes",
     amount: 30,
     minutes: 5,
-  },
+  }),
 
-  ten_minutes: {
+  ten_minutes: Object.freeze({
     id: "ten_minutes",
     name: "10 Minutes",
     amount: 60,
     minutes: 10,
-  },
+  }),
 
-  thirty_minutes: {
+  thirty_minutes: Object.freeze({
     id: "thirty_minutes",
     name: "30 Minutes",
     amount: 180,
     minutes: 30,
-  },
+  }),
 
-  sixty_minutes: {
+  sixty_minutes: Object.freeze({
     id: "sixty_minutes",
     name: "60 Minutes",
     amount: 360,
     minutes: 60,
-  },
+  }),
 
-  three_hour: {
+  three_hour: Object.freeze({
     id: "three_hour",
     name: "3 Hours",
     amount: 1080,
     minutes: 180,
-  },
-};
+  }),
+});
 
-/*
-|--------------------------------------------------------------------------
-| HELPERS
-|--------------------------------------------------------------------------
-*/
+const MAX_ID_LENGTH = 200;
+const MAX_EMAIL_LENGTH = 254;
+const MAX_BANK_FIELD_LENGTH = 120;
+const MAX_ACCOUNT_NUMBER_LENGTH = 40;
+const MAX_REASON_LENGTH = 500;
+const MAX_PAYOUT_REFERENCE_LENGTH = 200;
 
-function requireString(value, fieldName) {
+// ============================================================
+// VALIDATION HELPERS
+// ============================================================
+
+function requireString(value, fieldName, maxLength = MAX_ID_LENGTH) {
   if (
     typeof value !== "string" ||
-    value.trim().length === 0
+    value.trim().length === 0 ||
+    value.trim().length > maxLength
   ) {
-    throw new Error(`${fieldName} is required.`);
+    throw new Error(`${fieldName} is invalid.`);
   }
 
   return value.trim();
+}
+
+function requireDocumentId(value, fieldName) {
+  const id = requireString(value, fieldName, MAX_ID_LENGTH);
+
+  if (id.includes("/") || id.includes("\0")) {
+    throw new Error(`${fieldName} is invalid.`);
+  }
+
+  return id;
 }
 
 function validPositiveInteger(value) {
   return Number.isSafeInteger(value) && value > 0;
 }
 
-function toSafeNumber(value, fallback = 0) {
-  const number = Number(value ?? fallback);
-
-  if (!Number.isFinite(number)) {
-    throw new Error("A stored financial or balance value is invalid.");
-  }
-
-  return number;
+function validNonNegativeInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0;
 }
 
-/*
-|--------------------------------------------------------------------------
-| GET PACKAGE
-|--------------------------------------------------------------------------
-*/
+function toCentsFromRand(amount, fieldName = "Amount") {
+  if (
+    typeof amount !== "number" ||
+    !Number.isFinite(amount) ||
+    amount <= 0
+  ) {
+    throw new Error(`${fieldName} must be a positive amount.`);
+  }
+
+  const cents = Math.round(amount * 100);
+
+  if (
+    !Number.isSafeInteger(cents) ||
+    cents <= 0 ||
+    Math.abs(amount * 100 - cents) > 0.000001
+  ) {
+    throw new Error(
+      `${fieldName} must have no more than two decimal places.`
+    );
+  }
+
+  return cents;
+}
+
+function readStoredCents(value, fieldName) {
+  if (!validNonNegativeInteger(value ?? 0)) {
+    throw new Error(`${fieldName} balance is invalid.`);
+  }
+
+  return value ?? 0;
+}
+
+function readStoredMinutes(value, fieldName) {
+  if (!validNonNegativeInteger(value ?? 0)) {
+    throw new Error(`${fieldName} minute balance is invalid.`);
+  }
+
+  return value ?? 0;
+}
+
+function validateEmail(email) {
+  if (email === undefined || email === null || email === "") {
+    return null;
+  }
+
+  if (
+    typeof email !== "string" ||
+    email.length > MAX_EMAIL_LENGTH ||
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+  ) {
+    throw new Error("A valid payment email is required.");
+  }
+
+  return email.trim().toLowerCase();
+}
+
+function validateBankDetails(bankDetails) {
+  if (
+    !bankDetails ||
+    typeof bankDetails !== "object" ||
+    Array.isArray(bankDetails)
+  ) {
+    throw new Error("Bank details are required.");
+  }
+
+  const accountHolder = requireString(
+    bankDetails.accountHolder,
+    "Account holder",
+    MAX_BANK_FIELD_LENGTH
+  );
+
+  const bankName = requireString(
+    bankDetails.bankName,
+    "Bank name",
+    MAX_BANK_FIELD_LENGTH
+  );
+
+  const accountNumber = requireString(
+    bankDetails.accountNumber,
+    "Account number",
+    MAX_ACCOUNT_NUMBER_LENGTH
+  );
+
+  const accountType = requireString(
+    bankDetails.accountType,
+    "Account type",
+    60
+  );
+
+  if (
+    /[\u0000-\u001F\u007F]/.test(accountHolder) ||
+    /[\u0000-\u001F\u007F]/.test(bankName) ||
+    /[\u0000-\u001F\u007F]/.test(accountType) ||
+    !/^[a-zA-Z0-9 -]+$/.test(accountNumber)
+  ) {
+    throw new Error("Bank details are invalid.");
+  }
+
+  return {
+    accountHolder,
+    bankName,
+    accountNumber,
+    accountType,
+  };
+}
+
+function validatePackageIntegrity(payment) {
+  const paymentPackage = getPaymentPackage(payment.packageId);
+
+  if (!paymentPackage) {
+    throw new Error("The stored payment package is invalid.");
+  }
+
+  const expectedAmountCents = toCentsFromRand(
+    paymentPackage.amount,
+    "Package amount"
+  );
+
+  if (
+    payment.provider !== "payfast" ||
+    payment.currency !== "ZAR" ||
+    payment.packageId !== paymentPackage.id ||
+    payment.amount !== paymentPackage.amount ||
+    payment.amountCents !== expectedAmountCents ||
+    payment.minutes !== paymentPackage.minutes
+  ) {
+    throw new Error(
+      "The stored payment does not match the configured package."
+    );
+  }
+
+  return paymentPackage;
+}
+
+function validateWithdrawalRecord(withdrawal) {
+  if (
+    !withdrawal ||
+    typeof withdrawal.hostId !== "string" ||
+    withdrawal.hostId.trim().length === 0 ||
+    !validPositiveInteger(withdrawal.amountCents) ||
+    withdrawal.currency !== "ZAR"
+  ) {
+    throw new Error("The withdrawal record is invalid.");
+  }
+}
+
+// ============================================================
+// GET PAYMENT PACKAGE
+// ============================================================
 
 export function getPaymentPackage(packageId) {
   if (typeof packageId !== "string") {
@@ -103,15 +251,9 @@ export function getPaymentPackage(packageId) {
   return PAYMENT_PACKAGES[packageId] ?? null;
 }
 
-/*
-|--------------------------------------------------------------------------
-| CREATE PENDING PAYMENT
-|--------------------------------------------------------------------------
-| Create this record before redirecting the customer to PayFast.
-| The server must establish the authenticated userId.
-| Never credit minutes based only on a browser redirect.
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// CREATE PENDING PAYMENT
+// ============================================================
 
 export async function createPaymentRecord({
   userId,
@@ -119,8 +261,8 @@ export async function createPaymentRecord({
   packageId,
   email,
 }) {
-  userId = requireString(userId, "User ID");
-  reference = requireString(reference, "Payment reference");
+  userId = requireDocumentId(userId, "User ID");
+  reference = requireDocumentId(reference, "Payment reference");
 
   const paymentPackage = getPaymentPackage(packageId);
 
@@ -128,32 +270,29 @@ export async function createPaymentRecord({
     throw new Error("Invalid payment package.");
   }
 
-  if (
-    email !== undefined &&
-    email !== null &&
-    (
-      typeof email !== "string" ||
-      email.length > 254 ||
-      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
-    )
-  ) {
-    throw new Error("A valid payment email is required.");
-  }
+  const normalizedEmail = validateEmail(email);
+
+  const amountCents = toCentsFromRand(
+    paymentPackage.amount,
+    "Package amount"
+  );
 
   const userRef = usersCollection.doc(userId);
   const paymentRef = paymentsCollection.doc(reference);
 
   await db.runTransaction(async (transaction) => {
     const userSnapshot = await transaction.get(userRef);
-    const existingPayment = await transaction.get(paymentRef);
+    const paymentSnapshot = await transaction.get(paymentRef);
 
     if (!userSnapshot.exists) {
       throw new Error("User account was not found.");
     }
 
-    if (existingPayment.exists) {
+    if (paymentSnapshot.exists) {
       throw new Error("Payment reference already exists.");
     }
+
+    const now = new Date();
 
     transaction.create(paymentRef, {
       userId,
@@ -161,17 +300,15 @@ export async function createPaymentRecord({
       packageId: paymentPackage.id,
       packageName: paymentPackage.name,
       amount: paymentPackage.amount,
-      amountCents: Math.round(paymentPackage.amount * 100),
+      amountCents,
       currency: "ZAR",
       minutes: paymentPackage.minutes,
-      email: email ? email.trim().toLowerCase() : null,
-
+      email: normalizedEmail,
       provider: "payfast",
       status: "pending",
       credited: false,
-
-      createdAt: new Date(),
-      updatedAt: new Date(),
+      createdAt: now,
+      updatedAt: now,
     });
   });
 
@@ -181,16 +318,16 @@ export async function createPaymentRecord({
   };
 }
 
-/*
-|--------------------------------------------------------------------------
-| GET PAYMENT BY REFERENCE
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// GET PAYMENT BY REFERENCE
+// ============================================================
 
 export async function getPaymentByReference(reference) {
   if (
     typeof reference !== "string" ||
-    reference.trim().length === 0
+    reference.trim().length === 0 ||
+    reference.trim().length > MAX_ID_LENGTH ||
+    reference.includes("/")
   ) {
     return null;
   }
@@ -209,24 +346,12 @@ export async function getPaymentByReference(reference) {
   };
 }
 
-/*
-|--------------------------------------------------------------------------
-| CREDIT VERIFIED PAYMENT ONCE
-|--------------------------------------------------------------------------
-| Call ONLY after the PayFast ITN has been verified, including:
-| - Signature verification
-| - PayFast server validation
-| - Payment status
-| - Merchant identity
-| - Expected amount and currency
-|
-| The PayFast integration must perform these checks before calling
-| this function. Duplicate notifications must not credit twice.
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// CREDIT VERIFIED PAYFAST PAYMENT ONCE
+// ============================================================
 
 export async function creditSuccessfulPayment(reference) {
-  reference = requireString(reference, "Payment reference");
+  reference = requireDocumentId(reference, "Payment reference");
 
   const paymentRef = paymentsCollection.doc(reference);
 
@@ -240,6 +365,12 @@ export async function creditSuccessfulPayment(reference) {
     const payment = paymentSnapshot.data();
 
     if (payment.credited === true) {
+      if (payment.status !== "complete") {
+        throw new Error(
+          "Payment has an inconsistent credited status."
+        );
+      }
+
       return {
         success: true,
         alreadyCredited: true,
@@ -253,13 +384,13 @@ export async function creditSuccessfulPayment(reference) {
 
     if (
       !payment.userId ||
-      !validPositiveInteger(payment.minutes) ||
-      !validPositiveInteger(payment.amountCents) ||
-      payment.currency !== "ZAR" ||
-      payment.provider !== "payfast"
+      typeof payment.userId !== "string" ||
+      !validPositiveInteger(payment.minutes)
     ) {
       throw new Error("Payment record is invalid.");
     }
+
+    const paymentPackage = validatePackageIntegrity(payment);
 
     const userRef = usersCollection.doc(payment.userId);
     const userSnapshot = await transaction.get(userRef);
@@ -268,61 +399,60 @@ export async function creditSuccessfulPayment(reference) {
       throw new Error("User account was not found.");
     }
 
-    const currentMinutes = toSafeNumber(
+    const currentMinutes = readStoredMinutes(
       userSnapshot.get("minutes"),
-      0
+      "User"
     );
 
-    if (
-      !Number.isSafeInteger(currentMinutes) ||
-      currentMinutes < 0
-    ) {
-      throw new Error("User minute balance is invalid.");
+    const newMinutes = currentMinutes + paymentPackage.minutes;
+
+    if (!Number.isSafeInteger(newMinutes)) {
+      throw new Error("The resulting minute balance is invalid.");
     }
 
+    const now = new Date();
+
     transaction.update(userRef, {
-      minutes: currentMinutes + payment.minutes,
-      updatedAt: new Date(),
+      minutes: newMinutes,
+      updatedAt: now,
     });
 
     transaction.update(paymentRef, {
       status: "complete",
       credited: true,
-      creditedAt: new Date(),
-      updatedAt: new Date(),
+      creditedAt: now,
+      updatedAt: now,
     });
 
     return {
       success: true,
       alreadyCredited: false,
-      minutes: payment.minutes,
+      minutes: paymentPackage.minutes,
     };
   });
 }
 
-/*
-|--------------------------------------------------------------------------
-| RECORD HOST EARNINGS FOR COMPLETED MINUTES
-|--------------------------------------------------------------------------
-| This function is intended to be called by the trusted backend after
-| a call has ended and the eligible completed minutes are confirmed.
-|
-| Each call must have a stable, unique callId.
-| A host cannot earn twice for the same callId.
-|
-| IMPORTANT:
-| Do not expose this function directly through an unauthenticated
-| endpoint or allow hosts to choose their own completed-minute count.
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// RECORD HOST EARNINGS
+// ============================================================
+//
+// hostId is the document ID in the hosts collection.
+//
+// IMPORTANT:
+// Call only after the trusted call-billing service has completed
+// billing and finalized the call. Do not call this from a browser
+// or directly from Telegram user input.
+//
+// completedMinutes must be derived by the trusted backend.
+// ============================================================
 
 export async function recordHostEarnings({
   hostId,
   callId,
   completedMinutes,
 }) {
-  hostId = requireString(hostId, "Host ID");
-  callId = requireString(callId, "Call ID");
+  hostId = requireDocumentId(hostId, "Host ID");
+  callId = requireDocumentId(callId, "Call ID");
 
   if (!validPositiveInteger(completedMinutes)) {
     throw new Error(
@@ -330,65 +460,86 @@ export async function recordHostEarnings({
     );
   }
 
-  const hostRef = usersCollection.doc(hostId);
-  const earningRef = earningsCollection.doc(callId);
-
   const amountCents =
-    completedMinutes *
-    HOST_EARNINGS_PER_MINUTE *
-    100;
+    completedMinutes * HOST_EARNINGS_PER_MINUTE * 100;
 
   if (!Number.isSafeInteger(amountCents)) {
     throw new Error("Host earnings amount is invalid.");
   }
 
+  const hostRef = hostsCollection.doc(hostId);
+  const callRef = callsCollection.doc(callId);
+  const earningRef = earningsCollection.doc(callId);
+
   return db.runTransaction(async (transaction) => {
     const hostSnapshot = await transaction.get(hostRef);
+    const callSnapshot = await transaction.get(callRef);
     const earningSnapshot = await transaction.get(earningRef);
 
     if (!hostSnapshot.exists) {
       throw new Error("Host account was not found.");
     }
 
-    if (earningSnapshot.exists) {
-      const existingEarning = earningSnapshot.data();
+    if (!callSnapshot.exists) {
+      throw new Error("Call record was not found.");
+    }
 
-      if (existingEarning.hostId !== hostId) {
+    const call = callSnapshot.data();
+
+    if (
+      call.hostId !== hostId ||
+      call.status !== "completed" ||
+      call.billingStatus !== "finalized" ||
+      call.billableMinutes !== completedMinutes
+    ) {
+      throw new Error(
+        "Call is not finalized with matching billable minutes."
+      );
+    }
+
+    if (earningSnapshot.exists) {
+      const existing = earningSnapshot.data();
+
+      if (
+        existing.hostId !== hostId ||
+        existing.callId !== callId ||
+        existing.completedMinutes !== completedMinutes ||
+        existing.amountCents !== amountCents
+      ) {
         throw new Error(
-          "This call ID is already associated with another host."
+          "Existing host earnings do not match this call."
         );
       }
 
       return {
         success: true,
         alreadyRecorded: true,
-        completedMinutes: existingEarning.completedMinutes,
-        amount: existingEarning.amount,
+        completedMinutes,
+        amount: amountCents / 100,
       };
     }
 
-    const currentAvailableCents = Math.round(
-      toSafeNumber(
-        hostSnapshot.get("availableHostEarningsCents"),
-        0
-      )
+    const currentAvailableCents = readStoredCents(
+      hostSnapshot.get("availableHostEarningsCents"),
+      "Available host earnings"
     );
 
-    const currentLifetimeCents = Math.round(
-      toSafeNumber(
-        hostSnapshot.get("lifetimeHostEarningsCents"),
-        0
-      )
+    const currentLifetimeCents = readStoredCents(
+      hostSnapshot.get("lifetimeHostEarningsCents"),
+      "Lifetime host earnings"
     );
+
+    const newAvailableCents = currentAvailableCents + amountCents;
+    const newLifetimeCents = currentLifetimeCents + amountCents;
 
     if (
-      !Number.isSafeInteger(currentAvailableCents) ||
-      !Number.isSafeInteger(currentLifetimeCents) ||
-      currentAvailableCents < 0 ||
-      currentLifetimeCents < 0
+      !Number.isSafeInteger(newAvailableCents) ||
+      !Number.isSafeInteger(newLifetimeCents)
     ) {
-      throw new Error("Host earnings balance is invalid.");
+      throw new Error("The resulting host balance is invalid.");
     }
+
+    const now = new Date();
 
     transaction.create(earningRef, {
       callId,
@@ -399,17 +550,13 @@ export async function recordHostEarnings({
       amountCents,
       currency: "ZAR",
       status: "available",
-      createdAt: new Date(),
+      createdAt: now,
     });
 
     transaction.update(hostRef, {
-      availableHostEarningsCents:
-        currentAvailableCents + amountCents,
-
-      lifetimeHostEarningsCents:
-        currentLifetimeCents + amountCents,
-
-      updatedAt: new Date(),
+      availableHostEarningsCents: newAvailableCents,
+      lifetimeHostEarningsCents: newLifetimeCents,
+      updatedAt: now,
     });
 
     return {
@@ -421,121 +568,63 @@ export async function recordHostEarnings({
   });
 }
 
-/*
-|--------------------------------------------------------------------------
-| GET HOST EARNINGS SUMMARY
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// GET HOST EARNINGS SUMMARY
+// ============================================================
 
 export async function getHostEarningsSummary(hostId) {
-  hostId = requireString(hostId, "Host ID");
+  hostId = requireDocumentId(hostId, "Host ID");
 
-  const hostSnapshot = await usersCollection
-    .doc(hostId)
-    .get();
+  const snapshot = await hostsCollection.doc(hostId).get();
 
-  if (!hostSnapshot.exists) {
+  if (!snapshot.exists) {
     throw new Error("Host account was not found.");
-  }
-
-  const host = hostSnapshot.data();
-
-  const availableCents = Math.round(
-    toSafeNumber(host.availableHostEarningsCents, 0)
-  );
-
-  const lifetimeCents = Math.round(
-    toSafeNumber(host.lifetimeHostEarningsCents, 0)
-  );
-
-  if (
-    !Number.isSafeInteger(availableCents) ||
-    !Number.isSafeInteger(lifetimeCents) ||
-    availableCents < 0 ||
-    lifetimeCents < 0
-  ) {
-    throw new Error("Host earnings balance is invalid.");
   }
 
   return {
     hostId,
     currency: "ZAR",
-    available: availableCents / 100,
-    lifetime: lifetimeCents / 100,
+    available:
+      readStoredCents(
+        snapshot.get("availableHostEarningsCents"),
+        "Available host earnings"
+      ) / 100,
+    lifetime:
+      readStoredCents(
+        snapshot.get("lifetimeHostEarningsCents"),
+        "Lifetime host earnings"
+      ) / 100,
+    pendingWithdrawals:
+      readStoredCents(
+        snapshot.get("pendingHostWithdrawalsCents"),
+        "Pending host withdrawals"
+      ) / 100,
   };
 }
 
-/*
-|--------------------------------------------------------------------------
-| CREATE HOST WITHDRAWAL REQUEST
-|--------------------------------------------------------------------------
-| Creates a request for administrator review.
-| This function does NOT transfer money.
-|
-| The caller must authenticate the host and derive hostId from the
-| verified session, not accept an arbitrary hostId from the client.
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// CREATE HOST WITHDRAWAL REQUEST
+// ============================================================
+//
+// Reserves funds. Does not transfer money.
+// hostId must come from the authenticated host identity.
+// ============================================================
 
 export async function createHostWithdrawalRequest({
   hostId,
   amount,
   bankDetails,
 }) {
-  hostId = requireString(hostId, "Host ID");
+  hostId = requireDocumentId(hostId, "Host ID");
 
-  if (
-    typeof amount !== "number" ||
-    !Number.isFinite(amount) ||
-    amount <= 0 ||
-    Math.round(amount * 100) !== amount * 100
-  ) {
-    throw new Error(
-      "Withdrawal amount must be a positive rand amount with at most two decimal places."
-    );
-  }
-
-  if (
-    !bankDetails ||
-    typeof bankDetails !== "object" ||
-    Array.isArray(bankDetails)
-  ) {
-    throw new Error("Bank details are required.");
-  }
-
-  const accountHolder = requireString(
-    bankDetails.accountHolder,
-    "Account holder"
+  const amountCents = toCentsFromRand(
+    amount,
+    "Withdrawal amount"
   );
 
-  const bankName = requireString(
-    bankDetails.bankName,
-    "Bank name"
-  );
+  const validatedBankDetails = validateBankDetails(bankDetails);
 
-  const accountNumber = requireString(
-    bankDetails.accountNumber,
-    "Account number"
-  );
-
-  const accountType = requireString(
-    bankDetails.accountType,
-    "Account type"
-  );
-
-  if (
-    accountHolder.length > 120 ||
-    bankName.length > 120 ||
-    accountNumber.length > 40 ||
-    !/^[a-zA-Z0-9 -]+$/.test(accountNumber) ||
-    accountType.length > 60
-  ) {
-    throw new Error("Bank details are invalid.");
-  }
-
-  const amountCents = Math.round(amount * 100);
-
-  const hostRef = usersCollection.doc(hostId);
+  const hostRef = hostsCollection.doc(hostId);
   const withdrawalRef = withdrawalsCollection.doc();
 
   await db.runTransaction(async (transaction) => {
@@ -547,114 +636,102 @@ export async function createHostWithdrawalRequest({
 
     const host = hostSnapshot.data();
 
-    const availableCents = Math.round(
-      toSafeNumber(host.availableHostEarningsCents, 0)
-    );
-
-    const reservedCents = Math.round(
-      toSafeNumber(host.pendingHostWithdrawalsCents, 0)
-    );
-
-    if (
-      !Number.isSafeInteger(availableCents) ||
-      !Number.isSafeInteger(reservedCents) ||
-      availableCents < 0 ||
-      reservedCents < 0
-    ) {
-      throw new Error("Host withdrawal balance is invalid.");
+    if (host.status !== "active") {
+      throw new Error("Only active hosts can request withdrawals.");
     }
+
+    const availableCents = readStoredCents(
+      host.availableHostEarningsCents,
+      "Available host earnings"
+    );
+
+    const reservedCents = readStoredCents(
+      host.pendingHostWithdrawalsCents,
+      "Pending host withdrawals"
+    );
 
     if (amountCents > availableCents) {
       throw new Error("Insufficient available host earnings.");
     }
 
+    const newReservedCents = reservedCents + amountCents;
+
+    if (!Number.isSafeInteger(newReservedCents)) {
+      throw new Error("The resulting withdrawal balance is invalid.");
+    }
+
+    const now = new Date();
+
     transaction.create(withdrawalRef, {
       hostId,
-      amount,
+      amount: amountCents / 100,
       amountCents,
       currency: "ZAR",
-
-      bankDetails: {
-        accountHolder,
-        bankName,
-        accountNumber,
-        accountType,
-      },
-
+      bankDetails: validatedBankDetails,
       status: "pending",
       payoutMethod: "manual",
       adminNotified: false,
-
-      createdAt: new Date(),
-      updatedAt: new Date(),
+      createdAt: now,
+      updatedAt: now,
     });
 
     transaction.update(hostRef, {
-      availableHostEarningsCents:
-        availableCents - amountCents,
-
-      pendingHostWithdrawalsCents:
-        reservedCents + amountCents,
-
-      updatedAt: new Date(),
+      availableHostEarningsCents: availableCents - amountCents,
+      pendingHostWithdrawalsCents: newReservedCents,
+      updatedAt: now,
     });
   });
 
   return {
     success: true,
     withdrawalId: withdrawalRef.id,
-    amount,
+    amount: amountCents / 100,
     currency: "ZAR",
     status: "pending",
   };
 }
 
-/*
-|--------------------------------------------------------------------------
-| ADMINISTRATOR MARKS A WITHDRAWAL AS PAID
-|--------------------------------------------------------------------------
-| Call only from a properly authenticated and authorized admin route
-| after confirming that the bank transfer actually succeeded.
-|
-| This marks the withdrawal paid. It does not initiate a transfer.
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// MARK WITHDRAWAL AS PAID
+// ============================================================
+//
+// An authorized administrator must confirm the real bank transfer
+// before calling this function. It does not transfer money.
+// ============================================================
 
 export async function markHostWithdrawalPaid({
   withdrawalId,
   adminId,
   payoutReference,
 }) {
-  withdrawalId = requireString(
+  withdrawalId = requireDocumentId(
     withdrawalId,
     "Withdrawal ID"
   );
 
-  adminId = requireString(adminId, "Administrator ID");
+  adminId = requireDocumentId(adminId, "Administrator ID");
 
-  if (
-    payoutReference !== undefined &&
-    payoutReference !== null &&
-    (
-      typeof payoutReference !== "string" ||
-      payoutReference.trim().length > 200
-    )
-  ) {
-    throw new Error("Payout reference is invalid.");
-  }
+  const normalizedPayoutReference =
+    payoutReference === undefined || payoutReference === null
+      ? null
+      : requireString(
+          payoutReference,
+          "Payout reference",
+          MAX_PAYOUT_REFERENCE_LENGTH
+        );
 
-  const withdrawalRef =
-    withdrawalsCollection.doc(withdrawalId);
+  const withdrawalRef = withdrawalsCollection.doc(withdrawalId);
 
   return db.runTransaction(async (transaction) => {
-    const withdrawalSnapshot =
-      await transaction.get(withdrawalRef);
+    const withdrawalSnapshot = await transaction.get(withdrawalRef);
 
     if (!withdrawalSnapshot.exists) {
       throw new Error("Withdrawal request was not found.");
     }
 
     const withdrawal = withdrawalSnapshot.data();
+
+    validateWithdrawalRecord(withdrawal);
 
     if (withdrawal.status === "paid") {
       return {
@@ -670,92 +747,71 @@ export async function markHostWithdrawalPaid({
       );
     }
 
-    const hostRef = usersCollection.doc(withdrawal.hostId);
+    const hostRef = hostsCollection.doc(withdrawal.hostId);
     const hostSnapshot = await transaction.get(hostRef);
 
     if (!hostSnapshot.exists) {
       throw new Error("Host account was not found.");
     }
 
-    const pendingCents = Math.round(
-      toSafeNumber(
-        hostSnapshot.get("pendingHostWithdrawalsCents"),
-        0
-      )
+    const pendingCents = readStoredCents(
+      hostSnapshot.get("pendingHostWithdrawalsCents"),
+      "Pending host withdrawals"
     );
 
-    if (
-      !Number.isSafeInteger(pendingCents) ||
-      pendingCents < withdrawal.amountCents
-    ) {
+    if (pendingCents < withdrawal.amountCents) {
       throw new Error(
         "Pending withdrawal balance does not match the request."
       );
     }
 
+    const now = new Date();
+
     transaction.update(hostRef, {
       pendingHostWithdrawalsCents:
         pendingCents - withdrawal.amountCents,
-
-      updatedAt: new Date(),
+      updatedAt: now,
     });
 
     transaction.update(withdrawalRef, {
       status: "paid",
       payoutMethod: "manual",
-      payoutReference: payoutReference
-        ? payoutReference.trim()
-        : null,
+      payoutReference: normalizedPayoutReference,
       processedBy: adminId,
-      paidAt: new Date(),
-      updatedAt: new Date(),
+      paidAt: now,
+      updatedAt: now,
     });
 
     return {
       success: true,
       alreadyPaid: false,
       withdrawalId,
-      amount: withdrawal.amount,
+      amount: withdrawal.amountCents / 100,
     };
   });
 }
 
-/*
-|--------------------------------------------------------------------------
-| ADMINISTRATOR REJECTS A WITHDRAWAL
-|--------------------------------------------------------------------------
-| Releases the reserved amount back to the host's available balance.
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// REJECT WITHDRAWAL
+// ============================================================
 
 export async function rejectHostWithdrawal({
   withdrawalId,
   adminId,
   reason,
 }) {
-  withdrawalId = requireString(
+  withdrawalId = requireDocumentId(
     withdrawalId,
     "Withdrawal ID"
   );
 
-  adminId = requireString(adminId, "Administrator ID");
+  adminId = requireDocumentId(adminId, "Administrator ID");
+  reason = requireString(reason, "Rejection reason", MAX_REASON_LENGTH);
 
-  if (
-    typeof reason !== "string" ||
-    reason.trim().length === 0 ||
-    reason.trim().length > 500
-  ) {
-    throw new Error(
-      "A rejection reason of up to 500 characters is required."
-    );
-  }
-
-  const withdrawalRef =
-    withdrawalsCollection.doc(withdrawalId);
+  const withdrawalRef = withdrawalsCollection.doc(withdrawalId);
 
   return db.runTransaction(async (transaction) => {
-    const withdrawalSnapshot =
-      await transaction.get(withdrawalRef);
+    const withdrawalSnapshot = await transaction.get(withdrawalRef);
 
     if (!withdrawalSnapshot.exists) {
       throw new Error("Withdrawal request was not found.");
@@ -763,13 +819,15 @@ export async function rejectHostWithdrawal({
 
     const withdrawal = withdrawalSnapshot.data();
 
+    validateWithdrawalRecord(withdrawal);
+
     if (withdrawal.status !== "pending") {
       throw new Error(
         "Only pending withdrawals can be rejected."
       );
     }
 
-    const hostRef = usersCollection.doc(withdrawal.hostId);
+    const hostRef = hostsCollection.doc(withdrawal.hostId);
     const hostSnapshot = await transaction.get(hostRef);
 
     if (!hostSnapshot.exists) {
@@ -778,41 +836,43 @@ export async function rejectHostWithdrawal({
 
     const host = hostSnapshot.data();
 
-    const availableCents = Math.round(
-      toSafeNumber(host.availableHostEarningsCents, 0)
+    const availableCents = readStoredCents(
+      host.availableHostEarningsCents,
+      "Available host earnings"
     );
 
-    const pendingCents = Math.round(
-      toSafeNumber(host.pendingHostWithdrawalsCents, 0)
+    const pendingCents = readStoredCents(
+      host.pendingHostWithdrawalsCents,
+      "Pending host withdrawals"
     );
 
-    if (
-      !Number.isSafeInteger(availableCents) ||
-      !Number.isSafeInteger(pendingCents) ||
-      availableCents < 0 ||
-      pendingCents < withdrawal.amountCents
-    ) {
+    if (pendingCents < withdrawal.amountCents) {
       throw new Error(
-        "Host withdrawal balances are invalid."
+        "Pending withdrawal balance does not match the request."
       );
     }
 
-    transaction.update(hostRef, {
-      availableHostEarningsCents:
-        availableCents + withdrawal.amountCents,
+    const newAvailableCents = availableCents + withdrawal.amountCents;
 
+    if (!Number.isSafeInteger(newAvailableCents)) {
+      throw new Error("The resulting host balance is invalid.");
+    }
+
+    const now = new Date();
+
+    transaction.update(hostRef, {
+      availableHostEarningsCents: newAvailableCents,
       pendingHostWithdrawalsCents:
         pendingCents - withdrawal.amountCents,
-
-      updatedAt: new Date(),
+      updatedAt: now,
     });
 
     transaction.update(withdrawalRef, {
       status: "rejected",
-      rejectionReason: reason.trim(),
+      rejectionReason: reason,
       processedBy: adminId,
-      rejectedAt: new Date(),
-      updatedAt: new Date(),
+      rejectedAt: now,
+      updatedAt: now,
     });
 
     return {

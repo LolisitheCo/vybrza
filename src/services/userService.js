@@ -4,19 +4,67 @@ const usersCollection = db.collection("users");
 
 /*
 |--------------------------------------------------------------------------
+| HELPERS
+|--------------------------------------------------------------------------
+*/
+
+function toUser(doc) {
+  return {
+    id: doc.id,
+    ...doc.data(),
+  };
+}
+
+function normalizeMinutes(value) {
+  const minutes = Number(value ?? 0);
+
+  if (!Number.isSafeInteger(minutes) || minutes < 0) {
+    throw new Error("Invalid user minute balance.");
+  }
+
+  return minutes;
+}
+
+function normalizeTelegramId(telegramId) {
+  if (
+    telegramId === undefined ||
+    telegramId === null ||
+    !/^\d+$/.test(String(telegramId))
+  ) {
+    throw new Error("A valid Telegram ID is required.");
+  }
+
+  return String(telegramId);
+}
+
+function normalizeEmail(email) {
+  if (typeof email !== "string") {
+    throw new Error("A valid payment email address is required.");
+  }
+
+  const normalized = email.trim().toLowerCase();
+
+  if (
+    normalized.length > 254 ||
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)
+  ) {
+    throw new Error("A valid payment email address is required.");
+  }
+
+  return normalized;
+}
+
+/*
+|--------------------------------------------------------------------------
 | GET USER BY TELEGRAM ID
 |--------------------------------------------------------------------------
 */
 
-export async function getUserByTelegramId(
-  telegramId
-) {
+export async function getUserByTelegramId(telegramId) {
+  const id = normalizeTelegramId(telegramId);
+
   const snapshot = await usersCollection
-    .where(
-      "telegramId",
-      "==",
-      String(telegramId)
-    )
+    .where("telegramId", "==", id)
     .limit(1)
     .get();
 
@@ -24,111 +72,86 @@ export async function getUserByTelegramId(
     return null;
   }
 
-  const doc = snapshot.docs[0];
-
-  return {
-    id: doc.id,
-    ...doc.data(),
-  };
+  return toUser(snapshot.docs[0]);
 }
 
 /*
 |--------------------------------------------------------------------------
 | CREATE USER
 |--------------------------------------------------------------------------
+| Uses a deterministic document ID based on Telegram ID to prevent
+| duplicate user documents from concurrent registration attempts.
+|--------------------------------------------------------------------------
 */
 
-export async function createUser(
-  telegramUser
-) {
-  const telegramId = String(
-    telegramUser.id
-  );
-
-  const existingUser =
-    await getUserByTelegramId(
-      telegramId
-    );
-
-  if (existingUser) {
-    return existingUser;
+export async function createUser(telegramUser) {
+  if (
+    !telegramUser ||
+    telegramUser.id === undefined ||
+    telegramUser.id === null
+  ) {
+    throw new Error("A valid Telegram user is required.");
   }
 
-  const now = new Date();
+  const telegramId = normalizeTelegramId(telegramUser.id);
+  const userRef = usersCollection.doc(`tg_${telegramId}`);
 
-  const userData = {
-    telegramId,
+  return db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(userRef);
 
-    username:
-      telegramUser.username || null,
+    if (snapshot.exists) {
+      return toUser(snapshot);
+    }
 
-    firstName:
-      telegramUser.first_name || "",
+    const now = new Date();
 
-    lastName:
-      telegramUser.last_name || "",
+    const displayName = [
+      telegramUser.first_name,
+      telegramUser.last_name,
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .trim() || "SA LIVE User";
 
-    profile: {
-      displayName:
-        [
-          telegramUser.first_name,
-          telegramUser.last_name,
-        ]
-          .filter(Boolean)
-          .join(" ") ||
-        "SA LIVE User",
+    const userData = {
+      telegramId,
+      username: telegramUser.username || null,
+      firstName: telegramUser.first_name || "",
+      lastName: telegramUser.last_name || "",
 
-      bio: "",
-    },
+      profile: {
+        displayName,
+        bio: "",
+      },
 
-    verificationStatus:
-      "pending",
+      verificationStatus: "pending",
 
-    verification: {
-      submittedAt: null,
-      reviewedAt: null,
-      reviewedBy: null,
-      rejectionReason: null,
-    },
+      verification: {
+        submittedAt: null,
+        reviewedAt: null,
+        reviewedBy: null,
+        rejectionReason: null,
+      },
 
-    /*
-    |--------------------------------------------------------------------------
-    | BALANCE
-    |--------------------------------------------------------------------------
-    */
+      // Purchased minutes only.
+      minutes: 0,
 
-    minutes: 0,
+      activeCallId: null,
+      role: "user",
+      paymentEmail: null,
+      pendingPaymentPackageId: null,
 
-    /*
-    |--------------------------------------------------------------------------
-    | CALL STATE
-    |--------------------------------------------------------------------------
-    */
+      createdAt: now,
+      updatedAt: now,
+    };
 
-    activeCallId: null,
+    transaction.create(userRef, userData);
 
-    /*
-    |--------------------------------------------------------------------------
-    | USER ROLE
-    |--------------------------------------------------------------------------
-    */
-
-    role: "user",
-
-    createdAt: now,
-
-    updatedAt: now,
-  };
-
-  const docRef =
-    await usersCollection.add(
-      userData
-    );
-
-  return {
-    id: docRef.id,
-    ...userData,
-  };
+    return {
+      id: userRef.id,
+      ...userData,
+    };
+  });
 }
 
 /*
@@ -137,21 +160,16 @@ export async function createUser(
 |--------------------------------------------------------------------------
 */
 
-export async function getOrCreateUser(
-  telegramUser
-) {
-  const existingUser =
-    await getUserByTelegramId(
-      telegramUser.id
-    );
-
-  if (existingUser) {
-    return existingUser;
+export async function getOrCreateUser(telegramUser) {
+  if (
+    !telegramUser ||
+    telegramUser.id === undefined ||
+    telegramUser.id === null
+  ) {
+    throw new Error("A valid Telegram user is required.");
   }
 
-  return createUser(
-    telegramUser
-  );
+  return createUser(telegramUser);
 }
 
 /*
@@ -160,55 +178,46 @@ export async function getOrCreateUser(
 |--------------------------------------------------------------------------
 */
 
-export async function submitVerification(
-  userId
-) {
-  const userRef =
-    usersCollection.doc(userId);
-
-  const snapshot =
-    await userRef.get();
-
-  if (!snapshot.exists) {
-    throw new Error(
-      "User not found."
-    );
+export async function submitVerification(userId) {
+  if (typeof userId !== "string" || !userId.trim()) {
+    throw new Error("User ID is required.");
   }
 
-  const user = snapshot.data();
+  const userRef = usersCollection.doc(userId.trim());
 
-  /*
-  |--------------------------------------------------------------------------
-  | Already approved
-  |--------------------------------------------------------------------------
-  */
+  return db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(userRef);
 
-  if (
-    user.verificationStatus ===
-    "approved"
-  ) {
-    return;
-  }
+    if (!snapshot.exists) {
+      throw new Error("User not found.");
+    }
 
-  const now = new Date();
+    const user = snapshot.data();
 
-  await userRef.update({
-    verificationStatus:
-      "pending",
+    if (user.verificationStatus === "approved") {
+      return {
+        success: true,
+        alreadyApproved: true,
+        verificationStatus: "approved",
+      };
+    }
 
-    "verification.submittedAt":
-      now,
+    const now = new Date();
 
-    "verification.reviewedAt":
-      null,
+    transaction.update(userRef, {
+      verificationStatus: "pending",
+      "verification.submittedAt": now,
+      "verification.reviewedAt": null,
+      "verification.reviewedBy": null,
+      "verification.rejectionReason": null,
+      updatedAt: now,
+    });
 
-    "verification.reviewedBy":
-      null,
-
-    "verification.rejectionReason":
-      null,
-
-    updatedAt: now,
+    return {
+      success: true,
+      alreadyApproved: false,
+      verificationStatus: "pending",
+    };
   });
 }
 
@@ -216,96 +225,58 @@ export async function submitVerification(
 |--------------------------------------------------------------------------
 | APPROVE VERIFICATION
 |--------------------------------------------------------------------------
+| Never grants free minutes.
+|--------------------------------------------------------------------------
 */
 
-export async function approveVerification(
-  userId,
-  adminTelegramId
-) {
-  const userRef =
-    usersCollection.doc(userId);
+export async function approveVerification(userId, adminTelegramId) {
+  if (
+    typeof userId !== "string" ||
+    !userId.trim() ||
+    adminTelegramId === undefined ||
+    adminTelegramId === null
+  ) {
+    throw new Error(
+      "User ID and administrator Telegram ID are required."
+    );
+  }
 
-  return db.runTransaction(
-    async (transaction) => {
-      const snapshot =
-        await transaction.get(
-          userRef
-        );
+  const userRef = usersCollection.doc(userId.trim());
 
-      if (!snapshot.exists) {
-        throw new Error(
-          "User not found."
-        );
-      }
+  return db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(userRef);
 
-      const user =
-        snapshot.data();
+    if (!snapshot.exists) {
+      throw new Error("User not found.");
+    }
 
-      /*
-      |--------------------------------------------------------------------------
-      | Prevent duplicate free minutes
-      |--------------------------------------------------------------------------
-      */
+    const user = snapshot.data();
+    const currentMinutes = normalizeMinutes(user.minutes);
 
-      if (
-        user.verificationStatus ===
-        "approved"
-      ) {
-        return {
-          alreadyApproved: true,
-
-          minutes:
-            Number(
-              user.minutes || 0
-            ),
-        };
-      }
-
-      const currentMinutes =
-        Number(
-          user.minutes || 0
-        );
-
-      const newMinutes =
-        currentMinutes + 5;
-
-      const now =
-        new Date();
-
-      transaction.update(
-        userRef,
-        {
-          verificationStatus:
-            "approved",
-
-          minutes:
-            newMinutes,
-
-          "verification.reviewedAt":
-            now,
-
-          "verification.reviewedBy":
-            String(
-              adminTelegramId
-            ),
-
-          "verification.rejectionReason":
-            null,
-
-          updatedAt:
-            now,
-        }
-      );
-
+    if (user.verificationStatus === "approved") {
       return {
-        alreadyApproved:
-          false,
-
-        minutes:
-          newMinutes,
+        alreadyApproved: true,
+        verificationStatus: "approved",
+        minutes: currentMinutes,
       };
     }
-  );
+
+    const now = new Date();
+
+    transaction.update(userRef, {
+      verificationStatus: "approved",
+      "verification.reviewedAt": now,
+      "verification.reviewedBy": String(adminTelegramId),
+      "verification.rejectionReason": null,
+      updatedAt: now,
+    });
+
+    return {
+      alreadyApproved: false,
+      verificationStatus: "approved",
+      minutes: currentMinutes,
+    };
+  });
 }
 
 /*
@@ -317,38 +288,52 @@ export async function approveVerification(
 export async function rejectVerification(
   userId,
   adminTelegramId,
-  reason =
-    "Verification was not approved."
+  reason = "Verification was not approved."
 ) {
-  const userRef =
-    usersCollection.doc(userId);
-
-  const snapshot =
-    await userRef.get();
-
-  if (!snapshot.exists) {
+  if (
+    typeof userId !== "string" ||
+    !userId.trim() ||
+    adminTelegramId === undefined ||
+    adminTelegramId === null
+  ) {
     throw new Error(
-      "User not found."
+      "User ID and administrator Telegram ID are required."
     );
   }
 
-  await userRef.update({
-    verificationStatus:
-      "rejected",
+  if (typeof reason !== "string" || !reason.trim()) {
+    throw new Error("A rejection reason is required.");
+  }
 
-    "verification.reviewedAt":
-      new Date(),
+  const userRef = usersCollection.doc(userId.trim());
 
-    "verification.reviewedBy":
-      String(
-        adminTelegramId
-      ),
+  return db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(userRef);
 
-    "verification.rejectionReason":
-      reason,
+    if (!snapshot.exists) {
+      throw new Error("User not found.");
+    }
 
-    updatedAt:
-      new Date(),
+    if (snapshot.data().verificationStatus === "approved") {
+      throw new Error(
+        "An approved user's verification cannot be rejected directly."
+      );
+    }
+
+    const now = new Date();
+
+    transaction.update(userRef, {
+      verificationStatus: "rejected",
+      "verification.reviewedAt": now,
+      "verification.reviewedBy": String(adminTelegramId),
+      "verification.rejectionReason": reason.trim(),
+      updatedAt: now,
+    });
+
+    return {
+      success: true,
+      verificationStatus: "rejected",
+    };
   });
 }
 
@@ -359,141 +344,102 @@ export async function rejectVerification(
 */
 
 export async function getPendingUsers() {
-  const snapshot =
-    await usersCollection
-      .where(
-        "verificationStatus",
-        "==",
-        "pending"
-      )
-      .get();
+  const snapshot = await usersCollection
+    .where("verificationStatus", "==", "pending")
+    .get();
 
-  const users =
-    snapshot.docs.map(
-      (doc) => ({
-        id: doc.id,
-        ...doc.data(),
-      })
-    );
+  const users = snapshot.docs.map(toUser);
 
-  /*
-  |--------------------------------------------------------------------------
-  | Sort oldest requests first
-  |--------------------------------------------------------------------------
-  */
-
-  users.sort(
-    (a, b) => {
-      const aTime =
-        a.createdAt?.toMillis?.() ||
-        0;
-
-      const bTime =
-        b.createdAt?.toMillis?.() ||
-        0;
-
-      return (
-        aTime - bTime
-      );
+  function getTimestamp(value) {
+    if (value?.toMillis) {
+      return value.toMillis();
     }
-  );
+
+    if (value instanceof Date) {
+      return value.getTime();
+    }
+
+    return 0;
+  }
+
+  users.sort((a, b) => {
+    return (
+      getTimestamp(a.verification?.submittedAt || a.createdAt) -
+      getTimestamp(b.verification?.submittedAt || b.createdAt)
+    );
+  });
 
   return users;
 }
 
 /*
 |--------------------------------------------------------------------------
-| GET BALANCE
+| GET USER MINUTES
 |--------------------------------------------------------------------------
 */
 
-export async function getUserMinutes(
-  userId
-) {
-  const userRef =
-    usersCollection.doc(userId);
-
-  const snapshot =
-    await userRef.get();
-
-  if (!snapshot.exists) {
-    throw new Error(
-      "User not found."
-    );
+export async function getUserMinutes(userId) {
+  if (typeof userId !== "string" || !userId.trim()) {
+    throw new Error("User ID is required.");
   }
 
-  const user =
-    snapshot.data();
+  const snapshot = await usersCollection.doc(userId.trim()).get();
 
-  return Number(
-    user.minutes || 0
-  );
+  if (!snapshot.exists) {
+    throw new Error("User not found.");
+  }
+
+  return normalizeMinutes(snapshot.data().minutes);
 }
 
 /*
 |--------------------------------------------------------------------------
 | ADD MINUTES
 |--------------------------------------------------------------------------
+| Call only after trusted backend payment verification.
+| Payment idempotency must be enforced by the payment service.
+|--------------------------------------------------------------------------
 */
 
-export async function addMinutes(
-  userId,
-  minutes
-) {
-  const amount =
-    Number(minutes);
+export async function addMinutes(userId, minutes) {
+  const amount = Number(minutes);
 
-  if (
-    !Number.isFinite(amount) ||
-    amount <= 0
-  ) {
+  if (typeof userId !== "string" || !userId.trim()) {
+    throw new Error("User ID is required.");
+  }
+
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
     throw new Error(
-      "Minutes must be greater than zero."
+      "Minutes to add must be a positive whole number."
     );
   }
 
-  const userRef =
-    usersCollection.doc(userId);
+  const userRef = usersCollection.doc(userId.trim());
 
-  return db.runTransaction(
-    async (transaction) => {
-      const snapshot =
-        await transaction.get(
-          userRef
-        );
+  return db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(userRef);
 
-      if (!snapshot.exists) {
-        throw new Error(
-          "User not found."
-        );
-      }
-
-      const user =
-        snapshot.data();
-
-      const currentMinutes =
-        Number(
-          user.minutes || 0
-        );
-
-      const newMinutes =
-        currentMinutes +
-        amount;
-
-      transaction.update(
-        userRef,
-        {
-          minutes:
-            newMinutes,
-
-          updatedAt:
-            new Date(),
-        }
-      );
-
-      return newMinutes;
+    if (!snapshot.exists) {
+      throw new Error("User not found.");
     }
-  );
+
+    const currentMinutes = normalizeMinutes(
+      snapshot.data().minutes
+    );
+
+    const newMinutes = currentMinutes + amount;
+
+    if (!Number.isSafeInteger(newMinutes)) {
+      throw new Error("The resulting minute balance is invalid.");
+    }
+
+    transaction.update(userRef, {
+      minutes: newMinutes,
+      updatedAt: new Date(),
+    });
+
+    return newMinutes;
+  });
 }
 
 /*
@@ -502,139 +448,144 @@ export async function addMinutes(
 |--------------------------------------------------------------------------
 */
 
-export async function deductMinutes(
-  userId,
-  minutes
-) {
-  const amount =
-    Number(minutes);
+export async function deductMinutes(userId, minutes) {
+  const amount = Number(minutes);
 
-  if (
-    !Number.isFinite(amount) ||
-    amount <= 0
-  ) {
+  if (typeof userId !== "string" || !userId.trim()) {
+    throw new Error("User ID is required.");
+  }
+
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
     throw new Error(
-      "Minutes must be greater than zero."
+      "Minutes to deduct must be a positive whole number."
     );
   }
 
-  const userRef =
-    usersCollection.doc(userId);
+  const userRef = usersCollection.doc(userId.trim());
 
-  return db.runTransaction(
-    async (transaction) => {
-      const snapshot =
-        await transaction.get(
-          userRef
-        );
+  return db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(userRef);
 
-      if (!snapshot.exists) {
-        throw new Error(
-          "User not found."
-        );
-      }
-
-      const user =
-        snapshot.data();
-
-      const currentMinutes =
-        Number(
-          user.minutes || 0
-        );
-
-      if (
-        currentMinutes <= 0
-      ) {
-        throw new Error(
-          "User has no available minutes."
-        );
-      }
-
-      const newMinutes =
-        Math.max(
-          0,
-          currentMinutes -
-            amount
-        );
-
-      transaction.update(
-        userRef,
-        {
-          minutes:
-            newMinutes,
-
-          updatedAt:
-            new Date(),
-        }
-      );
-
-      return newMinutes;
+    if (!snapshot.exists) {
+      throw new Error("User not found.");
     }
-  );
+
+    const currentMinutes = normalizeMinutes(
+      snapshot.data().minutes
+    );
+
+    if (currentMinutes < amount) {
+      throw new Error("Insufficient available minutes.");
+    }
+
+    const newMinutes = currentMinutes - amount;
+
+    transaction.update(userRef, {
+      minutes: newMinutes,
+      updatedAt: new Date(),
+    });
+
+    return newMinutes;
+  });
 }
 
-// ============================================================
-// PAYMENT EMAIL
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| UPDATE PAYMENT EMAIL
+|--------------------------------------------------------------------------
+*/
 
-export async function updateUserPaymentEmail(
-  userId,
-  email
-) {
-  const userRef =
-    usersCollection.doc(userId);
+export async function updateUserPaymentEmail(userId, email) {
+  if (typeof userId !== "string" || !userId.trim()) {
+    throw new Error("User ID is required.");
+  }
 
-  await userRef.update({
-    paymentEmail: email,
-    updatedAt: new Date(),
+  const normalizedEmail = normalizeEmail(email);
+  const userRef = usersCollection.doc(userId.trim());
+
+  await db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(userRef);
+
+    if (!snapshot.exists) {
+      throw new Error("User not found.");
+    }
+
+    transaction.update(userRef, {
+      paymentEmail: normalizedEmail,
+      updatedAt: new Date(),
+    });
   });
 
   return {
     success: true,
-    email,
+    email: normalizedEmail,
   };
 }
 
+/*
+|--------------------------------------------------------------------------
+| SET PENDING PAYMENT PACKAGE
+|--------------------------------------------------------------------------
+*/
 
-// ============================================================
-// PENDING PAYMENT PACKAGE
-// ============================================================
+export async function setPendingPaymentPackage(userId, packageId) {
+  if (
+    typeof userId !== "string" ||
+    !userId.trim() ||
+    typeof packageId !== "string" ||
+    !packageId.trim()
+  ) {
+    throw new Error(
+      "User ID and a valid package ID are required."
+    );
+  }
 
-export async function setPendingPaymentPackage(
-  userId,
-  packageId
-) {
-  const userRef =
-    usersCollection.doc(userId);
+  const normalizedPackageId = packageId.trim();
+  const userRef = usersCollection.doc(userId.trim());
 
-  await userRef.update({
-    pendingPaymentPackageId:
-      packageId,
+  await db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(userRef);
 
-    updatedAt:
-      new Date(),
+    if (!snapshot.exists) {
+      throw new Error("User not found.");
+    }
+
+    transaction.update(userRef, {
+      pendingPaymentPackageId: normalizedPackageId,
+      updatedAt: new Date(),
+    });
   });
 
   return {
     success: true,
-    packageId,
+    packageId: normalizedPackageId,
   };
 }
 
+/*
+|--------------------------------------------------------------------------
+| CLEAR PENDING PAYMENT
+|--------------------------------------------------------------------------
+*/
 
-// ============================================================
-// CLEAR PENDING PAYMENT
-// ============================================================
+export async function clearPendingPayment(userId) {
+  if (typeof userId !== "string" || !userId.trim()) {
+    throw new Error("User ID is required.");
+  }
 
-export async function clearPendingPayment(
-  userId
-) {
-  const userRef =
-    usersCollection.doc(userId);
+  const userRef = usersCollection.doc(userId.trim());
 
-  await userRef.update({
-    pendingPaymentPackageId: null,
-    updatedAt: new Date(),
+  await db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(userRef);
+
+    if (!snapshot.exists) {
+      throw new Error("User not found.");
+    }
+
+    transaction.update(userRef, {
+      pendingPaymentPackageId: null,
+      updatedAt: new Date(),
+    });
   });
 
   return {
