@@ -7,6 +7,7 @@ import cors from "cors";
 import { bot } from "./bot/bot.js";
 import hostRoutes from "./routes/hostRoutes.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
+import adminManagementRoutes from "./routes/adminManagementRoutes.js";
 
 const app = express();
 
@@ -190,6 +191,7 @@ app.get("/health", (req, res) => {
 
 app.use("/api/hosts", hostRoutes);
 app.use("/api/payments", paymentRoutes);
+app.use("/api/admin", adminManagementRoutes);
 
 /*
 |--------------------------------------------------------------------------
