@@ -1,3 +1,4 @@
+
 import { db } from "../config/firebase.js";
 
 const usersCollection = db.collection("users");
@@ -79,8 +80,8 @@ export async function getUserByTelegramId(telegramId) {
 |--------------------------------------------------------------------------
 | CREATE USER
 |--------------------------------------------------------------------------
-| Uses a deterministic document ID based on Telegram ID to prevent
-| duplicate user documents from concurrent registration attempts.
+| Telegram is the registration identity.
+| Email is collected separately for PayFast payments.
 |--------------------------------------------------------------------------
 */
 
@@ -133,12 +134,15 @@ export async function createUser(telegramUser) {
         rejectionReason: null,
       },
 
-      // Purchased minutes only.
+      // Purchased call minutes only.
       minutes: 0,
 
       activeCallId: null,
       role: "user",
+
+      // PayFast email is collected separately.
       paymentEmail: null,
+
       pendingPaymentPackageId: null,
 
       createdAt: now,
@@ -396,8 +400,8 @@ export async function getUserMinutes(userId) {
 |--------------------------------------------------------------------------
 | ADD MINUTES
 |--------------------------------------------------------------------------
-| Call only after trusted backend payment verification.
-| Payment idempotency must be enforced by the payment service.
+| Only call after verified payment processing.
+| Payment idempotency belongs to paymentService.js.
 |--------------------------------------------------------------------------
 */
 
@@ -520,6 +524,35 @@ export async function updateUserPaymentEmail(userId, email) {
     success: true,
     email: normalizedEmail,
   };
+}
+
+/*
+|--------------------------------------------------------------------------
+| GET PAYMENT EMAIL
+|--------------------------------------------------------------------------
+| Existing users may have no paymentEmail field or a null value.
+|--------------------------------------------------------------------------
+*/
+
+export async function getUserPaymentEmail(userId) {
+  if (typeof userId !== "string" || !userId.trim()) {
+    throw new Error("User ID is required.");
+  }
+
+  const snapshot = await usersCollection.doc(userId.trim()).get();
+
+  if (!snapshot.exists) {
+    throw new Error("User not found.");
+  }
+
+  const user = snapshot.data();
+  const email = user.paymentEmail ?? user.email ?? null;
+
+  if (email === null || email === "") {
+    return null;
+  }
+
+  return normalizeEmail(email);
 }
 
 /*
