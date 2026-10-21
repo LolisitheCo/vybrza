@@ -1,5 +1,4 @@
 import "dotenv/config";
-import path from "node";
 import { Telegraf } from "telegraf";
 
 import {
