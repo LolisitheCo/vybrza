@@ -34,17 +34,7 @@ const PAYFAST_SOURCE_RANGES = Object.freeze([
   "144.126.193.139/32",
 ]);
 
-function getPayfastMode() {
-  const mode = (
-    process.env.PAYFAST_MODE || "live"
-  ).trim().toLowerCase();
 
-  if (!Object.hasOwn(PAYFAST_HOSTS, mode)) {
-    throw new Error("Invalid PayFast mode.");
-  }
-
-  return mode;
-}
 
 function getPassphrase() {
   const value = process.env.PAYFAST_PASSPHRASE;
