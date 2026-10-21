@@ -9,6 +9,9 @@ const PAYFAST_URLS = Object.freeze({
   sandbox: "https://sandbox.payfast.co.za/eng/process",
 });
 
+const PAYMENT_REFERENCE_PATTERN = /^SALIVE-[A-F0-9]{32}$/;
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 function requiredEnv(name) {
   const value = process.env[name];
 
@@ -20,25 +23,29 @@ function requiredEnv(name) {
 }
 
 function validateUrl(value, name, mode) {
-  if (!value) {
+  if (typeof value !== "string" || !value.trim()) {
     throw new Error(`${name} is missing.`);
   }
 
   let parsed;
 
   try {
-    parsed = new URL(value);
+    parsed = new URL(value.trim());
   } catch {
     throw new Error(`${name} must be a valid URL.`);
   }
 
-  if (
-    parsed.protocol !== "https:" &&
-    !(mode === "sandbox" &&
-      ["localhost", "127.0.0.1"].includes(parsed.hostname) &&
-      parsed.protocol === "http:")
-  ) {
+  const localSandbox =
+    mode === "sandbox" &&
+    ["localhost", "127.0.0.1"].includes(parsed.hostname) &&
+    parsed.protocol === "http:";
+
+  if (parsed.protocol !== "https:" && !localSandbox) {
     throw new Error(`${name} must use HTTPS.`);
+  }
+
+  if (parsed.username || parsed.password) {
+    throw new Error(`${name} must not contain URL credentials.`);
   }
 
   return parsed.toString();
@@ -125,13 +132,15 @@ export async function initializePayfastTransaction({
 }) {
   const config = getPayfastConfig();
 
+  // Validate the reference before constructing checkout fields.
   if (
     typeof reference !== "string" ||
-    !/^SALIVE-[A-F0-9]{32}$/.test(reference)
+    !PAYMENT_REFERENCE_PATTERN.test(reference.trim())
   ) {
     throw new Error("A valid payment reference is required.");
   }
 
+  const normalizedReference = reference.trim();
   const numericAmount = Number(amount);
 
   if (
@@ -139,13 +148,15 @@ export async function initializePayfastTransaction({
     numericAmount < 5 ||
     Math.round(numericAmount * 100) !== numericAmount * 100
   ) {
-    throw new Error("Payment amount must be at least R5.00.");
+    throw new Error(
+      "Payment amount must be at least R5.00 with no more than two decimal places."
+    );
   }
 
   if (
     typeof email !== "string" ||
     email.length > 254 ||
-    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+    !EMAIL_PATTERN.test(email.trim())
   ) {
     throw new Error("A valid customer email address is required.");
   }
@@ -158,6 +169,8 @@ export async function initializePayfastTransaction({
     throw new Error("Payment metadata must be an object.");
   }
 
+  // These values come from server-side configuration and the
+  // trusted payment controller, not directly from the browser.
   const fields = {
     merchant_id: config.merchantId,
     merchant_key: config.merchantKey,
@@ -165,22 +178,27 @@ export async function initializePayfastTransaction({
     cancel_url: config.cancelUrl,
     notify_url: config.notifyUrl,
     email_address: email.trim().toLowerCase(),
-    m_payment_id: reference,
+    m_payment_id: normalizedReference,
     amount: numericAmount.toFixed(2),
     item_name: "SA LIVE Call Minutes",
-    item_description: `SA LIVE call time top-up: ${numericAmount.toFixed(2)} ZAR`,
+    item_description:
+      `SA LIVE call time top-up: ${numericAmount.toFixed(2)} ZAR`,
   };
 
-  for (const key of [
+  const allowedMetadataKeys = [
     "custom_str1",
     "custom_str2",
     "custom_str3",
     "custom_str4",
     "custom_str5",
-  ]) {
+  ];
+
+  for (const key of allowedMetadataKeys) {
     const value = metadata[key];
 
-    if (value === undefined || value === null) continue;
+    if (value === undefined || value === null) {
+      continue;
+    }
 
     if (typeof value !== "string" || value.length > 255) {
       throw new Error(`Invalid PayFast metadata field: ${key}.`);
@@ -198,7 +216,7 @@ export async function initializePayfastTransaction({
     provider: "payfast",
     mode: config.mode,
     paymentUrl: config.processUrl,
-    reference,
+    reference: normalizedReference,
     fields,
   };
 }
