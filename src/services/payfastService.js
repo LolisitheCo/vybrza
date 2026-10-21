@@ -9,9 +9,6 @@ const PAYFAST_URLS = Object.freeze({
   sandbox: "https://sandbox.payfast.co.za/eng/process",
 });
 
-const PAYMENT_REFERENCE_PATTERN = /^SALIVE-[A-F0-9]{32}$/;
-const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
 function requiredEnv(name) {
   const value = process.env[name];
 
@@ -23,29 +20,23 @@ function requiredEnv(name) {
 }
 
 function validateUrl(value, name, mode) {
-  if (typeof value !== "string" || !value.trim()) {
-    throw new Error(`${name} is missing.`);
-  }
-
   let parsed;
 
   try {
-    parsed = new URL(value.trim());
+    parsed = new URL(value);
   } catch {
-    throw new Error(`${name} must be a valid URL.`);
+    throw new Error(`${name} must be a valid absolute URL.`);
   }
 
-  const localSandbox =
-    mode === "sandbox" &&
-    ["localhost", "127.0.0.1"].includes(parsed.hostname) &&
-    parsed.protocol === "http:";
-
-  if (parsed.protocol !== "https:" && !localSandbox) {
+  if (
+    parsed.protocol !== "https:" &&
+    !(
+      mode === "sandbox" &&
+      parsed.protocol === "http:" &&
+      ["localhost", "127.0.0.1"].includes(parsed.hostname)
+    )
+  ) {
     throw new Error(`${name} must use HTTPS.`);
-  }
-
-  if (parsed.username || parsed.password) {
-    throw new Error(`${name} must not contain URL credentials.`);
   }
 
   return parsed.toString();
@@ -74,17 +65,17 @@ function getPayfastConfig() {
     merchantKey,
     passphrase,
     returnUrl: validateUrl(
-      process.env.PAYFAST_RETURN_URL,
+      requiredEnv("PAYFAST_RETURN_URL"),
       "PAYFAST_RETURN_URL",
       mode
     ),
     cancelUrl: validateUrl(
-      process.env.PAYFAST_CANCEL_URL,
+      requiredEnv("PAYFAST_CANCEL_URL"),
       "PAYFAST_CANCEL_URL",
       mode
     ),
     notifyUrl: validateUrl(
-      process.env.PAYFAST_NOTIFY_URL,
+      requiredEnv("PAYFAST_NOTIFY_URL"),
       "PAYFAST_NOTIFY_URL",
       mode
     ),
@@ -130,17 +121,17 @@ export async function initializePayfastTransaction({
   reference,
   metadata = {},
 }) {
-  const config = getPayfastConfig();
-
-  // Validate the reference before constructing checkout fields.
+  // Validate the reference before reading payment credentials.
   if (
     typeof reference !== "string" ||
-    !PAYMENT_REFERENCE_PATTERN.test(reference.trim())
+    !/^SALIVE-[A-F0-9]{32}$/.test(reference)
   ) {
-    throw new Error("A valid payment reference is required.");
+    throw new Error(
+      `Invalid payment reference format. Received type: ${typeof reference}.`
+    );
   }
 
-  const normalizedReference = reference.trim();
+  const config = getPayfastConfig();
   const numericAmount = Number(amount);
 
   if (
@@ -156,7 +147,7 @@ export async function initializePayfastTransaction({
   if (
     typeof email !== "string" ||
     email.length > 254 ||
-    !EMAIL_PATTERN.test(email.trim())
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
   ) {
     throw new Error("A valid customer email address is required.");
   }
@@ -169,8 +160,6 @@ export async function initializePayfastTransaction({
     throw new Error("Payment metadata must be an object.");
   }
 
-  // These values come from server-side configuration and the
-  // trusted payment controller, not directly from the browser.
   const fields = {
     merchant_id: config.merchantId,
     merchant_key: config.merchantKey,
@@ -178,22 +167,19 @@ export async function initializePayfastTransaction({
     cancel_url: config.cancelUrl,
     notify_url: config.notifyUrl,
     email_address: email.trim().toLowerCase(),
-    m_payment_id: normalizedReference,
+    m_payment_id: reference,
     amount: numericAmount.toFixed(2),
     item_name: "SA LIVE Call Minutes",
-    item_description:
-      `SA LIVE call time top-up: ${numericAmount.toFixed(2)} ZAR`,
+    item_description: `SA LIVE call time top-up: ${numericAmount.toFixed(2)} ZAR`,
   };
 
-  const allowedMetadataKeys = [
+  for (const key of [
     "custom_str1",
     "custom_str2",
     "custom_str3",
     "custom_str4",
     "custom_str5",
-  ];
-
-  for (const key of allowedMetadataKeys) {
+  ]) {
     const value = metadata[key];
 
     if (value === undefined || value === null) {
@@ -216,7 +202,7 @@ export async function initializePayfastTransaction({
     provider: "payfast",
     mode: config.mode,
     paymentUrl: config.processUrl,
-    reference: normalizedReference,
+    reference,
     fields,
   };
 }
