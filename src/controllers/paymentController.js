@@ -60,15 +60,20 @@ function getPassphrase() {
   return value;
 }
 
+
 function getMerchantId() {
   const merchantId = process.env.PAYFAST_MERCHANT_ID;
 
-  if (!/^\d{8}$/.test(merchantId || "")) {
+  if (
+    typeof merchantId !== "string" ||
+    !/^\d{8}$/.test(merchantId.trim())
+  ) {
     throw new Error("PayFast merchant ID is invalid.");
   }
 
-  return merchantId;
+  return merchantId.trim();
 }
+
 
 // ============================================================
 // AUTHENTICATION HELPERS
@@ -234,17 +239,21 @@ function isScalarPayfastField(value) {
 // PAYFAST SIGNATURE VERIFICATION
 // ============================================================
 
-function payfastEncode(value) {
-  return encodeURIComponent(String(value).trim())
-    .replace(/%20/g, "+")
-    .replace(/[!'()*]/g, (character) =>
-      "%" +
-      character
-        .charCodeAt(0)
-        .toString(16)
-        .toUpperCase()
+
+function getPayfastMode() {
+  const mode = (
+    process.env.PAYFAST_MODE || "live"
+  ).trim().toLowerCase();
+
+  if (mode !== "live") {
+    throw new Error(
+      "SA LIVE requires PAYFAST_MODE=live. Sandbox is disabled."
     );
+  }
+
+  return "live";
 }
+
 
 function buildPayfastParameterString(
   fields,
