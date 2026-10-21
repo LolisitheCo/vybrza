@@ -1,4 +1,3 @@
-
 import crypto from "node:crypto";
 import { Markup } from "telegraf";
 
@@ -25,21 +24,40 @@ const PAYMENT_PACKAGES = [
 ];
 
 const PAYMENT_REFERENCE_PATTERN = /^SALIVE-[A-F0-9]{32}$/;
-
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-// Temporary in-memory email collection.
-// Email requests expire when the server restarts.
+// Pending email requests are keyed by Telegram ID.
+// They remain in memory only while this server process runs.
 const pendingEmailRequests = new Map();
 
 // ============================================================
 // HELPERS
 // ============================================================
 
-function getPublicFrontendUrl() {
-  const value = process.env.FRONTEND_URL;
+function normalizeEmail(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
 
-  if (typeof value !== "string" || !value.trim()) {
+  const email = value.trim().toLowerCase();
+
+  if (email.length > 254 || !EMAIL_PATTERN.test(email)) {
+    return null;
+  }
+
+  return email;
+}
+
+function createPaymentReference() {
+  return `SALIVE-${crypto.randomUUID()
+    .replace(/-/g, "")
+    .toUpperCase()}`;
+}
+
+function getPublicFrontendUrl() {
+  const value = process.env.FRONTEND_URL?.trim();
+
+  if (!value) {
     throw new Error("FRONTEND_URL is not configured.");
   }
 
@@ -61,12 +79,6 @@ function getPublicFrontendUrl() {
   }
 
   return url.origin;
-}
-
-function createPaymentReference() {
-  return `SALIVE-${crypto.randomUUID()
-    .replace(/-/g, "")
-    .toUpperCase()}`;
 }
 
 function createCheckoutBridgeUrl(frontendUrl, reference) {
@@ -130,27 +142,97 @@ function formatPackage(paymentPackage) {
     `📦 Package: *${paymentPackage.name}*\n` +
     `💵 Price: *R${amount.toFixed(2)}*\n` +
     `⏱️ Minutes: *${minutes}*\n\n` +
-    `🔐 Payments are processed securely through PayFast.\n\n` +
-    `Minutes are credited only after payment is verified.\n\n` +
+    `🔐 Payments are processed through PayFast.\n\n` +
+    `Your minutes are credited only after the backend verifies payment.\n\n` +
     `_SA LIVE — More than just a call._`
   );
 }
 
-function normalizeEmail(email) {
-  if (typeof email !== "string") {
-    return null;
+function clearPendingEmail(telegramId) {
+  pendingEmailRequests.delete(String(telegramId));
+}
+
+// ============================================================
+// PREPARE PAYMENT
+// ============================================================
+
+async function preparePayment({
+  ctx,
+  user,
+  paymentPackage,
+  email,
+}) {
+  const normalizedEmail = normalizeEmail(email);
+
+  if (!normalizedEmail) {
+    throw new Error("A valid payment email is required.");
   }
 
-  const normalized = email.trim().toLowerCase();
-
-  if (
-    normalized.length > 254 ||
-    !EMAIL_PATTERN.test(normalized)
-  ) {
-    return null;
+  if (!user?.id) {
+    throw new Error("Could not identify the SA LIVE account.");
   }
 
-  return normalized;
+  if (!PAYMENT_PACKAGES.includes(paymentPackage.id)) {
+    throw new Error("Invalid payment package.");
+  }
+
+  const frontendUrl = getPublicFrontendUrl();
+  const reference = createPaymentReference();
+
+  if (!PAYMENT_REFERENCE_PATTERN.test(reference)) {
+    throw new Error("Could not generate a valid payment reference.");
+  }
+
+  console.log("Preparing SA LIVE PayFast payment:", {
+    userId: String(user.id),
+    packageId: paymentPackage.id,
+    hasEmail: true,
+    hasReference: true,
+    referenceType: typeof reference,
+    referenceLength: reference.length,
+  });
+
+  // Save a pending payment. Do not credit minutes here.
+  await createPaymentRecord({
+    userId: String(user.id),
+    reference,
+    packageId: paymentPackage.id,
+    email: normalizedEmail,
+  });
+
+  const checkoutUrl = createCheckoutBridgeUrl(
+    frontendUrl,
+    reference
+  );
+
+  await ctx.reply(
+    formatPackage(paymentPackage) +
+      `\n\n🧾 Reference: \`${reference}\`\n\n` +
+      "Select below to continue to secure checkout.",
+    {
+      parse_mode: "Markdown",
+      ...Markup.inlineKeyboard([
+        [
+          Markup.button.url(
+            "🔐 Continue to secure checkout",
+            checkoutUrl
+          ),
+        ],
+        [
+          Markup.button.callback(
+            "💳 Other Packages",
+            "buy_minutes"
+          ),
+        ],
+        [
+          Markup.button.callback(
+            "⬅️ Main Menu",
+            "payment_main_menu"
+          ),
+        ],
+      ]),
+    }
+  );
 }
 
 // ============================================================
@@ -165,7 +247,7 @@ export function registerPaymentHandlers(bot) {
   }
 
   // ----------------------------------------------------------
-  // OPEN PACKAGE MENU
+  // OPEN BUY MINUTES MENU
   // ----------------------------------------------------------
 
   bot.action("buy_minutes", async (ctx) => {
@@ -183,10 +265,7 @@ export function registerPaymentHandlers(bot) {
         }
       );
     } catch (error) {
-      console.error(
-        "Open payment menu failed:",
-        error.message
-      );
+      console.error("Open payment menu failed:", error);
     }
   });
 
@@ -208,21 +287,21 @@ export function registerPaymentHandlers(bot) {
 
         const user = await getOrCreateUser(ctx.from);
 
-        if (!user || !user.id) {
+        if (!user?.id) {
           throw new Error("Could not identify your SA LIVE account.");
         }
 
         if (user.verificationStatus !== "approved") {
           await ctx.reply(
             "🛡️ *VERIFICATION REQUIRED*\n\n" +
-              "Your account must be approved before purchasing minutes.",
+              "Your account must be approved before you can purchase minutes.",
             { parse_mode: "Markdown" }
           );
 
           return;
         }
 
-        const packageId = ctx.match?.[1];
+        const packageId = ctx.match[1];
 
         if (!PAYMENT_PACKAGES.includes(packageId)) {
           await ctx.reply("That payment package is unavailable.");
@@ -247,14 +326,11 @@ export function registerPaymentHandlers(bot) {
           throw new Error("Invalid payment package pricing.");
         }
 
-        // IMPORTANT:
-        // Telegram does not automatically provide an email.
-        // Check the field actually stored by userService.js.
-        const savedEmail = normalizeEmail(
-          user.paymentEmail || user.email
-        );
+        // Read the field used by userService.js.
+        const savedEmail = normalizeEmail(user.paymentEmail);
 
         if (!savedEmail) {
+          // Preserve the package while waiting for the email.
           pendingEmailRequests.set(String(ctx.from.id), {
             userId: String(user.id),
             packageId,
@@ -262,8 +338,8 @@ export function registerPaymentHandlers(bot) {
 
           await ctx.reply(
             "📧 *EMAIL REQUIRED*\n\n" +
-              "Your SA LIVE account uses your Telegram account, " +
-              "so we need an email address for PayFast checkout.\n\n" +
+              "Your account uses your Telegram account, so you do not need to register with a separate username or password.\n\n" +
+              "PayFast requires an email address for checkout.\n\n" +
               "Please send your email address in this chat.\n\n" +
               "Example: you@example.com\n\n" +
               "_Your email will be saved to your SA LIVE account._",
@@ -290,15 +366,12 @@ export function registerPaymentHandlers(bot) {
           email: savedEmail,
         });
       } catch (error) {
-        console.error(
-          "Initialize payment failed:",
-          error
-        );
+        console.error("Initialize payment failed:", error);
 
         await ctx.reply(
           "❌ *PAYMENT SETUP FAILED*\n\n" +
-            "We couldn't prepare your payment. No minutes have been added.\n\n" +
-            "Please try again later.",
+            "We couldn't prepare your payment. No minutes were added.\n\n" +
+            "Please try again later. If you were charged, contact SA LIVE support before retrying.",
           { parse_mode: "Markdown" }
         );
       }
@@ -306,25 +379,37 @@ export function registerPaymentHandlers(bot) {
   );
 
   // ----------------------------------------------------------
-  // RECEIVE EMAIL FROM TELEGRAM CHAT
+  // RECEIVE PAYMENT EMAIL
+  // ----------------------------------------------------------
+  // IMPORTANT:
+  // This handler calls next() when no payment email is pending.
+  // The existing host application email handler can then process
+  // the message if it belongs to a host application.
   // ----------------------------------------------------------
 
   bot.on("text", async (ctx, next) => {
     const telegramId = String(ctx.from?.id ?? "");
     const request = pendingEmailRequests.get(telegramId);
 
-    // Do not interfere with unrelated bot messages.
     if (!request) {
       return next();
     }
 
-    const email = normalizeEmail(ctx.message?.text);
+    const messageText = ctx.message?.text?.trim() || "";
+
+    // Allow commands to reach their own handlers.
+    if (messageText.startsWith("/")) {
+      return next();
+    }
+
+    // Do not interpret another bot menu interaction as an email.
+    const email = normalizeEmail(messageText);
 
     if (!email) {
       await ctx.reply(
         "❌ That email address doesn't look valid.\n\n" +
-          "Please send a valid address, such as you@example.com, " +
-          "or cancel and try again."
+          "Please send an address such as you@example.com.\n\n" +
+          "Or use Cancel to stop the payment process."
       );
 
       return;
@@ -334,37 +419,36 @@ export function registerPaymentHandlers(bot) {
       const user = await getOrCreateUser(ctx.from);
 
       if (String(user.id) !== request.userId) {
-        pendingEmailRequests.delete(telegramId);
+        clearPendingEmail(telegramId);
 
         await ctx.reply(
-          "Your account could not be verified. Please start again."
+          "Your account could not be verified. Please start the payment process again."
         );
 
         return;
       }
 
       if (user.verificationStatus !== "approved") {
-        pendingEmailRequests.delete(telegramId);
+        clearPendingEmail(telegramId);
 
         await ctx.reply(
-          "Your account must be approved before purchasing minutes."
+          "Your account must be approved before you can purchase minutes."
         );
 
         return;
       }
 
-      // Save to the correct Firestore field: paymentEmail.
-      await updateUserPaymentEmail(user.id, email);
-
-      pendingEmailRequests.delete(telegramId);
-
-      const paymentPackage = getPaymentPackage(
-        request.packageId
-      );
+      const paymentPackage = getPaymentPackage(request.packageId);
 
       if (!paymentPackage) {
         throw new Error("Payment package was not found.");
       }
+
+      // Save the email to the paymentEmail Firestore field.
+      await updateUserPaymentEmail(user.id, email);
+
+      // Clear only after the email has been saved successfully.
+      clearPendingEmail(telegramId);
 
       await ctx.reply(
         "✅ Email saved successfully.\n\n" +
@@ -387,8 +471,8 @@ export function registerPaymentHandlers(bot) {
       );
 
       await ctx.reply(
-        "We couldn't save your email or prepare checkout. " +
-          "Please try again."
+        "We couldn't complete the payment setup.\n\n" +
+          "Your email may already have been saved. Please try Buy Minutes again."
       );
     }
   });
@@ -402,7 +486,7 @@ export function registerPaymentHandlers(bot) {
       await ctx.answerCbQuery();
 
       if (ctx.from?.id) {
-        pendingEmailRequests.delete(String(ctx.from.id));
+        clearPendingEmail(ctx.from.id);
       }
 
       await ctx.reply(
@@ -425,10 +509,7 @@ export function registerPaymentHandlers(bot) {
         }
       );
     } catch (error) {
-      console.error(
-        "Cancel email request failed:",
-        error.message
-      );
+      console.error("Cancel email request failed:", error);
     }
   });
 
@@ -461,10 +542,7 @@ export function registerPaymentHandlers(bot) {
         }
       );
     } catch (error) {
-      console.error(
-        "Payment balance failed:",
-        error.message
-      );
+      console.error("Payment balance failed:", error);
 
       await ctx.reply(
         "Unable to retrieve your balance right now."
@@ -503,86 +581,7 @@ export function registerPaymentHandlers(bot) {
         }
       );
     } catch (error) {
-      console.error(
-        "Return to payment menu failed:",
-        error.message
-      );
+      console.error("Return to payment menu failed:", error);
     }
-  });
-}
-
-// ============================================================
-// CREATE PENDING PAYMENT AND SEND CHECKOUT BUTTON
-// ============================================================
-
-async function preparePayment({
-  ctx,
-  user,
-  paymentPackage,
-  email,
-}) {
-  const normalizedEmail = normalizeEmail(email);
-
-  if (!normalizedEmail) {
-    throw new Error("A valid payment email is required.");
-  }
-
-  const frontendUrl = getPublicFrontendUrl();
-  const reference = createPaymentReference();
-
-  if (!PAYMENT_REFERENCE_PATTERN.test(reference)) {
-    throw new Error("Could not generate a valid payment reference.");
-  }
-
-  console.log("Preparing SA LIVE PayFast payment:", {
-    userId: String(user.id),
-    packageId: paymentPackage.id,
-    hasEmail: true,
-    hasReference: true,
-    referenceType: typeof reference,
-    referenceLength: reference.length,
-  });
-
-  // This creates a pending record only.
-  // It must not credit minutes.
-  await createPaymentRecord({
-    userId: String(user.id),
-    reference,
-    packageId: paymentPackage.id,
-    email: normalizedEmail,
-  });
-
-  const checkoutUrl = createCheckoutBridgeUrl(
-    frontendUrl,
-    reference
-  );
-
-  const message =
-    formatPackage(paymentPackage) +
-    `\n\n🧾 Reference: \`${reference}\`\n\n` +
-    "Select the button below to continue to secure checkout.";
-
-  await ctx.reply(message, {
-    parse_mode: "Markdown",
-    ...Markup.inlineKeyboard([
-      [
-        Markup.button.url(
-          "🔐 Continue to secure checkout",
-          checkoutUrl
-        ),
-      ],
-      [
-        Markup.button.callback(
-          "💳 Other Packages",
-          "buy_minutes"
-        ),
-      ],
-      [
-        Markup.button.callback(
-          "⬅️ Main Menu",
-          "payment_main_menu"
-        ),
-      ],
-    ]),
   });
 }
