@@ -60,11 +60,17 @@ const MAX_ACCOUNT_NUMBER_LENGTH = 40;
 const MAX_REASON_LENGTH = 500;
 const MAX_PAYOUT_REFERENCE_LENGTH = 200;
 
+const PAYMENT_REFERENCE_PATTERN = /^SALIVE-[A-F0-9]{32}$/;
+
 // ============================================================
 // VALIDATION HELPERS
 // ============================================================
 
-function requireString(value, fieldName, maxLength = MAX_ID_LENGTH) {
+function requireString(
+  value,
+  fieldName,
+  maxLength = MAX_ID_LENGTH
+) {
   if (
     typeof value !== "string" ||
     value.trim().length === 0 ||
@@ -84,6 +90,19 @@ function requireDocumentId(value, fieldName) {
   }
 
   return id;
+}
+
+function requirePaymentReference(value) {
+  if (
+    typeof value !== "string" ||
+    !PAYMENT_REFERENCE_PATTERN.test(value)
+  ) {
+    throw new Error(
+      "Invalid payment reference. Expected SALIVE- followed by 32 uppercase hexadecimal characters."
+    );
+  }
+
+  return value;
 }
 
 function validPositiveInteger(value) {
@@ -119,23 +138,31 @@ function toCentsFromRand(amount, fieldName = "Amount") {
 }
 
 function readStoredCents(value, fieldName) {
-  if (!validNonNegativeInteger(value ?? 0)) {
+  const cents = value ?? 0;
+
+  if (!validNonNegativeInteger(cents)) {
     throw new Error(`${fieldName} balance is invalid.`);
   }
 
-  return value ?? 0;
+  return cents;
 }
 
 function readStoredMinutes(value, fieldName) {
-  if (!validNonNegativeInteger(value ?? 0)) {
+  const minutes = value ?? 0;
+
+  if (!validNonNegativeInteger(minutes)) {
     throw new Error(`${fieldName} minute balance is invalid.`);
   }
 
-  return value ?? 0;
+  return minutes;
 }
 
 function validateEmail(email) {
-  if (email === undefined || email === null || email === "") {
+  if (
+    email === undefined ||
+    email === null ||
+    email === ""
+  ) {
     return null;
   }
 
@@ -263,7 +290,7 @@ export async function createPaymentRecord({
   email,
 }) {
   userId = requireDocumentId(userId, "User ID");
-  reference = requireDocumentId(reference, "Payment reference");
+  reference = requirePaymentReference(reference);
 
   const paymentPackage = getPaymentPackage(packageId);
 
@@ -286,7 +313,9 @@ export async function createPaymentRecord({
     const paymentSnapshot = await transaction.get(paymentRef);
 
     if (!userSnapshot.exists) {
-      throw new Error("User account was not found.");
+      throw new Error(
+        `User account was not found for user ID: ${userId}.`
+      );
     }
 
     if (paymentSnapshot.exists) {
@@ -316,6 +345,7 @@ export async function createPaymentRecord({
   return {
     reference,
     package: paymentPackage,
+    status: "pending",
   };
 }
 
@@ -326,15 +356,13 @@ export async function createPaymentRecord({
 export async function getPaymentByReference(reference) {
   if (
     typeof reference !== "string" ||
-    reference.trim().length === 0 ||
-    reference.trim().length > MAX_ID_LENGTH ||
-    reference.includes("/")
+    !PAYMENT_REFERENCE_PATTERN.test(reference)
   ) {
     return null;
   }
 
   const snapshot = await paymentsCollection
-    .doc(reference.trim())
+    .doc(reference)
     .get();
 
   if (!snapshot.exists) {
@@ -350,9 +378,15 @@ export async function getPaymentByReference(reference) {
 // ============================================================
 // CREDIT VERIFIED PAYFAST PAYMENT ONCE
 // ============================================================
+//
+// Call only after the backend has verified the PayFast ITN,
+// including its signature, payment status, amount and reference.
+// Never credit minutes just because the customer returns to
+// the website or opens a Telegram payment link.
+// ============================================================
 
 export async function creditSuccessfulPayment(reference) {
-  reference = requireDocumentId(reference, "Payment reference");
+  reference = requirePaymentReference(reference);
 
   const paymentRef = paymentsCollection.doc(reference);
 
@@ -405,10 +439,13 @@ export async function creditSuccessfulPayment(reference) {
       "User"
     );
 
-    const newMinutes = currentMinutes + paymentPackage.minutes;
+    const newMinutes =
+      currentMinutes + paymentPackage.minutes;
 
     if (!Number.isSafeInteger(newMinutes)) {
-      throw new Error("The resulting minute balance is invalid.");
+      throw new Error(
+        "The resulting minute balance is invalid."
+      );
     }
 
     const now = new Date();
@@ -439,12 +476,9 @@ export async function creditSuccessfulPayment(reference) {
 //
 // hostId is the document ID in the hosts collection.
 //
-// IMPORTANT:
 // Call only after the trusted call-billing service has completed
-// billing and finalized the call. Do not call this from a browser
-// or directly from Telegram user input.
-//
-// completedMinutes must be derived by the trusted backend.
+// billing and finalized the call. completedMinutes must be
+// calculated by the trusted backend, never by a browser.
 // ============================================================
 
 export async function recordHostEarnings({
@@ -530,14 +564,19 @@ export async function recordHostEarnings({
       "Lifetime host earnings"
     );
 
-    const newAvailableCents = currentAvailableCents + amountCents;
-    const newLifetimeCents = currentLifetimeCents + amountCents;
+    const newAvailableCents =
+      currentAvailableCents + amountCents;
+
+    const newLifetimeCents =
+      currentLifetimeCents + amountCents;
 
     if (
       !Number.isSafeInteger(newAvailableCents) ||
       !Number.isSafeInteger(newLifetimeCents)
     ) {
-      throw new Error("The resulting host balance is invalid.");
+      throw new Error(
+        "The resulting host balance is invalid."
+      );
     }
 
     const now = new Date();
@@ -607,7 +646,7 @@ export async function getHostEarningsSummary(hostId) {
 // CREATE HOST WITHDRAWAL REQUEST
 // ============================================================
 //
-// Reserves funds. Does not transfer money.
+// Reserves funds; it does not transfer money.
 // hostId must come from the authenticated host identity.
 // ============================================================
 
@@ -623,7 +662,8 @@ export async function createHostWithdrawalRequest({
     "Withdrawal amount"
   );
 
-  const validatedBankDetails = validateBankDetails(bankDetails);
+  const validatedBankDetails =
+    validateBankDetails(bankDetails);
 
   const hostRef = hostsCollection.doc(hostId);
   const withdrawalRef = withdrawalsCollection.doc();
@@ -638,7 +678,9 @@ export async function createHostWithdrawalRequest({
     const host = hostSnapshot.data();
 
     if (host.status !== "active") {
-      throw new Error("Only active hosts can request withdrawals.");
+      throw new Error(
+        "Only active hosts can request withdrawals."
+      );
     }
 
     const availableCents = readStoredCents(
@@ -652,13 +694,18 @@ export async function createHostWithdrawalRequest({
     );
 
     if (amountCents > availableCents) {
-      throw new Error("Insufficient available host earnings.");
+      throw new Error(
+        "Insufficient available host earnings."
+      );
     }
 
-    const newReservedCents = reservedCents + amountCents;
+    const newReservedCents =
+      reservedCents + amountCents;
 
     if (!Number.isSafeInteger(newReservedCents)) {
-      throw new Error("The resulting withdrawal balance is invalid.");
+      throw new Error(
+        "The resulting withdrawal balance is invalid."
+      );
     }
 
     const now = new Date();
@@ -677,7 +724,8 @@ export async function createHostWithdrawalRequest({
     });
 
     transaction.update(hostRef, {
-      availableHostEarningsCents: availableCents - amountCents,
+      availableHostEarningsCents:
+        availableCents - amountCents,
       pendingHostWithdrawalsCents: newReservedCents,
       updatedAt: now,
     });
@@ -696,8 +744,9 @@ export async function createHostWithdrawalRequest({
 // MARK WITHDRAWAL AS PAID
 // ============================================================
 //
-// An authorized administrator must confirm the real bank transfer
-// before calling this function. It does not transfer money.
+// An authorized administrator must confirm the real bank
+// transfer before calling this function. This function does
+// not transfer money.
 // ============================================================
 
 export async function markHostWithdrawalPaid({
@@ -710,10 +759,14 @@ export async function markHostWithdrawalPaid({
     "Withdrawal ID"
   );
 
-  adminId = requireDocumentId(adminId, "Administrator ID");
+  adminId = requireDocumentId(
+    adminId,
+    "Administrator ID"
+  );
 
   const normalizedPayoutReference =
-    payoutReference === undefined || payoutReference === null
+    payoutReference === undefined ||
+    payoutReference === null
       ? null
       : requireString(
           payoutReference,
@@ -721,10 +774,12 @@ export async function markHostWithdrawalPaid({
           MAX_PAYOUT_REFERENCE_LENGTH
         );
 
-  const withdrawalRef = withdrawalsCollection.doc(withdrawalId);
+  const withdrawalRef =
+    withdrawalsCollection.doc(withdrawalId);
 
   return db.runTransaction(async (transaction) => {
-    const withdrawalSnapshot = await transaction.get(withdrawalRef);
+    const withdrawalSnapshot =
+      await transaction.get(withdrawalRef);
 
     if (!withdrawalSnapshot.exists) {
       throw new Error("Withdrawal request was not found.");
@@ -806,13 +861,23 @@ export async function rejectHostWithdrawal({
     "Withdrawal ID"
   );
 
-  adminId = requireDocumentId(adminId, "Administrator ID");
-  reason = requireString(reason, "Rejection reason", MAX_REASON_LENGTH);
+  adminId = requireDocumentId(
+    adminId,
+    "Administrator ID"
+  );
 
-  const withdrawalRef = withdrawalsCollection.doc(withdrawalId);
+  reason = requireString(
+    reason,
+    "Rejection reason",
+    MAX_REASON_LENGTH
+  );
+
+  const withdrawalRef =
+    withdrawalsCollection.doc(withdrawalId);
 
   return db.runTransaction(async (transaction) => {
-    const withdrawalSnapshot = await transaction.get(withdrawalRef);
+    const withdrawalSnapshot =
+      await transaction.get(withdrawalRef);
 
     if (!withdrawalSnapshot.exists) {
       throw new Error("Withdrawal request was not found.");
@@ -853,10 +918,13 @@ export async function rejectHostWithdrawal({
       );
     }
 
-    const newAvailableCents = availableCents + withdrawal.amountCents;
+    const newAvailableCents =
+      availableCents + withdrawal.amountCents;
 
     if (!Number.isSafeInteger(newAvailableCents)) {
-      throw new Error("The resulting host balance is invalid.");
+      throw new Error(
+        "The resulting host balance is invalid."
+      );
     }
 
     const now = new Date();
