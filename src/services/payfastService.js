@@ -115,17 +115,38 @@ function generateSignature(fields, passphrase) {
     .digest("hex");
 }
 
-export async function initializePayfastTransaction({
-  email,
-  amount,
-  reference,
-  metadata = {},
-}) {
+
+export async function initializePayfastTransaction(options = {}) {
+  console.info("PAYFAST SERVICE ENTRY:", {
+    argumentType: typeof options,
+    argumentKeys:
+      options &&
+      typeof options === "object"
+        ? Object.keys(options)
+        : [],
+    hasReference:
+      Object.prototype.hasOwnProperty.call(
+        options,
+        "reference"
+      ),
+    referenceType: typeof options?.reference,
+    referenceLength:
+      typeof options?.reference === "string"
+        ? options.reference.length
+        : null,
+  });
+
+  const {
+    email,
+    amount,
+    reference,
+    metadata = {},
+  } = options;
+
   if (
     typeof reference !== "string" ||
-    !PAYMENT_REFERENCE_PATTERN.test(reference)
+    !/^SALIVE-[A-F0-9]{32}$/.test(reference)
   ) {
-    // Log only safe diagnostic information, not payment secrets.
     console.error("Invalid PayFast reference received:", {
       type: typeof reference,
       length:
@@ -141,6 +162,9 @@ export async function initializePayfastTransaction({
       "Invalid payment reference. Expected SALIVE- followed by 32 uppercase hexadecimal characters."
     );
   }
+
+  // Keep the rest of your existing function below this point.
+
 
   if (
     typeof email !== "string" ||

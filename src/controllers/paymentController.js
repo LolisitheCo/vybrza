@@ -530,6 +530,13 @@ export async function initializePayment(req, res) {
       email: normalizedEmail,
     });
 
+    console.info("PAYMENT CONTROLLER HANDOFF:", {
+  referenceType: typeof reference,
+  referenceLength: reference.length,
+  referenceFormatValid:
+    /^SALIVE-[A-F0-9]{32}$/.test(reference),
+});
+
      
 const checkout = await initializePayfastTransaction({
   email: normalizedEmail,
