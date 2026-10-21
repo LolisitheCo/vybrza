@@ -530,26 +530,25 @@ export async function initializePayment(req, res) {
       email: normalizedEmail,
     });
 
-     console.info("SA LIVE payment reference check:", {
-  referenceType: typeof reference,
-  referenceLength:
-    typeof reference === "string"
-      ? reference.length
-      : null,
+     
+const checkout = await initializePayfastTransaction({
+  email: normalizedEmail,
+  amount: paymentPackage.amount,
+  reference,
+  metadata: {
+    custom_str1: paymentPackage.id,
+  },
+});
+
+console.info("SA LIVE checkout initialized:", {
   referenceFormatValid:
     typeof reference === "string" &&
     /^SALIVE-[A-F0-9]{32}$/.test(reference),
+  checkoutCreated: Boolean(checkout),
+  paymentUrlProvided:
+    typeof checkout?.paymentUrl === "string",
 });
 
-    const checkout =
-      await initializePayfastTransaction({
-        email: normalizedEmail,
-        amount: paymentPackage.amount,
-        reference,
-        metadata: {
-          custom_str1: paymentPackage.id,
-        },
-      });
 
     if (
   !checkout ||
