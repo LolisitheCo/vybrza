@@ -1,3 +1,4 @@
+
 import crypto from "node:crypto";
 import { Markup } from "telegraf";
 
@@ -8,11 +9,13 @@ import {
 
 import {
   getOrCreateUser,
-  updateUserPaymentEmail,
+  getUserPaymentEmail,
 } from "../services/userService.js";
 
 // ============================================================
 // SA LIVE PAYMENT BOT — PAYFAST
+// Uses the Gmail saved during user verification.
+// No email collection during checkout.
 // ============================================================
 
 const PAYMENT_PACKAGES = [
@@ -24,24 +27,23 @@ const PAYMENT_PACKAGES = [
 ];
 
 const PAYMENT_REFERENCE_PATTERN = /^SALIVE-[A-F0-9]{32}$/;
-const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-// Pending email requests are keyed by Telegram ID.
-// They remain in memory only while this server process runs.
-const pendingEmailRequests = new Map();
+const GMAIL_PATTERN = /^[a-z0-9._%+-]+@gmail\.com$/i;
 
 // ============================================================
 // HELPERS
 // ============================================================
 
-function normalizeEmail(value) {
+function normalizeGmail(value) {
   if (typeof value !== "string") {
     return null;
   }
 
   const email = value.trim().toLowerCase();
 
-  if (email.length > 254 || !EMAIL_PATTERN.test(email)) {
+  if (
+    email.length > 254 ||
+    !GMAIL_PATTERN.test(email)
+  ) {
     return null;
   }
 
@@ -148,10 +150,6 @@ function formatPackage(paymentPackage) {
   );
 }
 
-function clearPendingEmail(telegramId) {
-  pendingEmailRequests.delete(String(telegramId));
-}
-
 // ============================================================
 // PREPARE PAYMENT
 // ============================================================
@@ -162,10 +160,12 @@ async function preparePayment({
   paymentPackage,
   email,
 }) {
-  const normalizedEmail = normalizeEmail(email);
+  const savedGmail = normalizeGmail(email);
 
-  if (!normalizedEmail) {
-    throw new Error("A valid payment email is required.");
+  if (!savedGmail) {
+    throw new Error(
+      "A valid Gmail address saved during verification is required."
+    );
   }
 
   if (!user?.id) {
@@ -186,18 +186,16 @@ async function preparePayment({
   console.log("Preparing SA LIVE PayFast payment:", {
     userId: String(user.id),
     packageId: paymentPackage.id,
-    hasEmail: true,
+    hasSavedGmail: true,
     hasReference: true,
-    referenceType: typeof reference,
-    referenceLength: reference.length,
   });
 
-  // Save a pending payment. Do not credit minutes here.
+  // Create a pending payment. Never credit minutes here.
   await createPaymentRecord({
     userId: String(user.id),
     reference,
     packageId: paymentPackage.id,
-    email: normalizedEmail,
+    email: savedGmail,
   });
 
   const checkoutUrl = createCheckoutBridgeUrl(
@@ -208,6 +206,7 @@ async function preparePayment({
   await ctx.reply(
     formatPackage(paymentPackage) +
       `\n\n🧾 Reference: \`${reference}\`\n\n` +
+      "Your saved Gmail will be used for PayFast checkout.\n\n" +
       "Select below to continue to secure checkout.",
     {
       parse_mode: "Markdown",
@@ -288,7 +287,9 @@ export function registerPaymentHandlers(bot) {
         const user = await getOrCreateUser(ctx.from);
 
         if (!user?.id) {
-          throw new Error("Could not identify your SA LIVE account.");
+          throw new Error(
+            "Could not identify your SA LIVE account."
+          );
         }
 
         if (user.verificationStatus !== "approved") {
@@ -304,7 +305,9 @@ export function registerPaymentHandlers(bot) {
         const packageId = ctx.match[1];
 
         if (!PAYMENT_PACKAGES.includes(packageId)) {
-          await ctx.reply("That payment package is unavailable.");
+          await ctx.reply(
+            "That payment package is unavailable."
+          );
           return;
         }
 
@@ -326,30 +329,29 @@ export function registerPaymentHandlers(bot) {
           throw new Error("Invalid payment package pricing.");
         }
 
-        // Read the field used by userService.js.
-        const savedEmail = normalizeEmail(user.paymentEmail);
+        // Read the Gmail saved to this user's Firestore record.
+        const savedEmail = normalizeGmail(
+          await getUserPaymentEmail(user.id)
+        );
 
         if (!savedEmail) {
-          // Preserve the package while waiting for the email.
-          pendingEmailRequests.set(String(ctx.from.id), {
-            userId: String(user.id),
-            packageId,
-          });
-
           await ctx.reply(
-            "📧 *EMAIL REQUIRED*\n\n" +
-              "Your account uses your Telegram account, so you do not need to register with a separate username or password.\n\n" +
-              "PayFast requires an email address for checkout.\n\n" +
-              "Please send your email address in this chat.\n\n" +
-              "Example: you@example.com\n\n" +
-              "_Your email will be saved to your SA LIVE account._",
+            "📧 *GMAIL REQUIRED FOR YOUR ACCOUNT*\n\n" +
+              "We couldn't find a valid Gmail address saved to your account.\n\n" +
+              "Please use *Request Verification* and submit your Gmail address first. Once it is saved and your account is approved, you can purchase minutes without entering your email at checkout.",
             {
               parse_mode: "Markdown",
               ...Markup.inlineKeyboard([
                 [
                   Markup.button.callback(
-                    "❌ Cancel",
-                    "cancel_payment_email"
+                    "🛡️ Request Verification",
+                    "request_verification"
+                  ),
+                ],
+                [
+                  Markup.button.callback(
+                    "⬅️ Main Menu",
+                    "payment_main_menu"
                   ),
                 ],
               ]),
@@ -377,141 +379,6 @@ export function registerPaymentHandlers(bot) {
       }
     }
   );
-
-  // ----------------------------------------------------------
-  // RECEIVE PAYMENT EMAIL
-  // ----------------------------------------------------------
-  // IMPORTANT:
-  // This handler calls next() when no payment email is pending.
-  // The existing host application email handler can then process
-  // the message if it belongs to a host application.
-  // ----------------------------------------------------------
-
-  bot.on("text", async (ctx, next) => {
-    const telegramId = String(ctx.from?.id ?? "");
-    const request = pendingEmailRequests.get(telegramId);
-
-    if (!request) {
-      return next();
-    }
-
-    const messageText = ctx.message?.text?.trim() || "";
-
-    // Allow commands to reach their own handlers.
-    if (messageText.startsWith("/")) {
-      return next();
-    }
-
-    // Do not interpret another bot menu interaction as an email.
-    const email = normalizeEmail(messageText);
-
-    if (!email) {
-      await ctx.reply(
-        "❌ That email address doesn't look valid.\n\n" +
-          "Please send an address such as you@example.com.\n\n" +
-          "Or use Cancel to stop the payment process."
-      );
-
-      return;
-    }
-
-    try {
-      const user = await getOrCreateUser(ctx.from);
-
-      if (String(user.id) !== request.userId) {
-        clearPendingEmail(telegramId);
-
-        await ctx.reply(
-          "Your account could not be verified. Please start the payment process again."
-        );
-
-        return;
-      }
-
-      if (user.verificationStatus !== "approved") {
-        clearPendingEmail(telegramId);
-
-        await ctx.reply(
-          "Your account must be approved before you can purchase minutes."
-        );
-
-        return;
-      }
-
-      const paymentPackage = getPaymentPackage(request.packageId);
-
-      if (!paymentPackage) {
-        throw new Error("Payment package was not found.");
-      }
-
-      // Save the email to the paymentEmail Firestore field.
-      await updateUserPaymentEmail(user.id, email);
-
-      // Clear only after the email has been saved successfully.
-      clearPendingEmail(telegramId);
-
-      await ctx.reply(
-        "✅ Email saved successfully.\n\n" +
-          "Preparing your PayFast checkout..."
-      );
-
-      await preparePayment({
-        ctx,
-        user: {
-          ...user,
-          paymentEmail: email,
-        },
-        paymentPackage,
-        email,
-      });
-    } catch (error) {
-      console.error(
-        "Save payment email or prepare checkout failed:",
-        error
-      );
-
-      await ctx.reply(
-        "We couldn't complete the payment setup.\n\n" +
-          "Your email may already have been saved. Please try Buy Minutes again."
-      );
-    }
-  });
-
-  // ----------------------------------------------------------
-  // CANCEL EMAIL REQUEST
-  // ----------------------------------------------------------
-
-  bot.action("cancel_payment_email", async (ctx) => {
-    try {
-      await ctx.answerCbQuery();
-
-      if (ctx.from?.id) {
-        clearPendingEmail(ctx.from.id);
-      }
-
-      await ctx.reply(
-        "Email entry cancelled. No payment was started.",
-        {
-          ...Markup.inlineKeyboard([
-            [
-              Markup.button.callback(
-                "💳 Buy Minutes",
-                "buy_minutes"
-              ),
-            ],
-            [
-              Markup.button.callback(
-                "⬅️ Main Menu",
-                "payment_main_menu"
-              ),
-            ],
-          ]),
-        }
-      );
-    } catch (error) {
-      console.error("Cancel email request failed:", error);
-    }
-  });
 
   // ----------------------------------------------------------
   // REFRESH BALANCE

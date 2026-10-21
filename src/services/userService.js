@@ -3,11 +3,9 @@ import { db } from "../config/firebase.js";
 
 const usersCollection = db.collection("users");
 
-/*
-|--------------------------------------------------------------------------
-| HELPERS
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// HELPERS
+// ============================================================
 
 function toUser(doc) {
   return {
@@ -40,7 +38,7 @@ function normalizeTelegramId(telegramId) {
 
 function normalizeEmail(email) {
   if (typeof email !== "string") {
-    throw new Error("A valid payment email address is required.");
+    throw new Error("A valid email address is required.");
   }
 
   const normalized = email.trim().toLowerCase();
@@ -49,17 +47,40 @@ function normalizeEmail(email) {
     normalized.length > 254 ||
     !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)
   ) {
-    throw new Error("A valid payment email address is required.");
+    throw new Error("A valid email address is required.");
   }
 
   return normalized;
 }
 
-/*
-|--------------------------------------------------------------------------
-| GET USER BY TELEGRAM ID
-|--------------------------------------------------------------------------
-*/
+function normalizeGmail(email) {
+  const normalized = normalizeEmail(email);
+
+  if (!/^[a-z0-9._%+-]+@gmail\.com$/i.test(normalized)) {
+    throw new Error(
+      "Please provide a valid Gmail address ending in @gmail.com."
+    );
+  }
+
+  return normalized;
+}
+
+function requireUserId(userId) {
+  if (
+    typeof userId !== "string" ||
+    !userId.trim() ||
+    userId.includes("/") ||
+    userId.includes("\0")
+  ) {
+    throw new Error("A valid user ID is required.");
+  }
+
+  return userId.trim();
+}
+
+// ============================================================
+// GET USER BY TELEGRAM ID
+// ============================================================
 
 export async function getUserByTelegramId(telegramId) {
   const id = normalizeTelegramId(telegramId);
@@ -76,14 +97,9 @@ export async function getUserByTelegramId(telegramId) {
   return toUser(snapshot.docs[0]);
 }
 
-/*
-|--------------------------------------------------------------------------
-| CREATE USER
-|--------------------------------------------------------------------------
-| Telegram is the registration identity.
-| Email is collected separately for PayFast payments.
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// CREATE USER
+// ============================================================
 
 export async function createUser(telegramUser) {
   if (
@@ -140,7 +156,8 @@ export async function createUser(telegramUser) {
       activeCallId: null,
       role: "user",
 
-      // PayFast email is collected separately.
+      // Gmail collected during verification.
+      // Reused for PayFast checkout.
       paymentEmail: null,
 
       pendingPaymentPackageId: null,
@@ -158,11 +175,9 @@ export async function createUser(telegramUser) {
   });
 }
 
-/*
-|--------------------------------------------------------------------------
-| GET OR CREATE USER
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// GET OR CREATE USER
+// ============================================================
 
 export async function getOrCreateUser(telegramUser) {
   if (
@@ -176,18 +191,17 @@ export async function getOrCreateUser(telegramUser) {
   return createUser(telegramUser);
 }
 
-/*
-|--------------------------------------------------------------------------
-| SUBMIT VERIFICATION
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// SUBMIT VERIFICATION
+// ============================================================
+// Saves Gmail and submits verification atomically.
+// ============================================================
 
-export async function submitVerification(userId) {
-  if (typeof userId !== "string" || !userId.trim()) {
-    throw new Error("User ID is required.");
-  }
+export async function submitVerification(userId, email) {
+  userId = requireUserId(userId);
 
-  const userRef = usersCollection.doc(userId.trim());
+  const normalizedEmail = normalizeGmail(email);
+  const userRef = usersCollection.doc(userId);
 
   return db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(userRef);
@@ -203,17 +217,22 @@ export async function submitVerification(userId) {
         success: true,
         alreadyApproved: true,
         verificationStatus: "approved",
+        email: user.paymentEmail || normalizedEmail,
       };
     }
 
     const now = new Date();
 
     transaction.update(userRef, {
+      paymentEmail: normalizedEmail,
+
       verificationStatus: "pending",
+
       "verification.submittedAt": now,
       "verification.reviewedAt": null,
       "verification.reviewedBy": null,
       "verification.rejectionReason": null,
+
       updatedAt: now,
     });
 
@@ -221,22 +240,20 @@ export async function submitVerification(userId) {
       success: true,
       alreadyApproved: false,
       verificationStatus: "pending",
+      email: normalizedEmail,
     };
   });
 }
 
-/*
-|--------------------------------------------------------------------------
-| APPROVE VERIFICATION
-|--------------------------------------------------------------------------
-| Never grants free minutes.
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// APPROVE VERIFICATION
+// Never grants free minutes.
+// ============================================================
 
 export async function approveVerification(userId, adminTelegramId) {
+  userId = requireUserId(userId);
+
   if (
-    typeof userId !== "string" ||
-    !userId.trim() ||
     adminTelegramId === undefined ||
     adminTelegramId === null
   ) {
@@ -245,7 +262,7 @@ export async function approveVerification(userId, adminTelegramId) {
     );
   }
 
-  const userRef = usersCollection.doc(userId.trim());
+  const userRef = usersCollection.doc(userId);
 
   return db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(userRef);
@@ -263,6 +280,12 @@ export async function approveVerification(userId, adminTelegramId) {
         verificationStatus: "approved",
         minutes: currentMinutes,
       };
+    }
+
+    if (!normalizeGmail(user.paymentEmail)) {
+      throw new Error(
+        "Cannot approve verification without a saved Gmail address."
+      );
     }
 
     const now = new Date();
@@ -283,20 +306,18 @@ export async function approveVerification(userId, adminTelegramId) {
   });
 }
 
-/*
-|--------------------------------------------------------------------------
-| REJECT VERIFICATION
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// REJECT VERIFICATION
+// ============================================================
 
 export async function rejectVerification(
   userId,
   adminTelegramId,
   reason = "Verification was not approved."
 ) {
+  userId = requireUserId(userId);
+
   if (
-    typeof userId !== "string" ||
-    !userId.trim() ||
     adminTelegramId === undefined ||
     adminTelegramId === null
   ) {
@@ -309,7 +330,7 @@ export async function rejectVerification(
     throw new Error("A rejection reason is required.");
   }
 
-  const userRef = usersCollection.doc(userId.trim());
+  const userRef = usersCollection.doc(userId);
 
   return db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(userRef);
@@ -341,11 +362,9 @@ export async function rejectVerification(
   });
 }
 
-/*
-|--------------------------------------------------------------------------
-| GET PENDING USERS
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// GET PENDING USERS
+// ============================================================
 
 export async function getPendingUsers() {
   const snapshot = await usersCollection
@@ -376,18 +395,14 @@ export async function getPendingUsers() {
   return users;
 }
 
-/*
-|--------------------------------------------------------------------------
-| GET USER MINUTES
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// GET USER MINUTES
+// ============================================================
 
 export async function getUserMinutes(userId) {
-  if (typeof userId !== "string" || !userId.trim()) {
-    throw new Error("User ID is required.");
-  }
+  userId = requireUserId(userId);
 
-  const snapshot = await usersCollection.doc(userId.trim()).get();
+  const snapshot = await usersCollection.doc(userId).get();
 
   if (!snapshot.exists) {
     throw new Error("User not found.");
@@ -396,21 +411,15 @@ export async function getUserMinutes(userId) {
   return normalizeMinutes(snapshot.data().minutes);
 }
 
-/*
-|--------------------------------------------------------------------------
-| ADD MINUTES
-|--------------------------------------------------------------------------
-| Only call after verified payment processing.
-| Payment idempotency belongs to paymentService.js.
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// ADD MINUTES
+// Only call after verified payment processing.
+// ============================================================
 
 export async function addMinutes(userId, minutes) {
-  const amount = Number(minutes);
+  userId = requireUserId(userId);
 
-  if (typeof userId !== "string" || !userId.trim()) {
-    throw new Error("User ID is required.");
-  }
+  const amount = Number(minutes);
 
   if (!Number.isSafeInteger(amount) || amount <= 0) {
     throw new Error(
@@ -418,7 +427,7 @@ export async function addMinutes(userId, minutes) {
     );
   }
 
-  const userRef = usersCollection.doc(userId.trim());
+  const userRef = usersCollection.doc(userId);
 
   return db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(userRef);
@@ -434,7 +443,9 @@ export async function addMinutes(userId, minutes) {
     const newMinutes = currentMinutes + amount;
 
     if (!Number.isSafeInteger(newMinutes)) {
-      throw new Error("The resulting minute balance is invalid.");
+      throw new Error(
+        "The resulting minute balance is invalid."
+      );
     }
 
     transaction.update(userRef, {
@@ -446,18 +457,14 @@ export async function addMinutes(userId, minutes) {
   });
 }
 
-/*
-|--------------------------------------------------------------------------
-| DEDUCT MINUTES
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// DEDUCT MINUTES
+// ============================================================
 
 export async function deductMinutes(userId, minutes) {
-  const amount = Number(minutes);
+  userId = requireUserId(userId);
 
-  if (typeof userId !== "string" || !userId.trim()) {
-    throw new Error("User ID is required.");
-  }
+  const amount = Number(minutes);
 
   if (!Number.isSafeInteger(amount) || amount <= 0) {
     throw new Error(
@@ -465,7 +472,7 @@ export async function deductMinutes(userId, minutes) {
     );
   }
 
-  const userRef = usersCollection.doc(userId.trim());
+  const userRef = usersCollection.doc(userId);
 
   return db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(userRef);
@@ -493,19 +500,17 @@ export async function deductMinutes(userId, minutes) {
   });
 }
 
-/*
-|--------------------------------------------------------------------------
-| UPDATE PAYMENT EMAIL
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// UPDATE PAYMENT EMAIL
+// ============================================================
+// Validates and saves a Gmail address.
+// ============================================================
 
 export async function updateUserPaymentEmail(userId, email) {
-  if (typeof userId !== "string" || !userId.trim()) {
-    throw new Error("User ID is required.");
-  }
+  userId = requireUserId(userId);
 
-  const normalizedEmail = normalizeEmail(email);
-  const userRef = usersCollection.doc(userId.trim());
+  const normalizedEmail = normalizeGmail(email);
+  const userRef = usersCollection.doc(userId);
 
   await db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(userRef);
@@ -526,20 +531,15 @@ export async function updateUserPaymentEmail(userId, email) {
   };
 }
 
-/*
-|--------------------------------------------------------------------------
-| GET PAYMENT EMAIL
-|--------------------------------------------------------------------------
-| Existing users may have no paymentEmail field or a null value.
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// GET PAYMENT EMAIL
+// Used by PayFast checkout.
+// ============================================================
 
 export async function getUserPaymentEmail(userId) {
-  if (typeof userId !== "string" || !userId.trim()) {
-    throw new Error("User ID is required.");
-  }
+  userId = requireUserId(userId);
 
-  const snapshot = await usersCollection.doc(userId.trim()).get();
+  const snapshot = await usersCollection.doc(userId).get();
 
   if (!snapshot.exists) {
     throw new Error("User not found.");
@@ -552,19 +552,17 @@ export async function getUserPaymentEmail(userId) {
     return null;
   }
 
-  return normalizeEmail(email);
+  return normalizeGmail(email);
 }
 
-/*
-|--------------------------------------------------------------------------
-| SET PENDING PAYMENT PACKAGE
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// SET PENDING PAYMENT PACKAGE
+// ============================================================
 
 export async function setPendingPaymentPackage(userId, packageId) {
+  userId = requireUserId(userId);
+
   if (
-    typeof userId !== "string" ||
-    !userId.trim() ||
     typeof packageId !== "string" ||
     !packageId.trim()
   ) {
@@ -574,7 +572,7 @@ export async function setPendingPaymentPackage(userId, packageId) {
   }
 
   const normalizedPackageId = packageId.trim();
-  const userRef = usersCollection.doc(userId.trim());
+  const userRef = usersCollection.doc(userId);
 
   await db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(userRef);
@@ -595,18 +593,14 @@ export async function setPendingPaymentPackage(userId, packageId) {
   };
 }
 
-/*
-|--------------------------------------------------------------------------
-| CLEAR PENDING PAYMENT
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// CLEAR PENDING PAYMENT
+// ============================================================
 
 export async function clearPendingPayment(userId) {
-  if (typeof userId !== "string" || !userId.trim()) {
-    throw new Error("User ID is required.");
-  }
+  userId = requireUserId(userId);
 
-  const userRef = usersCollection.doc(userId.trim());
+  const userRef = usersCollection.doc(userId);
 
   await db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(userRef);
