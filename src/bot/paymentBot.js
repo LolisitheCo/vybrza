@@ -201,21 +201,11 @@ export function registerPaymentHandlers(bot) {
 
         callbackAnswered = true;
 
-        const telegramId = String(ctx.from.id);
+       if (!ctx.from?.id) {
+  throw new Error("A valid Telegram user is required.");
+}
 
-        const user = await getOrCreateUser(
-          telegramId
-        );
-
-        if (
-          !user ||
-          typeof user.id !== "string" ||
-          user.id !== telegramId
-        ) {
-          throw new Error(
-            "Unable to identify your SA LIVE account."
-          );
-        }
+const user = await getOrCreateUser(ctx.from);
 
         if (
           user.verificationStatus !== "approved"
@@ -374,9 +364,11 @@ export function registerPaymentHandlers(bot) {
     try {
       await ctx.answerCbQuery();
 
-      const user = await getOrCreateUser(
-        String(ctx.from.id)
-      );
+     if (!ctx.from?.id) {
+  throw new Error("A valid Telegram user is required.");
+}
+
+const user = await getOrCreateUser(ctx.from);
 
       const minutes = Number(user.minutes ?? 0);
 

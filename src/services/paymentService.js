@@ -14,6 +14,7 @@ const callsCollection = db.collection("callSessions");
 
 export const CUSTOMER_PRICE_PER_MINUTE = 6;
 export const HOST_EARNINGS_PER_MINUTE = 2;
+export const SA_LIVE_REVENUE_PER_MINUTE = 4;
 
 export const PAYMENT_PACKAGES = Object.freeze({
   starter: Object.freeze({

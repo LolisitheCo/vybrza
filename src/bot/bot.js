@@ -147,7 +147,7 @@ async function sendWelcome(ctx) {
     }
 
     const telegramId = String(ctx.from.id);
-    await getOrCreateUser(telegramId);
+    await getOrCreateUser(ctx.from);
 
     const firstName = escapeMarkdown(
       cleanText(ctx.from.first_name || "there", 64)

@@ -1,5 +1,9 @@
 import { db } from "../config/firebase.js";
 
+import {
+  finalizeCallBilling,
+} from "./billingService.js";
+
 const callsCollection = db.collection("callSessions");
 
 /*
@@ -68,15 +72,19 @@ export async function createCallSession({
     endedAt: null,
 
     durationSeconds: 0,
-    minutesUsed: 0,
+minutesUsed: 0,
+billableMinutes: 0,
 
-    endReason: null,
+endReason: null,
 
-    billingStatus: "pending",
-    billedAt: null,
+billingStatus: "pending",
+billedAt: null,
 
-    hostEarnings: 0,
-    hostPayoutStatus: "pending",
+customerCharge: 0,
+hostEarnings: 0,
+saLiveRevenue: 0,
+
+hostPayoutStatus: "pending",
 
     createdAt: now,
     updatedAt: now,
@@ -191,6 +199,7 @@ export async function startCall(
 |--------------------------------------------------------------------------
 */
 
+
 export async function endCall(
   callId,
   reason = "completed"
@@ -216,73 +225,90 @@ export async function endCall(
     throw new Error("Invalid call end reason.");
   }
 
-  const callRef = callsCollection.doc(callId);
+  const callRef = callsCollection.doc(callId.trim());
 
-  return db.runTransaction(async (transaction) => {
-    const snapshot = await transaction.get(callRef);
+  const endedCall = await db.runTransaction(
+    async (transaction) => {
+      const snapshot = await transaction.get(callRef);
 
-    if (!snapshot.exists) {
-      throw new Error("Call not found.");
-    }
+      if (!snapshot.exists) {
+        throw new Error("Call not found.");
+      }
 
-    const call = snapshot.data();
+      const call = snapshot.data();
 
-    if (call.status === "completed") {
+      if (call.status === "completed") {
+        return {
+          id: snapshot.id,
+          ...call,
+          alreadyEnded: true,
+        };
+      }
+
+      if (
+        call.status !== "active" &&
+        call.status !== "matching" &&
+        call.status !== "matched"
+      ) {
+        throw new Error(
+          "This call cannot be ended from its current state."
+        );
+      }
+
+      const now = new Date();
+      const startedAt = toDate(call.startedAt);
+
+      const durationSeconds = startedAt
+        ? Math.max(
+            0,
+            Math.floor(
+              (now.getTime() - startedAt.getTime()) / 1000
+            )
+          )
+        : 0;
+
+      const minutesUsed = Math.ceil(durationSeconds / 60);
+
+      const updatedCall = {
+        status: "completed",
+        endedAt: now,
+        durationSeconds,
+        minutesUsed,
+        endReason: reason,
+        billingStatus: "pending",
+        billedAt: null,
+        updatedAt: now,
+      };
+
+      transaction.update(callRef, updatedCall);
+
       return {
         id: snapshot.id,
         ...call,
-        alreadyEnded: true,
+        ...updatedCall,
       };
     }
+  );
 
-    if (
-      call.status !== "active" &&
-      call.status !== "matching" &&
-      call.status !== "matched"
-    ) {
-      throw new Error(
-        "This call cannot be ended from its current state."
-      );
-    }
+  // Finalize billing after the call is marked completed.
+  // Already-ended calls are not billed again here.
+  if (
+    endedCall.status === "completed" &&
+    !endedCall.alreadyEnded
+  ) {
+    const billing = await finalizeCallBilling(endedCall.id);
 
-    const now = new Date();
-    const startedAt = toDate(call.startedAt);
-
-    const durationSeconds = startedAt
-      ? Math.max(
-          0,
-          Math.floor(
-            (now.getTime() - startedAt.getTime()) / 1000
-          )
-        )
-      : 0;
-
-    const updatedCall = {
-      status: "completed",
-      endedAt: now,
-      durationSeconds,
-
-      // Round up partial minutes for billing calculations.
-      // The billing service must apply the approved pricing rules.
-      minutesUsed: Math.ceil(durationSeconds / 60),
-
-      endReason: reason,
-
-      billingStatus: "pending",
-      billedAt: null,
-
-      updatedAt: now,
-    };
-
-    transaction.update(callRef, updatedCall);
+    console.log("SA LIVE call billing:", billing);
 
     return {
-      id: snapshot.id,
-      ...call,
-      ...updatedCall,
+      ...endedCall,
+      billing,
     };
-  });
+  }
+
+  return endedCall;
 }
+
 
 /*
 |--------------------------------------------------------------------------
