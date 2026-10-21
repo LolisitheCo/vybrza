@@ -530,6 +530,17 @@ export async function initializePayment(req, res) {
       email: normalizedEmail,
     });
 
+     console.info("SA LIVE payment reference check:", {
+  referenceType: typeof reference,
+  referenceLength:
+    typeof reference === "string"
+      ? reference.length
+      : null,
+  referenceFormatValid:
+    typeof reference === "string" &&
+    /^SALIVE-[A-F0-9]{32}$/.test(reference),
+});
+
     const checkout =
       await initializePayfastTransaction({
         email: normalizedEmail,
