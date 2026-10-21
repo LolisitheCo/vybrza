@@ -4,19 +4,11 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-// ============================================================
-// PAYFAST LIVE CONFIGURATION — SANDBOX DISABLED
-// ============================================================
-
 const PAYFAST_PROCESS_URL =
   "https://www.payfast.co.za/eng/process";
 
 const PAYMENT_REFERENCE_PATTERN =
   /^SALIVE-[A-F0-9]{32}$/;
-
-// ============================================================
-// ENVIRONMENT VALIDATION
-// ============================================================
 
 function requiredEnv(name) {
   const value = process.env[name];
@@ -49,10 +41,6 @@ function validateHttpsUrl(value, name) {
   return parsed.toString();
 }
 
-// ============================================================
-// PAYFAST LIVE CONFIGURATION
-// ============================================================
-
 function getPayfastConfig() {
   const mode = (
     process.env.PAYFAST_MODE || "live"
@@ -78,27 +66,20 @@ function getPayfastConfig() {
     merchantId,
     merchantKey,
     passphrase,
-
     returnUrl: validateHttpsUrl(
       requiredEnv("PAYFAST_RETURN_URL"),
       "PAYFAST_RETURN_URL"
     ),
-
     cancelUrl: validateHttpsUrl(
       requiredEnv("PAYFAST_CANCEL_URL"),
       "PAYFAST_CANCEL_URL"
     ),
-
     notifyUrl: validateHttpsUrl(
       requiredEnv("PAYFAST_NOTIFY_URL"),
       "PAYFAST_NOTIFY_URL"
     ),
   };
 }
-
-// ============================================================
-// PAYFAST SIGNATURE GENERATION
-// ============================================================
 
 function encodeValue(value) {
   return encodeURIComponent(String(value).trim())
@@ -134,27 +115,33 @@ function generateSignature(fields, passphrase) {
     .digest("hex");
 }
 
-// ============================================================
-// INITIALIZE PAYFAST LIVE CHECKOUT
-// ============================================================
-
 export async function initializePayfastTransaction({
   email,
   amount,
   reference,
   metadata = {},
 }) {
-  // Validate payment reference
   if (
     typeof reference !== "string" ||
     !PAYMENT_REFERENCE_PATTERN.test(reference)
   ) {
+    // Log only safe diagnostic information, not payment secrets.
+    console.error("Invalid PayFast reference received:", {
+      type: typeof reference,
+      length:
+        typeof reference === "string"
+          ? reference.length
+          : null,
+      hasExpectedPrefix:
+        typeof reference === "string" &&
+        reference.startsWith("SALIVE-"),
+    });
+
     throw new Error(
       "Invalid payment reference. Expected SALIVE- followed by 32 uppercase hexadecimal characters."
     );
   }
 
-  // Validate customer email
   if (
     typeof email !== "string" ||
     email.length > 254 ||
@@ -166,7 +153,6 @@ export async function initializePayfastTransaction({
     );
   }
 
-  // Validate payment amount
   const numericAmount = Number(amount);
 
   if (
@@ -182,15 +168,12 @@ export async function initializePayfastTransaction({
     );
   }
 
-  // Validate metadata
   if (
     !metadata ||
     typeof metadata !== "object" ||
     Array.isArray(metadata)
   ) {
-    throw new Error(
-      "Payment metadata must be an object."
-    );
+    throw new Error("Payment metadata must be an object.");
   }
 
   const config = getPayfastConfig();
@@ -210,7 +193,6 @@ export async function initializePayfastTransaction({
       `SA LIVE call time top-up: R${formattedAmount}`,
   };
 
-  // Add supported custom metadata fields
   const metadataKeys = [
     "custom_str1",
     "custom_str2",
@@ -238,7 +220,6 @@ export async function initializePayfastTransaction({
     fields[key] = value;
   }
 
-  // Generate payment signature
   fields.signature = generateSignature(
     fields,
     config.passphrase
