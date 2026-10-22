@@ -116,8 +116,8 @@ function getSouthAfricanDayAndTime(date = new Date()) {
   };
 }
 
-function isRecentlySeen(host, nowMs = Date.now()) {
-  const lastSeenMs = getMillis(host.lastSeenAt);
+function isRecentlySeen(host, nowMs) {
+  const lastSeenMs = getMillis(host?.lastSeenAt);
 
   if (!Number.isFinite(lastSeenMs)) {
     return false;
@@ -128,17 +128,48 @@ function isRecentlySeen(host, nowMs = Date.now()) {
   return age >= 0 && age <= HOST_TIMEOUT_MS;
 }
 
+function sanitizeAvailability(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter((slot) => {
+      return (
+        slot &&
+        typeof slot === "object" &&
+        !Array.isArray(slot) &&
+        DAYS.includes(slot.day) &&
+        typeof slot.startTime === "string" &&
+        typeof slot.endTime === "string" &&
+        TIME_PATTERN.test(slot.startTime) &&
+        TIME_PATTERN.test(slot.endTime) &&
+        slot.startTime < slot.endTime
+      );
+    })
+    .map(({ day, startTime, endTime }) => ({
+      day,
+      startTime,
+      endTime,
+    }));
+}
+
 /*
 |--------------------------------------------------------------------------
 | SHARED SCHEDULE CHECK
 |--------------------------------------------------------------------------
-| Schedule times use Africa/Johannesburg, regardless of the server's
-| timezone. Start time is inclusive; end time is exclusive.
+| All schedule times use Africa/Johannesburg.
+| Start time is inclusive; end time is exclusive.
 |--------------------------------------------------------------------------
 */
 
 export function isWithinHostSchedule(host, date = new Date()) {
-  if (!host || !Array.isArray(host.availability)) {
+  if (
+    !host ||
+    !Array.isArray(host.availability) ||
+    !(date instanceof Date) ||
+    !Number.isFinite(date.getTime())
+  ) {
     return false;
   }
 
@@ -163,15 +194,20 @@ export function isWithinHostSchedule(host, date = new Date()) {
 
 /*
 |--------------------------------------------------------------------------
-| SHARED ONLINE CHECK
+| SHARED DIRECTORY ONLINE CHECK
 |--------------------------------------------------------------------------
 */
 
 function isHostOnline(host, date = new Date()) {
+  if (!(date instanceof Date) || !Number.isFinite(date.getTime())) {
+    return false;
+  }
+
   return Boolean(
     host &&
       host.status === "active" &&
-      host.firebaseUid &&
+      typeof host.firebaseUid === "string" &&
+      host.firebaseUid.trim() &&
       host.acceptingCalls === true &&
       !host.activeCallId &&
       isRecentlySeen(host, date.getTime()) &&
@@ -182,6 +218,8 @@ function isHostOnline(host, date = new Date()) {
 /*
 |--------------------------------------------------------------------------
 | GET HOST AVAILABILITY PROFILE
+|--------------------------------------------------------------------------
+| This profile is returned only to the authenticated host.
 |--------------------------------------------------------------------------
 */
 
@@ -198,9 +236,7 @@ export async function getHostAvailabilityProfile(hostId) {
     id: snapshot.id,
     publicUsername: host.publicUsername || "",
     acceptingCalls: host.acceptingCalls === true,
-    availability: Array.isArray(host.availability)
-      ? host.availability
-      : [],
+    availability: sanitizeAvailability(host.availability),
     accountStatus: host.status,
   };
 }
@@ -253,8 +289,10 @@ export async function updateHostAvailabilityProfile(hostId, input) {
 |--------------------------------------------------------------------------
 | PUBLIC HOST DIRECTORY
 |--------------------------------------------------------------------------
-| Only explicitly selected public fields are returned.
-| Never expose email, Telegram ID, Firebase UID, or internal call IDs.
+| Only approved, linked hosts with a public username are included.
+| The response contains only explicitly selected public fields.
+| Never return Telegram IDs, Firebase UIDs, email addresses,
+| bank details, internal call IDs, or raw host documents.
 |--------------------------------------------------------------------------
 */
 
@@ -270,24 +308,26 @@ export async function getPublicHostDirectory() {
       const host = doc.data();
 
       if (
-        !host.firebaseUid ||
+        typeof host.firebaseUid !== "string" ||
+        !host.firebaseUid.trim() ||
         typeof host.publicUsername !== "string" ||
         !host.publicUsername.trim()
       ) {
         return null;
       }
 
+      const username = host.publicUsername.trim();
       const online = isHostOnline(host, now);
 
       return {
-        id: doc.id,
-        username: host.publicUsername,
-        displayName: host.publicUsername,
+        // Public, non-sensitive identifier.
+        // The username is already displayed publicly.
+        id: username.toLowerCase(),
+        username,
+        displayName: username,
         online,
         status: online ? "online" : "offline",
-        availability: Array.isArray(host.availability)
-          ? host.availability
-          : [],
+        availability: sanitizeAvailability(host.availability),
       };
     })
     .filter(Boolean)

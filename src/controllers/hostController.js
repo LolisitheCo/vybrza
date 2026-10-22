@@ -20,7 +20,7 @@ export async function heartbeat(req, res) {
       });
     }
 
-    const result = await hostHeartbeat(hostId);
+    const result = await hostHeartbeat(hostId, req.user?.uid);
 
     return res.status(200).json({
       success: true,

@@ -382,8 +382,10 @@ export async function linkHostAccount(firebaseUid, linkCode) {
 |--------------------------------------------------------------------------
 */
 
-export async function hostHeartbeat(hostId) {
+
+export async function hostHeartbeat(hostId, firebaseUid) {
   const id = normalizeId(hostId, "Host ID");
+  const uid = normalizeId(firebaseUid, "Firebase UID");
   const hostRef = hostsCollection.doc(id);
 
   return db.runTransaction(async (transaction) => {
@@ -399,6 +401,10 @@ export async function hostHeartbeat(hostId) {
       throw new Error("Host account is not active.");
     }
 
+    if (host.firebaseUid !== uid) {
+      throw new Error("Host account does not match the authenticated user.");
+    }
+
     const now = new Date();
 
     transaction.update(hostRef, {
@@ -407,12 +413,12 @@ export async function hostHeartbeat(hostId) {
     });
 
     return {
-      id,
       lastSeenAt: now,
       activeCallId: host.activeCallId || null,
     };
   });
 }
+
 
 /*
 |--------------------------------------------------------------------------
