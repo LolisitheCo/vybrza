@@ -1,6 +1,7 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import { db } from "../config/firebase.js";
+import { isWithinHostSchedule } from "./hostAvailabilityService.js";
 
 const hostsCollection = db.collection("hosts");
 const accountLinksCollection = db.collection("hostAccountLinks");
@@ -15,19 +16,13 @@ const MAX_LINK_CODE_LENGTH = 256;
 */
 
 function normalizeId(value, fieldName) {
-  if (
-    typeof value !== "string" &&
-    typeof value !== "number"
-  ) {
+  if (typeof value !== "string" && typeof value !== "number") {
     throw new Error(`${fieldName} is required.`);
   }
 
   const normalized = String(value).trim();
 
-  if (
-    !normalized ||
-    normalized.length > 256
-  ) {
+  if (!normalized || normalized.length > 256) {
     throw new Error(`Invalid ${fieldName}.`);
   }
 
@@ -35,26 +30,15 @@ function normalizeId(value, fieldName) {
 }
 
 function hashLinkCode(code) {
-  return createHash("sha256")
-    .update(code, "utf8")
-    .digest("hex");
+  return createHash("sha256").update(code, "utf8").digest("hex");
 }
 
-/*
- * Never expose linkCodeHash through ordinary host lookup functions.
- * The raw linkCode is returned only once by createHost().
- */
 function toHost(doc) {
   if (!doc?.exists) {
     return null;
   }
 
-  const data = doc.data();
-
-  const {
-    linkCodeHash,
-    ...safeData
-  } = data;
+  const { linkCodeHash, ...safeData } = doc.data();
 
   return {
     id: doc.id,
@@ -80,7 +64,8 @@ function getTimestampMilliseconds(value) {
   }
 
   if (typeof value === "string" || typeof value === "number") {
-    return new Date(value).getTime();
+    const result = new Date(value).getTime();
+    return Number.isFinite(result) ? result : NaN;
   }
 
   return NaN;
@@ -95,13 +80,50 @@ function isValidLinkCode(code) {
   );
 }
 
+function hasRecentHeartbeat(host, nowMs = Date.now()) {
+  const lastSeenMs = getTimestampMilliseconds(host?.lastSeenAt);
+
+  if (!Number.isFinite(lastSeenMs)) {
+    return false;
+  }
+
+  const ageMs = nowMs - lastSeenMs;
+
+  return ageMs >= 0 && ageMs <= HOST_TIMEOUT_MS;
+}
+
+/*
+|--------------------------------------------------------------------------
+| SHARED HOST AVAILABILITY
+|--------------------------------------------------------------------------
+| A host must be active, linked, accepting calls, within scheduled
+| hours, recently seen, and not already assigned to a call.
+|--------------------------------------------------------------------------
+*/
+
+export function isHostAvailable(host, date = new Date()) {
+  if (!host || typeof host !== "object") {
+    return false;
+  }
+
+  if (host.status !== "active" || !host.firebaseUid) {
+    return false;
+  }
+
+  if (host.acceptingCalls !== true || host.activeCallId) {
+    return false;
+  }
+
+  if (!hasRecentHeartbeat(host, date.getTime())) {
+    return false;
+  }
+
+  return isWithinHostSchedule(host, date);
+}
+
 /*
 |--------------------------------------------------------------------------
 | CREATE HOST
-|--------------------------------------------------------------------------
-| New hosts are pending by default.
-| Existing hosts are not silently overwritten.
-| Only the raw one-time link code is returned to the caller.
 |--------------------------------------------------------------------------
 */
 
@@ -125,9 +147,7 @@ export async function createHost({
       ? displayName.trim().slice(0, 100)
       : "SA LIVE Host";
 
-  const hostRef = hostsCollection.doc(
-    `tg_${normalizedTelegramId}`
-  );
+  const hostRef = hostsCollection.doc(`tg_${normalizedTelegramId}`);
 
   const linkCode = randomBytes(32).toString("hex");
   const now = new Date();
@@ -136,16 +156,12 @@ export async function createHost({
     telegramId: normalizedTelegramId,
     username: normalizedUsername,
     displayName: normalizedDisplayName,
-
     role: "host",
     status: "pending",
     firebaseUid: null,
-
     linkCodeHash: hashLinkCode(linkCode),
-
     lastSeenAt: null,
     activeCallId: null,
-
     createdAt: now,
     updatedAt: now,
   };
@@ -178,12 +194,7 @@ export async function createHost({
     };
   }
 
-  // Return this code only through a trusted, authorized workflow.
-  // Never send it to public host APIs or ordinary client responses.
-  const {
-    linkCodeHash,
-    ...safeHost
-  } = result.host;
+  const { linkCodeHash, ...safeHost } = result.host;
 
   return {
     ...safeHost,
@@ -257,7 +268,6 @@ export async function getHostByFirebaseUid(firebaseUid) {
 
 export async function getHostById(hostId) {
   const id = normalizeId(hostId, "Host ID");
-
   const snapshot = await hostsCollection.doc(id).get();
 
   return toHost(snapshot);
@@ -266,13 +276,6 @@ export async function getHostById(hostId) {
 /*
 |--------------------------------------------------------------------------
 | LINK APPROVED HOST TO FIREBASE ACCOUNT
-|--------------------------------------------------------------------------
-| Requires:
-| 1. A valid Firebase UID obtained from verified authentication.
-| 2. A one-time link code issued to the approved host.
-|
-| A deterministic account-link document prevents concurrent
-| successful linking of the same Firebase UID to different hosts.
 |--------------------------------------------------------------------------
 */
 
@@ -285,7 +288,6 @@ export async function linkHostAccount(firebaseUid, linkCode) {
 
   const codeHash = hashLinkCode(linkCode);
 
-  // Locate the host using the one-way hash of the link code.
   const matchingHosts = await hostsCollection
     .where("linkCodeHash", "==", codeHash)
     .limit(2)
@@ -302,30 +304,22 @@ export async function linkHostAccount(firebaseUid, linkCode) {
   const hostRef = matchingHosts.docs[0].ref;
   const accountLinkRef = accountLinksCollection.doc(uid);
 
-  // Detect existing legacy links before entering the transaction.
-  // The deterministic account-link document enforces uniqueness
-  // for all successful uses of this updated linking workflow.
   const existingHostSnapshot = await hostsCollection
     .where("firebaseUid", "==", uid)
     .limit(1)
     .get();
 
-  if (!existingHostSnapshot.empty) {
-    const existingHost = existingHostSnapshot.docs[0];
-
-    if (existingHost.id !== hostRef.id) {
-      throw new Error(
-        "This Firebase account is already linked to another host."
-      );
-    }
+  if (
+    !existingHostSnapshot.empty &&
+    existingHostSnapshot.docs[0].id !== hostRef.id
+  ) {
+    throw new Error(
+      "This Firebase account is already linked to another host."
+    );
   }
 
   return db.runTransaction(async (transaction) => {
-    // Complete all reads before writing.
-    const [
-      hostSnapshot,
-      accountLinkSnapshot,
-    ] = await Promise.all([
+    const [hostSnapshot, accountLinkSnapshot] = await Promise.all([
       transaction.get(hostRef),
       transaction.get(accountLinkRef),
     ]);
@@ -386,8 +380,6 @@ export async function linkHostAccount(firebaseUid, linkCode) {
 |--------------------------------------------------------------------------
 | HOST HEARTBEAT
 |--------------------------------------------------------------------------
-| The controller must supply the host ID established by authentication.
-|--------------------------------------------------------------------------
 */
 
 export async function hostHeartbeat(hostId) {
@@ -424,46 +416,6 @@ export async function hostHeartbeat(hostId) {
 
 /*
 |--------------------------------------------------------------------------
-| CHECK HOST AVAILABILITY
-|--------------------------------------------------------------------------
-*/
-
-export function isHostAvailable(host) {
-  if (!host || typeof host !== "object") {
-    return false;
-  }
-
-  if (host.status !== "active") {
-    return false;
-  }
-
-  if (!host.firebaseUid) {
-    return false;
-  }
-
-  if (host.activeCallId) {
-    return false;
-  }
-
-  if (!host.lastSeenAt) {
-    return false;
-  }
-
-  const lastSeenMs = getTimestampMilliseconds(
-    host.lastSeenAt
-  );
-
-  if (!Number.isFinite(lastSeenMs)) {
-    return false;
-  }
-
-  const ageMs = Date.now() - lastSeenMs;
-
-  return ageMs >= 0 && ageMs <= HOST_TIMEOUT_MS;
-}
-
-/*
-|--------------------------------------------------------------------------
 | GET AVAILABLE HOSTS
 |--------------------------------------------------------------------------
 */
@@ -473,9 +425,11 @@ export async function getAvailableHosts() {
     .where("status", "==", "active")
     .get();
 
+  const now = new Date();
+
   return snapshot.docs
     .map(toHost)
-    .filter(isHostAvailable);
+    .filter((host) => isHostAvailable(host, now));
 }
 
 /*
@@ -485,32 +439,29 @@ export async function getAvailableHosts() {
 */
 
 export async function findAvailableHost() {
-  const hosts = await getAvailableHosts();
+  const availableHosts = await getAvailableHosts();
 
-  if (hosts.length === 0) {
+  if (availableHosts.length === 0) {
     return null;
   }
 
-  // Deterministic selection for predictable behaviour.
-  // Actual reservation must still be performed transactionally.
-  hosts.sort((a, b) => a.id.localeCompare(b.id));
+  availableHosts.sort((a, b) => a.id.localeCompare(b.id));
 
-  return hosts[0];
+  return availableHosts[0];
 }
 
 /*
 |--------------------------------------------------------------------------
 | RESERVE HOST FOR A CALL
 |--------------------------------------------------------------------------
-| Atomic reservation: concurrent customers cannot both reserve
-| the same host using this function.
+| Availability is checked again inside the transaction so stale search
+| results cannot reserve a host who is no longer available.
 |--------------------------------------------------------------------------
 */
 
 export async function reserveHost(hostId, callId) {
   const id = normalizeId(hostId, "Host ID");
   const normalizedCallId = normalizeId(callId, "Call ID");
-
   const hostRef = hostsCollection.doc(id);
 
   return db.runTransaction(async (transaction) => {
@@ -527,24 +478,22 @@ export async function reserveHost(hostId, callId) {
     }
 
     if (!host.firebaseUid) {
-      throw new Error(
-        "Host has not linked a website account."
-      );
+      throw new Error("Host has not linked a website account.");
     }
 
     if (host.activeCallId) {
       throw new Error("Host is already in a call.");
     }
 
-    if (!isHostAvailable(host)) {
-      throw new Error("Host is no longer available.");
+    if (!isHostAvailable(host, new Date())) {
+      throw new Error(
+        "Host is no longer available. Check their schedule and call status."
+      );
     }
-
-    const now = new Date();
 
     transaction.update(hostRef, {
       activeCallId: normalizedCallId,
-      updatedAt: now,
+      updatedAt: new Date(),
     });
 
     return true;
@@ -554,11 +503,6 @@ export async function reserveHost(hostId, callId) {
 /*
 |--------------------------------------------------------------------------
 | RELEASE HOST
-|--------------------------------------------------------------------------
-| When callId is supplied, only that call may release the host.
-| Existing callers can continue calling releaseHost(hostId).
-| Prefer supplying callId to prevent stale calls from releasing
-| a host who has already been assigned to another call.
 |--------------------------------------------------------------------------
 */
 
