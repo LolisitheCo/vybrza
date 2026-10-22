@@ -1,4 +1,5 @@
 import "dotenv/config";
+import path from "node:path";
 import { Telegraf } from "telegraf";
 
 import {
@@ -1243,6 +1244,15 @@ await ctx.reply(
 });
 
 // ============================================================
+// PAYMENT HANDLERS
+// ============================================================
+
+// Payment validation, PayFast signature checks, payment verification,
+// and minute crediting remain in the existing payment module.
+
+registerPaymentHandlers(bot);
+
+// ============================================================
 // UNKNOWN TEXT MESSAGE
 // ============================================================
 
@@ -1275,15 +1285,6 @@ error?.message
 );
 }
 });
-
-// ============================================================
-// PAYMENT HANDLERS
-// ============================================================
-
-// Payment validation, PayFast signature checks, payment verification,
-// and minute crediting remain in the existing payment module.
-
-registerPaymentHandlers(bot);
 
 // ============================================================
 // TELEGRAM ERROR HANDLER

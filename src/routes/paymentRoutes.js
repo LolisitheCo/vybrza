@@ -3,6 +3,7 @@ import express from "express";
 
 import {
   initializePayment,
+  initializeExistingPaymentCheckout,
   verifyPayment,
   paymentCallback,
   paymentITN,
@@ -10,8 +11,11 @@ import {
 
 const router = express.Router();
 
-// Initialize a live PayFast checkout.
+// Initialize a new payment for authenticated clients.
 router.post("/initialize", initializePayment);
+
+// Prepare PayFast checkout for the existing Telegram payment.
+router.post("/checkout/:reference", initializeExistingPaymentCheckout);
 
 // Check a payment belonging to the authenticated user.
 router.get("/verify/:reference", verifyPayment);
@@ -21,7 +25,6 @@ router.get("/verify/:reference", verifyPayment);
 router.get("/callback", paymentCallback);
 
 // PayFast server-to-server Instant Transaction Notification.
-// PayFast sends application/x-www-form-urlencoded data.
 router.post(
   "/itn",
   express.urlencoded({

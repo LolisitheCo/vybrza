@@ -440,6 +440,117 @@ async function validatePayfastWithServer(fields) {
 // INITIALIZE PAYMENT
 // ============================================================
 
+export async function initializeExistingPaymentCheckout(req, res) {
+  try {
+    const reference = req.params?.reference;
+
+    if (!isValidReference(reference)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid payment reference.",
+      });
+    }
+
+    // The reference is a high-entropy bearer token created by
+    // the Telegram bot. Never accept price or email from the browser.
+    const payment = await getPaymentByReference(reference);
+
+    if (!payment) {
+      return res.status(404).json({
+        success: false,
+        message: "Payment not found. Please restart checkout in Telegram.",
+      });
+    }
+
+    if (
+      payment.reference !== reference ||
+      payment.provider !== "payfast" ||
+      payment.currency !== "ZAR" ||
+      payment.status !== "pending" ||
+      payment.credited === true
+    ) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "This payment is no longer available for checkout. Check your balance in Telegram.",
+      });
+    }
+
+    const paymentPackage = getPaymentPackage(payment.packageId);
+
+    if (
+      !paymentPackage ||
+      payment.amount !== paymentPackage.amount ||
+      payment.minutes !== paymentPackage.minutes ||
+      payment.amountCents !== Math.round(paymentPackage.amount * 100)
+    ) {
+      console.error("Stored payment package mismatch:", reference);
+
+      return res.status(409).json({
+        success: false,
+        message: "The stored payment details could not be verified.",
+      });
+    }
+
+    if (!isValidEmail(payment.email)) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "A valid payment email is missing. Please update your email in Telegram.",
+      });
+    }
+
+    const checkout = await initializePayfastTransaction({
+      email: payment.email,
+      amount: paymentPackage.amount,
+      reference,
+      metadata: {
+        custom_str1: paymentPackage.id,
+      },
+    });
+
+    const expectedHost = PAYFAST_HOSTS[getPayfastMode()];
+    const checkoutUrl = new URL(checkout.paymentUrl);
+
+    if (
+      checkoutUrl.protocol !== "https:" ||
+      checkoutUrl.hostname !== expectedHost ||
+      !checkout.fields ||
+      typeof checkout.fields !== "object" ||
+      Array.isArray(checkout.fields)
+    ) {
+      throw new Error("Invalid PayFast checkout response.");
+    }
+
+    // Ensure the signed fields match this existing payment.
+    if (
+      checkout.fields.m_payment_id !== reference ||
+      Number(checkout.fields.amount) !== paymentPackage.amount ||
+      checkout.fields.email_address !== payment.email
+    ) {
+      throw new Error("PayFast fields do not match the stored payment.");
+    }
+
+    return res.status(200).json({
+      success: true,
+      paymentUrl: checkout.paymentUrl,
+      fields: checkout.fields,
+    });
+  } catch (error) {
+    console.error(
+      "Existing PayFast checkout failed:",
+      error.message
+    );
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to prepare checkout. Please try again shortly.",
+    });
+  }
+}
+
+
+
 export async function initializePayment(req, res) {
   try {
     const authenticatedUserId =
