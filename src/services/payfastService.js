@@ -164,9 +164,9 @@ function generateSignature(fields, passphrase) {
 //   metadata: { custom_str1: "starter" }
 // }
 //
-// This function prepares signed checkout fields. It does NOT
-// create a database payment record and does NOT credit minutes.
-// Create the pending record separately before checkout.
+// This function prepares signed checkout fields.
+// It does NOT create a payment record or credit minutes.
+// Create the pending payment record separately.
 // ============================================================
 
 export async function initializePayfastTransaction(
@@ -190,7 +190,7 @@ export async function initializePayfastTransaction(
   } = options;
 
   // ----------------------------------------------------------
-  // VALIDATE REFERENCE
+  // VALIDATE PAYMENT REFERENCE
   // ----------------------------------------------------------
 
   if (
@@ -217,7 +217,7 @@ export async function initializePayfastTransaction(
   }
 
   // ----------------------------------------------------------
-  // VALIDATE EMAIL
+  // VALIDATE CUSTOMER EMAIL
   // ----------------------------------------------------------
 
   if (
@@ -232,7 +232,7 @@ export async function initializePayfastTransaction(
   }
 
   // ----------------------------------------------------------
-  // VALIDATE AMOUNT
+  // VALIDATE PAYMENT AMOUNT
   // ----------------------------------------------------------
 
   const numericAmount = Number(amount);
@@ -268,7 +268,7 @@ export async function initializePayfastTransaction(
   const formattedAmount = numericAmount.toFixed(2);
 
   // ----------------------------------------------------------
-  // BUILD PAYFAST FIELDS
+  // BUILD PAYFAST CHECKOUT FIELDS
   // ----------------------------------------------------------
 
   const fields = {
@@ -317,11 +317,18 @@ export async function initializePayfastTransaction(
     fields[key] = value;
   }
 
-  // Generate the signature only after every field is final.
+  // ----------------------------------------------------------
+  // GENERATE SIGNATURE
+  // ----------------------------------------------------------
+
   fields.signature = generateSignature(
     fields,
     config.passphrase
   );
+
+  // ----------------------------------------------------------
+  // RETURN CHECKOUT DETAILS TO THE BACKEND CALLER
+  // ----------------------------------------------------------
 
   return {
     provider: "payfast",
