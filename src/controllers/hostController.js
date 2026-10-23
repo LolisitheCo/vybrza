@@ -11,7 +11,7 @@ import {
 
 export async function heartbeat(req, res) {
   try {
-    const hostId = req.host?.id;
+    const hostId = req.hostAccount?.id;
 
     if (!hostId) {
       return res.status(401).json({
@@ -42,7 +42,7 @@ export async function heartbeat(req, res) {
 
 export async function getMyHostProfile(req, res) {
   try {
-    const hostId = req.host?.id;
+    const hostId = req.hostAccount?.id;
 
     if (!hostId) {
       return res.status(401).json({
@@ -72,7 +72,7 @@ export async function getMyHostProfile(req, res) {
 
 export async function updateMyHostProfile(req, res) {
   try {
-    const hostId = req.host?.id;
+    const hostId = req.hostAccount?.id;
 
     if (!hostId) {
       return res.status(401).json({

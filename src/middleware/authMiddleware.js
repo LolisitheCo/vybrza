@@ -222,7 +222,7 @@ export async function requireHost(req, res, next) {
     }
 
     // Return only server-loaded host data.
-    req.host = Object.freeze({
+    req.hostAccount = Object.freeze({
       ...hostData,
       id: hostDoc.id,
     });
