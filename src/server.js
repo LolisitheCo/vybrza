@@ -6,6 +6,7 @@ import cors from "cors";
 
 import { bot } from "./bot/bot.js";
 import hostRoutes from "./routes/hostRoutes.js";
+import callRoutes from "./routes/callRoutes.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
 import adminManagementRoutes from "./routes/adminManagementRoutes.js";
 
@@ -192,6 +193,7 @@ app.get("/health", (req, res) => {
 app.use("/api/hosts", hostRoutes);
 app.use("/api/payments", paymentRoutes);
 app.use("/api/admin", adminManagementRoutes);
+app.use("/api/calls", callRoutes);
 
 /*
 |--------------------------------------------------------------------------
