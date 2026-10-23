@@ -839,6 +839,14 @@ console.info("PayFast ITN source diagnostic:", {
   ),
 });
 
+console.info("PayFast ITN proxy diagnostic:", {
+  forwardedFor: String(
+    req.headers["x-forwarded-for"] || ""
+  ).slice(0, 200),
+  expressIp,
+  socketIp,
+});
+
 if (!sourceIpAllowed) {
   console.warn(
     "Rejected PayFast ITN: source IP not allowlisted."
