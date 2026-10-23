@@ -228,11 +228,15 @@ export async function requireHost(req, res, next) {
     });
 
     return next();
-  } catch (error) {
-    console.error(
-      "Host authorization failed:",
-      error?.code || "UNKNOWN_ERROR"
-    );
+   } catch (error) {
+    console.error("Host authorization diagnostic:", {
+      name: error?.name || "UnknownError",
+      code: error?.code || "NO_ERROR_CODE",
+      message:
+        typeof error?.message === "string"
+          ? error.message.slice(0, 500)
+          : "No error message available",
+    });
 
     return sendError(
       res,
