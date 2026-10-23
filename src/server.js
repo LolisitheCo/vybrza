@@ -75,8 +75,11 @@ for (const origin of configuredOrigins) {
 
 app.disable("x-powered-by");
 
-// Do not enable trust proxy globally without configuring the exact
-// trusted proxy topology used by your hosting provider.
+// Render sits in front of the application as a reverse proxy.
+// Trust one proxy hop so Express can determine the originating IP
+// from the forwarded request headers.
+app.set("trust proxy", 1);
+
 app.disable("etag");
 
 app.use((req, res, next) => {
