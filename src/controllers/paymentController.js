@@ -830,21 +830,14 @@ const socketIp = normalizeRemoteAddress(
 const remoteAddress = expressIp || socketIp;
 const sourceIpAllowed = isPayfastSourceIp(remoteAddress);
 
-console.info("PayFast ITN source diagnostic:", {
-  expressIp,
-  socketIp,
-  sourceIpAllowed,
-  forwardedHeaderPresent: Boolean(
-    req.headers["x-forwarded-for"]
-  ),
-});
-
 console.info("PayFast ITN proxy diagnostic:", {
-  forwardedFor: String(
-    req.headers["x-forwarded-for"] || ""
-  ).slice(0, 200),
-  expressIp,
-  socketIp,
+  expressIp: req.ip,
+  expressIps: req.ips,
+  socketIp: req.socket?.remoteAddress,
+  forwardedFor: req.headers["x-forwarded-for"] ?? null,
+  cloudflareConnectingIp:
+    req.headers["cf-connecting-ip"] ?? null,
+  sourceIpAllowed,
 });
 
 if (!sourceIpAllowed) {
