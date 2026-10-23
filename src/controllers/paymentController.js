@@ -822,17 +822,30 @@ export async function paymentITN(req, res) {
      * Configure Express trusted proxies correctly in production.
      */
 
-    const remoteAddress = normalizeRemoteAddress(
-      req.ip || req.socket?.remoteAddress || ""
-    );
+    const expressIp = normalizeRemoteAddress(req.ip || "");
+const socketIp = normalizeRemoteAddress(
+  req.socket?.remoteAddress || ""
+);
 
-    if (!isPayfastSourceIp(remoteAddress)) {
-      console.warn(
-        "Rejected PayFast ITN from unrecognized source."
-      );
+const remoteAddress = expressIp || socketIp;
+const sourceIpAllowed = isPayfastSourceIp(remoteAddress);
 
-      return res.status(403).send("Forbidden");
-    }
+console.info("PayFast ITN source diagnostic:", {
+  expressIp,
+  socketIp,
+  sourceIpAllowed,
+  forwardedHeaderPresent: Boolean(
+    req.headers["x-forwarded-for"]
+  ),
+});
+
+if (!sourceIpAllowed) {
+  console.warn(
+    "Rejected PayFast ITN: source IP not allowlisted."
+  );
+
+  return res.status(403).send("Forbidden");
+}
 
     if (!verifyPayfastSignature(fields)) {
       console.warn("Rejected PayFast ITN: invalid signature.");
