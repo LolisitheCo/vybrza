@@ -229,6 +229,19 @@ function isScalarPayfastField(value) {
 // PAYFAST SIGNATURE VERIFICATION
 // ============================================================
 
+/*
+ * PayFast-compatible URL encoding.
+ * Spaces must become "+" and special characters must use
+ * uppercase percent-encoding.
+ */
+function payfastEncode(value) {
+  return encodeURIComponent(String(value))
+    .replace(/%20/g, "+")
+    .replace(/[!'()*]/g, (character) =>
+      `%${character.charCodeAt(0).toString(16).toUpperCase()}`
+    );
+}
+
 
 function getPayfastMode() {
   const mode = (
