@@ -294,6 +294,7 @@ function getPayfastMode() {
 
 
 
+
 function buildPayfastParameterString(
   fields,
   includePassphrase = true
@@ -301,14 +302,12 @@ function buildPayfastParameterString(
   const parts = [];
 
   for (const [key, value] of Object.entries(fields)) {
+    // PayFast's ITN example stops at signature.
     if (key === "signature") {
-      continue;
+      break;
     }
 
-    if (
-      typeof key !== "string" ||
-      !/^[a-zA-Z0-9_]+$/.test(key)
-    ) {
+    if (!/^[a-zA-Z0-9_]+$/.test(key)) {
       throw new Error("Invalid PayFast parameter name.");
     }
 
@@ -322,18 +321,17 @@ function buildPayfastParameterString(
       continue;
     }
 
-    parts.push(
-      `${key}=${payfastEncode(normalizedValue)}`
-    );
+    parts.push(`${key}=${payfastEncode(normalizedValue)}`);
   }
+
+  let parameterString = parts.join("&");
 
   if (includePassphrase) {
-    parts.push(
-      `passphrase=${payfastEncode(getPassphrase())}`
-    );
+    parameterString +=
+      `${parameterString ? "&" : ""}passphrase=${payfastEncode(getPassphrase())}`;
   }
 
-  return parts.join("&");
+  return parameterString;
 }
 
 function verifyPayfastSignature(fields) {
@@ -353,29 +351,20 @@ function verifyPayfastSignature(fields) {
     const expectedSignature = crypto
       .createHash("md5")
       .update(parameterString, "utf8")
-      .digest();
+      .digest("hex");
 
-    const actualSignature = Buffer.from(
-      receivedSignature,
-      "hex"
-    );
-
-    console.info("PayFast signature diagnostic:", {
-  receivedSignatureLength: receivedSignature.length,
-  parameterCount: Object.keys(fields).length,
-  passphraseConfigured:
-    Boolean(process.env.PAYFAST_SANDBOX_PASSPHRASE),
-  mode: getPayfastMode(),
-});
+    const actual = Buffer.from(receivedSignature, "hex");
+    const expected = Buffer.from(expectedSignature, "hex");
 
     return (
-      actualSignature.length === expectedSignature.length &&
-      crypto.timingSafeEqual(
-        actualSignature,
-        expectedSignature
-      )
+      actual.length === expected.length &&
+      crypto.timingSafeEqual(actual, expected)
     );
-  } catch {
+  } catch (error) {
+    console.error(
+      "PayFast signature verification setup failed:",
+      error.message
+    );
     return false;
   }
 }
