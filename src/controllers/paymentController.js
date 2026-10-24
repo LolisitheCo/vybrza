@@ -294,7 +294,6 @@ function getPayfastMode() {
 
 
 
-
 function buildPayfastParameterString(
   fields,
   includePassphrase = true
@@ -302,7 +301,7 @@ function buildPayfastParameterString(
   const parts = [];
 
   for (const [key, value] of Object.entries(fields)) {
-    // PayFast's ITN example stops at signature.
+    // PayFast's ITN format ends at the signature field.
     if (key === "signature") {
       break;
     }
@@ -315,13 +314,9 @@ function buildPayfastParameterString(
       throw new Error("Invalid PayFast parameter value.");
     }
 
-    const normalizedValue = String(value).trim();
-
-    if (normalizedValue === "") {
-      continue;
-    }
-
-    parts.push(`${key}=${payfastEncode(normalizedValue)}`);
+    // Preserve blank values in ITN notifications.
+    // Encode values using PayFast-compatible URL encoding.
+    parts.push(`${key}=${payfastEncode(value)}`);
   }
 
   let parameterString = parts.join("&");
@@ -333,6 +328,8 @@ function buildPayfastParameterString(
 
   return parameterString;
 }
+
+
 
 function verifyPayfastSignature(fields) {
   try {
