@@ -360,6 +360,14 @@ function verifyPayfastSignature(fields) {
       "hex"
     );
 
+    console.info("PayFast signature diagnostic:", {
+  receivedSignatureLength: receivedSignature.length,
+  parameterCount: Object.keys(fields).length,
+  passphraseConfigured:
+    Boolean(process.env.PAYFAST_SANDBOX_PASSPHRASE),
+  mode: getPayfastMode(),
+});
+
     return (
       actualSignature.length === expectedSignature.length &&
       crypto.timingSafeEqual(
