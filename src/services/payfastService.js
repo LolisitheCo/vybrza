@@ -248,13 +248,17 @@ export async function initializePayfastTransaction(options = {}) {
     }
   }
 
-  const config = getPayfastConfig();
+    const config = getPayfastConfig();
   const formattedAmount = numericAmount.toFixed(2);
+
+  // Include this transaction's reference in the browser return URL.
+  const returnUrl = new URL(config.returnUrl);
+  returnUrl.searchParams.set("reference", reference);
 
   const fields = {
     merchant_id: config.merchantId,
     merchant_key: config.merchantKey,
-    return_url: config.returnUrl,
+    return_url: returnUrl.toString(),
     cancel_url: config.cancelUrl,
     notify_url: config.notifyUrl,
     email_address: email.toLowerCase(),
