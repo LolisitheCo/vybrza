@@ -35,34 +35,68 @@ const PAYFAST_SOURCE_RANGES = Object.freeze([
 ]);
 
 
-
 function getPassphrase() {
-  const value = process.env.PAYFAST_PASSPHRASE;
+  const mode = (
+    process.env.PAYFAST_MODE || "live"
+  ).trim().toLowerCase();
+
+  if (mode !== "live" && mode !== "sandbox") {
+    throw new Error("PAYFAST_MODE must be live or sandbox.");
+  }
+
+  const variableName =
+    mode === "sandbox"
+      ? "PAYFAST_SANDBOX_PASSPHRASE"
+      : process.env.PAYFAST_LIVE_PASSPHRASE
+        ? "PAYFAST_LIVE_PASSPHRASE"
+        : "PAYFAST_PASSPHRASE";
+
+  const value = process.env[variableName];
 
   if (
     typeof value !== "string" ||
     value.length === 0 ||
-    value !== value.trim()
+    value !== value.trim() ||
+    value.length > 32
   ) {
-    throw new Error("PayFast passphrase is missing or invalid.");
+    throw new Error(
+      `${variableName} is missing or invalid.`
+    );
   }
 
   return value;
 }
 
 
+
 function getMerchantId() {
-  const merchantId = process.env.PAYFAST_MERCHANT_ID;
+  const mode = (
+    process.env.PAYFAST_MODE || "live"
+  ).trim().toLowerCase();
+
+  if (mode !== "live" && mode !== "sandbox") {
+    throw new Error("PAYFAST_MODE must be live or sandbox.");
+  }
+
+  const variableName =
+    mode === "sandbox"
+      ? "PAYFAST_SANDBOX_MERCHANT_ID"
+      : process.env.PAYFAST_LIVE_MERCHANT_ID
+        ? "PAYFAST_LIVE_MERCHANT_ID"
+        : "PAYFAST_MERCHANT_ID";
+
+  const merchantId = process.env[variableName];
 
   if (
     typeof merchantId !== "string" ||
     !/^\d{8}$/.test(merchantId.trim())
   ) {
-    throw new Error("PayFast merchant ID is invalid.");
+    throw new Error(`${variableName} is missing or invalid.`);
   }
 
   return merchantId.trim();
 }
+
 
 
 // ============================================================
@@ -243,19 +277,21 @@ function payfastEncode(value) {
 }
 
 
+
 function getPayfastMode() {
   const mode = (
     process.env.PAYFAST_MODE || "live"
   ).trim().toLowerCase();
 
-  if (mode !== "live") {
+  if (mode !== "live" && mode !== "sandbox") {
     throw new Error(
-      "SA LIVE requires PAYFAST_MODE=live. Sandbox is disabled."
+      "PAYFAST_MODE must be either live or sandbox."
     );
   }
 
-  return "live";
+  return mode;
 }
+
 
 
 function buildPayfastParameterString(

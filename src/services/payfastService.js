@@ -8,14 +8,13 @@ dotenv.config();
 // SA LIVE — PAYFAST CONFIGURATION
 // ============================================================
 
-const DEFAULT_PAYFAST_PAYMENT_URL =
-  "https://www.payfast.co.za/eng/process";
+const PAYFAST_HOSTS = Object.freeze({
+  live: "www.payfast.co.za",
+  sandbox: "sandbox.payfast.co.za",
+});
 
-const PAYMENT_REFERENCE_PATTERN =
-  /^SALIVE-[A-F0-9]{32}$/;
-
-const EMAIL_PATTERN =
-  /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PAYMENT_REFERENCE_PATTERN = /^SALIVE-[A-F0-9]{32}$/;
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const MAX_EMAIL_LENGTH = 254;
 const MINIMUM_PAYMENT_AMOUNT = 5;
@@ -35,10 +34,7 @@ const METADATA_KEYS = [
 function requiredEnv(name) {
   const value = process.env[name];
 
-  if (
-    typeof value !== "string" ||
-    !value.trim()
-  ) {
+  if (typeof value !== "string" || !value.trim()) {
     throw new Error(`${name} is missing.`);
   }
 
@@ -51,9 +47,7 @@ function validateHttpsUrl(value, name) {
   try {
     parsed = new URL(value);
   } catch {
-    throw new Error(
-      `${name} must be a valid absolute URL.`
-    );
+    throw new Error(`${name} must be a valid absolute URL.`);
   }
 
   if (
@@ -70,71 +64,61 @@ function validateHttpsUrl(value, name) {
   return parsed.toString();
 }
 
-function validatePayfastCheckoutUrl(value) {
-  const parsed = validateHttpsUrl(
-    value,
-    "PAYFAST_PAYMENT_URL"
-  );
-
-  const url = new URL(parsed);
-
-  if (
-    url.hostname !== "www.payfast.co.za" ||
-    url.pathname !== "/eng/process" ||
-    url.search ||
-    url.hash
-  ) {
-    throw new Error(
-      "PAYFAST_PAYMENT_URL must be https://www.payfast.co.za/eng/process."
-    );
-  }
-
-  return url.toString();
-}
-
 function getPayfastConfig() {
   const mode = (
     process.env.PAYFAST_MODE || "live"
   ).trim().toLowerCase();
 
-  if (mode !== "live") {
+  if (mode !== "live" && mode !== "sandbox") {
     throw new Error(
-      "SA LIVE requires PAYFAST_MODE=live. Sandbox is disabled."
+      "PAYFAST_MODE must be either live or sandbox."
     );
   }
 
+  const prefix =
+    mode === "sandbox"
+      ? "PAYFAST_SANDBOX"
+      : "PAYFAST_LIVE";
+
+  // Legacy variable names remain available for Live mode.
   const merchantId = requiredEnv(
-    "PAYFAST_MERCHANT_ID"
+    mode === "live" &&
+      !process.env.PAYFAST_LIVE_MERCHANT_ID
+      ? "PAYFAST_MERCHANT_ID"
+      : `${prefix}_MERCHANT_ID`
   );
 
   const merchantKey = requiredEnv(
-    "PAYFAST_MERCHANT_KEY"
+    mode === "live" &&
+      !process.env.PAYFAST_LIVE_MERCHANT_KEY
+      ? "PAYFAST_MERCHANT_KEY"
+      : `${prefix}_MERCHANT_KEY`
   );
 
   const passphrase = requiredEnv(
-    "PAYFAST_PASSPHRASE"
+    mode === "live" &&
+      !process.env.PAYFAST_LIVE_PASSPHRASE
+      ? "PAYFAST_PASSPHRASE"
+      : `${prefix}_PASSPHRASE`
   );
 
   if (!/^\d{8}$/.test(merchantId)) {
     throw new Error(
-      "PAYFAST_MERCHANT_ID must contain exactly 8 digits."
+      `${prefix}_MERCHANT_ID must contain exactly 8 digits.`
     );
   }
 
   if (passphrase.length > 32) {
     throw new Error(
-      "PAYFAST_PASSPHRASE must not exceed 32 characters."
+      `${prefix}_PASSPHRASE must not exceed 32 characters.`
     );
   }
 
-  const paymentUrl = validatePayfastCheckoutUrl(
-    (
-      process.env.PAYFAST_PAYMENT_URL ||
-      DEFAULT_PAYFAST_PAYMENT_URL
-    ).trim()
-  );
+  const paymentUrl =
+    `https://${PAYFAST_HOSTS[mode]}/eng/process`;
 
   return {
+    mode,
     merchantId,
     merchantKey,
     passphrase,
@@ -175,8 +159,6 @@ function encodeValue(value) {
 function generateSignature(fields, passphrase) {
   const parameters = [];
 
-  // Preserve the order in which PayFast fields are created.
-  // Do not alphabetically sort custom checkout signatures.
   for (const [key, value] of Object.entries(fields)) {
     if (
       key === "signature" ||
@@ -187,14 +169,10 @@ function generateSignature(fields, passphrase) {
       continue;
     }
 
-    parameters.push(
-      `${key}=${encodeValue(value)}`
-    );
+    parameters.push(`${key}=${encodeValue(value)}`);
   }
 
-  parameters.push(
-    `passphrase=${encodeValue(passphrase)}`
-  );
+  parameters.push(`passphrase=${encodeValue(passphrase)}`);
 
   return createHash("md5")
     .update(parameters.join("&"), "utf8")
@@ -205,9 +183,7 @@ function generateSignature(fields, passphrase) {
 // INITIALIZE PAYFAST TRANSACTION
 // ============================================================
 
-export async function initializePayfastTransaction(
-  options = {}
-) {
+export async function initializePayfastTransaction(options = {}) {
   if (
     !options ||
     typeof options !== "object" ||
@@ -225,7 +201,6 @@ export async function initializePayfastTransaction(
     metadata = {},
   } = options;
 
-  // Payment reference
   if (
     typeof reference !== "string" ||
     !PAYMENT_REFERENCE_PATTERN.test(reference)
@@ -235,19 +210,15 @@ export async function initializePayfastTransaction(
     );
   }
 
-  // Customer email
   if (
     typeof email !== "string" ||
     email.length > MAX_EMAIL_LENGTH ||
     email !== email.trim() ||
     !EMAIL_PATTERN.test(email)
   ) {
-    throw new Error(
-      "A valid customer email address is required."
-    );
+    throw new Error("A valid customer email address is required.");
   }
 
-  // Payment amount
   const numericAmount = Number(amount);
 
   if (
@@ -255,7 +226,7 @@ export async function initializePayfastTransaction(
     numericAmount < MINIMUM_PAYMENT_AMOUNT ||
     Math.abs(
       numericAmount * 100 -
-      Math.round(numericAmount * 100)
+        Math.round(numericAmount * 100)
     ) > 1e-8
   ) {
     throw new Error(
@@ -263,45 +234,34 @@ export async function initializePayfastTransaction(
     );
   }
 
-  // Metadata
   if (
     !metadata ||
     typeof metadata !== "object" ||
     Array.isArray(metadata)
   ) {
-    throw new Error(
-      "Payment metadata must be an object."
-    );
+    throw new Error("Payment metadata must be an object.");
   }
 
   for (const key of Object.keys(metadata)) {
     if (!METADATA_KEYS.includes(key)) {
-      throw new Error(
-        `Unsupported PayFast metadata field: ${key}.`
-      );
+      throw new Error(`Unsupported PayFast metadata field: ${key}.`);
     }
   }
 
   const config = getPayfastConfig();
   const formattedAmount = numericAmount.toFixed(2);
 
-  // Keep checkout field insertion order consistent.
   const fields = {
     merchant_id: config.merchantId,
     merchant_key: config.merchantKey,
-
     return_url: config.returnUrl,
     cancel_url: config.cancelUrl,
     notify_url: config.notifyUrl,
-
     email_address: email.toLowerCase(),
-
     m_payment_id: reference,
     amount: formattedAmount,
-
     item_name: "SA LIVE Call Minutes",
-    item_description:
-      `SA LIVE call time top-up: R${formattedAmount}`,
+    item_description: `SA LIVE call time top-up: R${formattedAmount}`,
   };
 
   for (const key of METADATA_KEYS) {
@@ -316,15 +276,12 @@ export async function initializePayfastTransaction(
       value.length > 255 ||
       /[\u0000-\u001F\u007F]/.test(value)
     ) {
-      throw new Error(
-        `Invalid PayFast metadata field: ${key}.`
-      );
+      throw new Error(`Invalid PayFast metadata field: ${key}.`);
     }
 
     fields[key] = value;
   }
 
-  // Generate the signature on the backend only.
   fields.signature = generateSignature(
     fields,
     config.passphrase
@@ -332,7 +289,7 @@ export async function initializePayfastTransaction(
 
   return {
     provider: "payfast",
-    mode: "live",
+    mode: config.mode,
     paymentUrl: config.paymentUrl,
     reference,
     fields,
