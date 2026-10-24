@@ -356,6 +356,17 @@ function verifyPayfastSignature(fields) {
     const actual = Buffer.from(receivedSignature, "hex");
     const expected = Buffer.from(expectedSignature, "hex");
 
+    console.info("PayFast signature comparison:", {
+  receivedMatchesCalculated:
+    receivedSignature.toLowerCase() === expectedSignature,
+  receivedSignatureLength: receivedSignature.length,
+  calculatedSignatureLength: expectedSignature.length,
+  fieldOrder: Object.keys(fields).filter(
+    (key) => key !== "signature"
+  ),
+  mode: getPayfastMode(),
+});
+
     return (
       actual.length === expected.length &&
       crypto.timingSafeEqual(actual, expected)
