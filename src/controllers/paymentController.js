@@ -864,7 +864,19 @@ const socketIp = normalizeRemoteAddress(
 );
 
 const remoteAddress = expressIp || socketIp;
-const sourceIpAllowed = isPayfastSourceIp(remoteAddress);
+
+const cloudflareIp = normalizeRemoteAddress(
+  typeof req.headers["cf-connecting-ip"] === "string"
+    ? req.headers["cf-connecting-ip"]
+    : ""
+);
+
+const sourceIpAllowed =
+  isPayfastSourceIp(remoteAddress) ||
+  (
+    cloudflareIp !== "" &&
+    isPayfastSourceIp(cloudflareIp)
+  );
 
 console.info("PayFast ITN proxy diagnostic:", {
   expressIp: req.ip,
