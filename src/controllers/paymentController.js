@@ -112,28 +112,21 @@ function getMerchantId() {
  * trusted authentication middleware.
  */
 
-function getAuthenticatedUserId(req) {
-  const candidates = [
-    req.authenticatedUserId,
-    req.user?.uid,
-    req.user?.telegramId,
-    req.auth?.uid,
-    req.auth?.telegramId,
-  ];
 
-  for (const candidate of candidates) {
-    if (
-      (typeof candidate === "string" ||
-        typeof candidate === "number") &&
-      String(candidate).trim() &&
-      String(candidate).length <= 128
-    ) {
-      return String(candidate).trim();
-    }
+function getAuthenticatedUserId(req) {
+  const uid = req.user?.uid;
+
+  if (
+    typeof uid !== "string" ||
+    uid.trim().length === 0 ||
+    uid.length > 128
+  ) {
+    return null;
   }
 
-  return null;
+  return uid.trim();
 }
+
 
 function isPaymentOwner(payment, userId) {
   return (
@@ -505,16 +498,28 @@ export async function initializeExistingPaymentCheckout(req, res) {
       });
     }
 
-    // The reference is a high-entropy bearer token created by
-    // the Telegram bot. Never accept price or email from the browser.
-    const payment = await getPaymentByReference(reference);
+    
+const authenticatedUserId = getAuthenticatedUserId(req);
 
-    if (!payment) {
-      return res.status(404).json({
-        success: false,
-        message: "Payment not found. Please restart checkout in Telegram.",
-      });
-    }
+if (!authenticatedUserId) {
+  return res.status(401).json({
+    success: false,
+    message: "Authentication is required.",
+  });
+}
+
+const payment = await getPaymentByReference(reference);
+
+if (
+  !payment ||
+  String(payment.userId) !== authenticatedUserId
+) {
+  return res.status(404).json({
+    success: false,
+    message: "Payment not found.",
+  });
+}
+
 
     if (
       payment.reference !== reference ||

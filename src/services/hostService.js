@@ -1,36 +1,36 @@
 
-import { createHash, randomBytes } from "node:crypto";
 import { db } from "../config/firebase.js";
 import { isWithinHostSchedule } from "./hostAvailabilityService.js";
 
 const hostsCollection = db.collection("hosts");
-const accountLinksCollection = db.collection("hostAccountLinks");
 
 const HOST_TIMEOUT_MS = 45_000;
-const MAX_LINK_CODE_LENGTH = 256;
+const MAX_ID_LENGTH = 256;
 
 /*
 |--------------------------------------------------------------------------
-| HELPERS
+| VALIDATION HELPERS
 |--------------------------------------------------------------------------
 */
 
 function normalizeId(value, fieldName) {
-  if (typeof value !== "string" && typeof value !== "number") {
+  if (
+    (typeof value !== "string" && typeof value !== "number") ||
+    !String(value).trim()
+  ) {
     throw new Error(`${fieldName} is required.`);
   }
 
   const normalized = String(value).trim();
 
-  if (!normalized || normalized.length > 256) {
+  if (
+    normalized.length > MAX_ID_LENGTH ||
+    normalized.includes("/")
+  ) {
     throw new Error(`Invalid ${fieldName}.`);
   }
 
   return normalized;
-}
-
-function hashLinkCode(code) {
-  return createHash("sha256").update(code, "utf8").digest("hex");
 }
 
 function toHost(doc) {
@@ -38,7 +38,14 @@ function toHost(doc) {
     return null;
   }
 
-  const { linkCodeHash, ...safeData } = doc.data();
+  const data = doc.data();
+
+  // Never return internal account-linking secrets or credentials.
+  const {
+    linkCodeHash,
+    telegramId,
+    ...safeData
+  } = data;
 
   return {
     id: doc.id,
@@ -65,19 +72,11 @@ function getTimestampMilliseconds(value) {
 
   if (typeof value === "string" || typeof value === "number") {
     const result = new Date(value).getTime();
+
     return Number.isFinite(result) ? result : NaN;
   }
 
   return NaN;
-}
-
-function isValidLinkCode(code) {
-  return (
-    typeof code === "string" &&
-    code.length >= 32 &&
-    code.length <= MAX_LINK_CODE_LENGTH &&
-    /^[a-f0-9]+$/i.test(code)
-  );
 }
 
 function hasRecentHeartbeat(host, nowMs = Date.now()) {
@@ -92,12 +91,48 @@ function hasRecentHeartbeat(host, nowMs = Date.now()) {
   return ageMs >= 0 && ageMs <= HOST_TIMEOUT_MS;
 }
 
+function validateHostProfile({
+  firebaseUid,
+  displayName,
+  username,
+}) {
+  const uid = normalizeId(firebaseUid, "Firebase UID");
+
+  if (typeof displayName !== "string" || !displayName.trim()) {
+    throw new Error("Host display name is required.");
+  }
+
+  if (displayName.trim().length > 100) {
+    throw new Error("Host display name cannot exceed 100 characters.");
+  }
+
+  if (
+    typeof username !== "string" ||
+    !/^[a-zA-Z0-9_]{3,32}$/.test(username.trim())
+  ) {
+    throw new Error(
+      "Username must contain 3–32 letters, numbers, or underscores."
+    );
+  }
+
+  return {
+    firebaseUid: uid,
+    displayName: displayName.trim(),
+    username: username.trim(),
+  };
+}
+
 /*
 |--------------------------------------------------------------------------
 | SHARED HOST AVAILABILITY
 |--------------------------------------------------------------------------
-| A host must be active, linked, accepting calls, within scheduled
-| hours, recently seen, and not already assigned to a call.
+| A host must:
+| - Have an approved, active host record.
+| - Be linked to a Firebase website account.
+| - Be accepting calls.
+| - Not already have an active call.
+| - Have a recent heartbeat.
+| - Be within their configured availability schedule.
 |--------------------------------------------------------------------------
 */
 
@@ -114,6 +149,10 @@ export function isHostAvailable(host, date = new Date()) {
     return false;
   }
 
+  if (!(date instanceof Date) || !Number.isFinite(date.getTime())) {
+    return false;
+  }
+
   if (!hasRecentHeartbeat(host, date.getTime())) {
     return false;
   }
@@ -123,114 +162,157 @@ export function isHostAvailable(host, date = new Date()) {
 
 /*
 |--------------------------------------------------------------------------
-| CREATE HOST
+| CREATE WEBSITE HOST RECORD
+|--------------------------------------------------------------------------
+| Call this from the approved host-application workflow.
+| A host is linked directly to their Firebase website account.
+| Do not create host accounts from Telegram IDs.
 |--------------------------------------------------------------------------
 */
 
+
 export async function createHost({
-  telegramId,
-  username = null,
+  firebaseUid,
+  username,
   displayName = "SA LIVE Host",
+  status = "active",
 }) {
-  const normalizedTelegramId = normalizeId(
-    telegramId,
-    "Telegram ID"
-  );
+  const profile = validateHostProfile({
+    firebaseUid,
+    username,
+    displayName,
+  });
 
-  const normalizedUsername =
-    typeof username === "string" && username.trim()
-      ? username.trim().slice(0, 64)
-      : null;
+  if (!["pending", "active"].includes(status)) {
+    throw new Error("Invalid initial host status.");
+  }
 
-  const normalizedDisplayName =
-    typeof displayName === "string" && displayName.trim()
-      ? displayName.trim().slice(0, 100)
-      : "SA LIVE Host";
-
-  const hostRef = hostsCollection.doc(`tg_${normalizedTelegramId}`);
-
-  const linkCode = randomBytes(32).toString("hex");
+  const usernameLower = profile.username.toLowerCase();
+  const hostRef = hostsCollection.doc(profile.firebaseUid);
   const now = new Date();
 
-  const hostData = {
-    telegramId: normalizedTelegramId,
-    username: normalizedUsername,
-    displayName: normalizedDisplayName,
-    role: "host",
-    status: "pending",
-    firebaseUid: null,
-    linkCodeHash: hashLinkCode(linkCode),
-    lastSeenAt: null,
-    activeCallId: null,
-    createdAt: now,
-    updatedAt: now,
-  };
+  return db.runTransaction(async (transaction) => {
+    const existingHostQuery = hostsCollection
+      .where("firebaseUid", "==", profile.firebaseUid)
+      .limit(2);
 
-  const result = await db.runTransaction(async (transaction) => {
-    const existing = await transaction.get(hostRef);
+    const usernameQuery = hostsCollection
+      .where("usernameLower", "==", usernameLower)
+      .limit(2);
 
-    if (existing.exists) {
+    const publicUsernameQuery = hostsCollection
+      .where("publicUsernameLower", "==", usernameLower)
+      .limit(2);
+
+    // Complete all transaction reads before performing any writes.
+    const [
+      existingHostSnapshot,
+      usernameSnapshot,
+      publicUsernameSnapshot,
+      hostSnapshot,
+    ] = await Promise.all([
+      transaction.get(existingHostQuery),
+      transaction.get(usernameQuery),
+      transaction.get(publicUsernameQuery),
+      transaction.get(hostRef),
+    ]);
+
+    const duplicateAccount = existingHostSnapshot.docs.some(
+      (doc) => doc.id !== hostRef.id
+    );
+
+    if (duplicateAccount) {
+      throw new Error(
+        "This Firebase account is already linked to another host record."
+      );
+    }
+
+    const usernameConflict = [
+      ...usernameSnapshot.docs,
+      ...publicUsernameSnapshot.docs,
+    ].some((doc) => doc.id !== hostRef.id);
+
+    if (usernameConflict) {
+      throw new Error("That host username is already in use.");
+    }
+
+    if (hostSnapshot.exists) {
+      const existing = hostSnapshot.data();
+
+      if (existing.firebaseUid !== profile.firebaseUid) {
+        throw new Error(
+          "Host record ID conflicts with another account."
+        );
+      }
+
+      const existingUsername = String(
+        existing.usernameLower || existing.username || ""
+      ).toLowerCase();
+
+      const existingPublicUsername = String(
+        existing.publicUsernameLower ||
+          existing.publicUsername ||
+          existing.usernameLower ||
+          existing.username ||
+          ""
+      ).toLowerCase();
+
+      if (
+        existingUsername !== usernameLower ||
+        existingPublicUsername !== usernameLower
+      ) {
+        throw new Error(
+          "The existing host username does not match the application. Administrator review is required."
+        );
+      }
+
+      // Approval must never silently reuse an already-active host
+      // record while its application is still being approved.
+      if (status === "pending" && existing.status !== "pending") {
+        throw new Error(
+          "An existing host record is not pending. Administrator review is required."
+        );
+      }
+
+      if (!["pending", "active"].includes(existing.status)) {
+        throw new Error(
+          "The existing host account is restricted and requires administrator review."
+        );
+      }
+
       return {
-        created: false,
-        host: toHost(existing),
+        ...toHost(hostSnapshot),
+        alreadyExists: true,
       };
     }
+
+    const hostData = {
+      firebaseUid: profile.firebaseUid,
+      username: profile.username,
+      usernameLower,
+      publicUsername: profile.username,
+      publicUsernameLower: usernameLower,
+      displayName: profile.displayName,
+      role: "host",
+      status,
+      acceptingCalls: false,
+      availability: [],
+      lastSeenAt: null,
+      activeCallId: null,
+      availableHostEarningsCents: 0,
+      lifetimeHostEarningsCents: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
 
     transaction.create(hostRef, hostData);
 
     return {
-      created: true,
-      host: {
-        id: hostRef.id,
-        ...hostData,
-      },
+      id: hostRef.id,
+      ...hostData,
+      alreadyExists: false,
     };
   });
-
-  if (!result.created) {
-    return {
-      ...result.host,
-      alreadyExists: true,
-    };
-  }
-
-  const { linkCodeHash, ...safeHost } = result.host;
-
-  return {
-    ...safeHost,
-    linkCode,
-    alreadyExists: false,
-  };
-}
-
-/*
-|--------------------------------------------------------------------------
-| GET HOST BY TELEGRAM ID
-|--------------------------------------------------------------------------
-*/
-
-export async function getHostByTelegramId(telegramId) {
-  const normalizedTelegramId = normalizeId(
-    telegramId,
-    "Telegram ID"
-  );
-
-  const snapshot = await hostsCollection
-    .where("telegramId", "==", normalizedTelegramId)
-    .limit(2)
-    .get();
-
-  if (snapshot.empty) {
-    return null;
-  }
-
-  if (snapshot.size > 1) {
-    throw new Error(
-      "Multiple host records use the same Telegram ID."
-    );
-  }
-
-  return toHost(snapshot.docs[0]);
 }
 
 /*
@@ -275,113 +357,12 @@ export async function getHostById(hostId) {
 
 /*
 |--------------------------------------------------------------------------
-| LINK APPROVED HOST TO FIREBASE ACCOUNT
-|--------------------------------------------------------------------------
-*/
-
-export async function linkHostAccount(firebaseUid, linkCode) {
-  const uid = normalizeId(firebaseUid, "Firebase UID");
-
-  if (!isValidLinkCode(linkCode)) {
-    throw new Error("Invalid or expired host link code.");
-  }
-
-  const codeHash = hashLinkCode(linkCode);
-
-  const matchingHosts = await hostsCollection
-    .where("linkCodeHash", "==", codeHash)
-    .limit(2)
-    .get();
-
-  if (matchingHosts.empty) {
-    throw new Error("Invalid or expired host link code.");
-  }
-
-  if (matchingHosts.size > 1) {
-    throw new Error("Host link code is not unique.");
-  }
-
-  const hostRef = matchingHosts.docs[0].ref;
-  const accountLinkRef = accountLinksCollection.doc(uid);
-
-  const existingHostSnapshot = await hostsCollection
-    .where("firebaseUid", "==", uid)
-    .limit(1)
-    .get();
-
-  if (
-    !existingHostSnapshot.empty &&
-    existingHostSnapshot.docs[0].id !== hostRef.id
-  ) {
-    throw new Error(
-      "This Firebase account is already linked to another host."
-    );
-  }
-
-  return db.runTransaction(async (transaction) => {
-    const [hostSnapshot, accountLinkSnapshot] = await Promise.all([
-      transaction.get(hostRef),
-      transaction.get(accountLinkRef),
-    ]);
-
-    if (!hostSnapshot.exists) {
-      throw new Error("Host account not found.");
-    }
-
-    const host = hostSnapshot.data();
-
-    if (host.linkCodeHash !== codeHash) {
-      throw new Error("Invalid or expired host link code.");
-    }
-
-    if (host.status !== "active") {
-      throw new Error(
-        "Your host application must be approved before linking."
-      );
-    }
-
-    if (host.firebaseUid) {
-      throw new Error(
-        "This host is already linked to a website account."
-      );
-    }
-
-    if (accountLinkSnapshot.exists) {
-      throw new Error(
-        "This Firebase account is already linked to a host."
-      );
-    }
-
-    const now = new Date();
-
-    transaction.create(accountLinkRef, {
-      firebaseUid: uid,
-      hostId: hostRef.id,
-      createdAt: now,
-    });
-
-    transaction.update(hostRef, {
-      firebaseUid: uid,
-      linkCodeHash: null,
-      linkedAt: now,
-      updatedAt: now,
-    });
-
-    return {
-      id: hostRef.id,
-      firebaseUid: uid,
-      displayName: host.displayName || "SA LIVE Host",
-      status: "active",
-    };
-  });
-}
-
-/*
-|--------------------------------------------------------------------------
 | HOST HEARTBEAT
 |--------------------------------------------------------------------------
+| Only the Firebase account attached to the host record can update
+| its heartbeat. Heartbeats do not change host approval status.
+|--------------------------------------------------------------------------
 */
-
 
 export async function hostHeartbeat(hostId, firebaseUid) {
   const id = normalizeId(hostId, "Host ID");
@@ -402,7 +383,9 @@ export async function hostHeartbeat(hostId, firebaseUid) {
     }
 
     if (host.firebaseUid !== uid) {
-      throw new Error("Host account does not match the authenticated user.");
+      throw new Error(
+        "Host account does not match the authenticated user."
+      );
     }
 
     const now = new Date();
@@ -419,10 +402,12 @@ export async function hostHeartbeat(hostId, firebaseUid) {
   });
 }
 
-
 /*
 |--------------------------------------------------------------------------
 | GET AVAILABLE HOSTS
+|--------------------------------------------------------------------------
+| Returns internal records for backend matching only.
+| Do not send these complete objects directly to website visitors.
 |--------------------------------------------------------------------------
 */
 
@@ -451,6 +436,7 @@ export async function findAvailableHost() {
     return null;
   }
 
+  // Stable selection for now. Fair rotation can be added later.
   availableHosts.sort((a, b) => a.id.localeCompare(b.id));
 
   return availableHosts[0];
@@ -460,8 +446,8 @@ export async function findAvailableHost() {
 |--------------------------------------------------------------------------
 | RESERVE HOST FOR A CALL
 |--------------------------------------------------------------------------
-| Availability is checked again inside the transaction so stale search
-| results cannot reserve a host who is no longer available.
+| Re-check availability transactionally to avoid assigning a host
+| using stale search results.
 |--------------------------------------------------------------------------
 */
 
@@ -510,14 +496,16 @@ export async function reserveHost(hostId, callId) {
 |--------------------------------------------------------------------------
 | RELEASE HOST
 |--------------------------------------------------------------------------
+| When a call ID is provided, it must match the host's current call.
+| This prevents an old call from releasing a host reserved for a new one.
+|--------------------------------------------------------------------------
 */
 
 export async function releaseHost(hostId, callId = null) {
   const id = normalizeId(hostId, "Host ID");
 
-  if (callId !== null) {
-    callId = normalizeId(callId, "Call ID");
-  }
+  const normalizedCallId =
+    callId === null ? null : normalizeId(callId, "Call ID");
 
   const hostRef = hostsCollection.doc(id);
 
@@ -530,9 +518,15 @@ export async function releaseHost(hostId, callId = null) {
 
     const host = snapshot.data();
 
-    if (callId !== null && host.activeCallId !== callId) {
+    if (normalizedCallId !== null) {
+      if (host.activeCallId !== normalizedCallId) {
+        throw new Error(
+          "Call ID does not match the host's active call."
+        );
+      }
+    } else if (host.activeCallId) {
       throw new Error(
-        "Call ID does not match the host's active call."
+        "A call ID is required before releasing an assigned host."
       );
     }
 

@@ -6,6 +6,16 @@ import {
 
 const callsCollection = db.collection("callSessions");
 
+const CALL_ID_PATTERN = /^[A-Za-z0-9_-]{1,150}$/;
+const ACTIVE_REQUEST_STATUSES = new Set(["matching", "matched"]);
+
+function sendError(res, status, message) {
+  return res.status(status).json({
+    success: false,
+    message,
+  });
+}
+
 function toDate(value) {
   if (!value) return null;
 
@@ -22,8 +32,26 @@ function sortNewestFirst(calls) {
   return calls.sort((a, b) => {
     const aTime = toDate(a.createdAt)?.getTime() || 0;
     const bTime = toDate(b.createdAt)?.getTime() || 0;
+
     return bTime - aTime;
   });
+}
+
+// Only return fields the host needs to display a call.
+// Never expose internal billing, payment, or security data here.
+function toHostCallResponse(docId, call) {
+  return {
+    id: docId,
+    hostId: call.hostId ?? null,
+    userId: call.userId ?? null,
+    status: call.status ?? null,
+    createdAt: call.createdAt ?? null,
+    updatedAt: call.updatedAt ?? null,
+    startedAt: call.startedAt ?? null,
+    endedAt: call.endedAt ?? null,
+    durationSeconds: Number(call.durationSeconds ?? 0),
+    endReason: call.endReason ?? null,
+  };
 }
 
 /*
@@ -37,26 +65,28 @@ export async function getMyCallRequests(req, res, next) {
     const hostId = req.hostAccount?.id;
 
     if (!hostId) {
-      return res.status(401).json({
-        success: false,
-        message: "Authenticated host account required.",
-      });
+      return sendError(
+        res,
+        401,
+        "Authenticated host account required."
+      );
     }
 
-    // Query by host ID, then filter statuses in the server.
     const snapshot = await callsCollection
       .where("hostId", "==", hostId)
       .get();
 
     const requests = sortNewestFirst(
       snapshot.docs
-        .map((doc) => ({
-          id: doc.id,
-          ...doc.data(),
-        }))
-        .filter((call) =>
-          ["matching", "matched"].includes(call.status)
-        )
+        .filter((doc) => {
+          const call = doc.data();
+
+          return (
+            ACTIVE_REQUEST_STATUSES.has(call.status) &&
+            !call.endedAt
+          );
+        })
+        .map((doc) => toHostCallResponse(doc.id, doc.data()))
     );
 
     res.setHeader("Cache-Control", "no-store");
@@ -81,13 +111,23 @@ export async function getMyCallHistory(req, res, next) {
     const hostId = req.hostAccount?.id;
 
     if (!hostId) {
-      return res.status(401).json({
-        success: false,
-        message: "Authenticated host account required.",
-      });
+      return sendError(
+        res,
+        401,
+        "Authenticated host account required."
+      );
     }
 
-    const calls = await getHostCallHistory(hostId);
+    const history = await getHostCallHistory(hostId);
+
+    // Re-filter by the authenticated host and return only safe fields.
+    const calls = sortNewestFirst(
+      (Array.isArray(history) ? history : [])
+        .filter((call) => call.hostId === hostId)
+        .map((call) =>
+          toHostCallResponse(call.id, call)
+        )
+    );
 
     res.setHeader("Cache-Control", "no-store");
 
@@ -104,8 +144,9 @@ export async function getMyCallHistory(req, res, next) {
 |--------------------------------------------------------------------------
 | ACCEPT AN ASSIGNED CALL REQUEST
 |--------------------------------------------------------------------------
-| Only the host assigned to the call can accept it.
-| The call must still be in "matching" status.
+| Only the assigned host may accept a matching call.
+| LiveKit room creation and token generation will be handled
+| separately in the call-service integration.
 |--------------------------------------------------------------------------
 */
 
@@ -115,20 +156,18 @@ export async function acceptCallRequest(req, res, next) {
     const callId = req.params.callId;
 
     if (!hostId) {
-      return res.status(401).json({
-        success: false,
-        message: "Authenticated host account required.",
-      });
+      return sendError(
+        res,
+        401,
+        "Authenticated host account required."
+      );
     }
 
     if (
       typeof callId !== "string" ||
-      !/^[A-Za-z0-9_-]{1,150}$/.test(callId)
+      !CALL_ID_PATTERN.test(callId)
     ) {
-      return res.status(400).json({
-        success: false,
-        message: "A valid call ID is required.",
-      });
+      return sendError(res, 400, "A valid call ID is required.");
     }
 
     const callRef = callsCollection.doc(callId);
@@ -190,14 +229,18 @@ export async function acceptCallRequest(req, res, next) {
     return res.status(200).json({
       success: true,
       message: "Call request accepted.",
-      call: acceptedCall,
+      call: toHostCallResponse(
+        acceptedCall.id,
+        acceptedCall
+      ),
     });
   } catch (error) {
     if ([403, 404, 409].includes(error.status)) {
-      return res.status(error.status).json({
-        success: false,
-        message: error.message,
-      });
+      return sendError(
+        res,
+        error.status,
+        error.message
+      );
     }
 
     return next(error);

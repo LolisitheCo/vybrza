@@ -14,17 +14,44 @@ import {
 
 const router = express.Router();
 
-// All call routes require an authenticated, active host.
+/*
+|--------------------------------------------------------------------------
+| HOST AUTHENTICATION
+|--------------------------------------------------------------------------
+| Every route in this router requires:
+| 1. A valid Firebase ID token.
+| 2. An active host record linked to that Firebase account.
+|--------------------------------------------------------------------------
+*/
+
 router.use(verifyFirebaseToken);
 router.use(requireHost);
 
-// GET /api/calls/requests
+/*
+|--------------------------------------------------------------------------
+| HOST CALL REQUESTS
+|--------------------------------------------------------------------------
+| GET /api/calls/requests
+*/
+
 router.get("/requests", getMyCallRequests);
 
-// GET /api/calls/history
+/*
+|--------------------------------------------------------------------------
+| HOST CALL HISTORY
+|--------------------------------------------------------------------------
+| GET /api/calls/history
+*/
+
 router.get("/history", getMyCallHistory);
 
-// POST /api/calls/:callId/accept
+/*
+|--------------------------------------------------------------------------
+| ACCEPT ASSIGNED CALL
+|--------------------------------------------------------------------------
+| POST /api/calls/:callId/accept
+*/
+
 router.post("/:callId/accept", acceptCallRequest);
 
 export default router;

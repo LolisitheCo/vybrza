@@ -3,15 +3,9 @@ import { db } from "../config/firebase.js";
 
 // ============================================================
 // SA LIVE BILLING SERVICE
-// ============================================================
 // Customer: R6 per billable minute
 // Host:     R2 per billable minute
 // SA LIVE:  R4 per billable minute
-//
-// IMPORTANT:
-// Call this service only from trusted backend code after
-// endCall() has completed. Never expose it as an unrestricted
-// public endpoint.
 // ============================================================
 
 const usersCollection = db.collection("users");
@@ -25,18 +19,21 @@ export const SA_LIVE_PRICING = Object.freeze({
   saLiveRevenuePerMinute: 4,
 });
 
-const MAX_MINUTES = Number.MAX_SAFE_INTEGER;
+const FINAL_BILLING_STATUS = "finalized";
+const PENDING_BILLING_STATUS = "pending";
 
-// ============================================================
-// HELPERS
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| HELPERS
+|--------------------------------------------------------------------------
+*/
 
 function requireId(value, fieldName) {
   if (
     typeof value !== "string" ||
     !value.trim() ||
     value.trim().length > 200 ||
-    value.includes("/") ||
+    value.trim().includes("/") ||
     value.includes("\0")
   ) {
     throw new Error(`${fieldName} is invalid.`);
@@ -48,10 +45,7 @@ function requireId(value, fieldName) {
 function readMinutes(value, fieldName) {
   const minutes = value ?? 0;
 
-  if (
-    !Number.isSafeInteger(minutes) ||
-    minutes < 0
-  ) {
+  if (!Number.isSafeInteger(minutes) || minutes < 0) {
     throw new Error(`${fieldName} balance is invalid.`);
   }
 
@@ -61,45 +55,68 @@ function readMinutes(value, fieldName) {
 function readCents(value, fieldName) {
   const cents = value ?? 0;
 
-  if (
-    !Number.isSafeInteger(cents) ||
-    cents < 0
-  ) {
+  if (!Number.isSafeInteger(cents) || cents < 0) {
     throw new Error(`${fieldName} balance is invalid.`);
   }
 
   return cents;
 }
 
-function moneyToCents(rand) {
-  const cents = rand * 100;
+function moneyToCents(amount) {
+  const cents = amount * 100;
 
-  if (!Number.isSafeInteger(cents)) {
+  if (!Number.isSafeInteger(cents) || cents < 0) {
     throw new Error("Calculated billing amount is invalid.");
   }
 
   return cents;
 }
 
-// ============================================================
-// FINALIZE CALL BILLING
-// ============================================================
-// callId must identify an existing completed call.
-//
-// The customer's balance is charged no more than their available
-// minutes. Host earnings and SA LIVE revenue use the minutes
-// actually charged.
-//
-// Repeated calls do not charge the customer again.
-// ============================================================
+function centsToMoney(cents) {
+  return cents / 100;
+}
+
+function makeBillingResult(callId, call, alreadyFinalized) {
+  return {
+    success: true,
+    alreadyFinalized,
+    callId,
+    billingStatus: call.billingStatus,
+    billableMinutes: call.billableMinutes ?? 0,
+    customerCharged: centsToMoney(
+      call.customerChargeCents ?? 0
+    ),
+    hostEarnings: centsToMoney(
+      call.hostEarningsCents ?? 0
+    ),
+    saLiveRevenue: centsToMoney(
+      call.saLiveRevenueCents ?? 0
+    ),
+  };
+}
+
+/*
+|--------------------------------------------------------------------------
+| FINALIZE CALL BILLING
+|--------------------------------------------------------------------------
+| Only completed calls can be billed.
+|
+| The transaction atomically:
+| - deducts available customer minutes;
+| - credits host earnings;
+| - creates one earnings record;
+| - marks call billing as finalized.
+|
+| Repeated calls are safe: a finalized call is never charged again.
+|--------------------------------------------------------------------------
+*/
 
 export async function finalizeCallBilling(callId) {
-  callId = requireId(callId, "Call ID");
-
-  const callRef = callsCollection.doc(callId);
+  const normalizedCallId = requireId(callId, "Call ID");
+  const callRef = callsCollection.doc(normalizedCallId);
 
   return db.runTransaction(async (transaction) => {
-    // 1. Read call.
+    // Read the call first.
     const callSnapshot = await transaction.get(callRef);
 
     if (!callSnapshot.exists) {
@@ -108,39 +125,26 @@ export async function finalizeCallBilling(callId) {
 
     const call = callSnapshot.data();
 
-    // Idempotency: never charge a finalized call twice.
-    if (call.billingStatus === "finalized") {
-      return {
-        success: true,
-        alreadyFinalized: true,
-        callId,
-        billableMinutes: call.billableMinutes ?? 0,
-        customerCharged:
-          (call.customerChargeCents ?? 0) / 100,
-        hostEarnings:
-          (call.hostEarningsCents ?? 0) / 100,
-        saLiveRevenue:
-          (call.saLiveRevenueCents ?? 0) / 100,
-      };
+    // Idempotency: never deduct or credit a finalized call twice.
+    if (call.billingStatus === FINAL_BILLING_STATUS) {
+      return makeBillingResult(
+        normalizedCallId,
+        call,
+        true
+      );
     }
 
     if (call.status !== "completed") {
-      throw new Error(
-        "Only completed calls can be billed."
-      );
+      throw new Error("Only completed calls can be billed.");
     }
 
-    if (call.billingStatus !== "pending") {
-      throw new Error(
-        "Call billing is not in a billable state."
-      );
+    if (call.billingStatus !== PENDING_BILLING_STATUS) {
+      throw new Error("Call billing is not in a billable state.");
     }
 
     const userId = requireId(call.userId, "User ID");
     const hostId = requireId(call.hostId, "Host ID");
 
-    // Prefer the duration saved by endCall().
-    // Round up partial minutes for billing.
     const durationSeconds = call.durationSeconds ?? 0;
 
     if (
@@ -150,22 +154,17 @@ export async function finalizeCallBilling(callId) {
       throw new Error("Call duration is invalid.");
     }
 
-    const calculatedMinutes = Math.ceil(
-      durationSeconds / 60
-    );
+    const calculatedMinutes = Math.ceil(durationSeconds / 60);
 
-    if (
-      calculatedMinutes > MAX_MINUTES ||
-      !Number.isSafeInteger(calculatedMinutes)
-    ) {
+    if (!Number.isSafeInteger(calculatedMinutes)) {
       throw new Error("Call duration is too large.");
     }
 
     const userRef = usersCollection.doc(userId);
     const hostRef = hostsCollection.doc(hostId);
-    const earningRef = earningsCollection.doc(callId);
+    const earningRef = earningsCollection.doc(normalizedCallId);
 
-    // 2. Read all remaining documents before writing.
+    // All reads must complete before any transaction writes.
     const [
       userSnapshot,
       hostSnapshot,
@@ -184,20 +183,22 @@ export async function finalizeCallBilling(callId) {
       throw new Error("Host account was not found.");
     }
 
-    // A pre-existing earnings record with pending billing
-    // indicates inconsistent data. Do not silently credit again.
+    // An existing earning record alongside pending billing is
+    // inconsistent data. Fail safely rather than crediting twice.
     if (earningSnapshot.exists) {
       throw new Error(
-        "Host earnings already exist for an unfinalized call. Review this call before retrying."
+        "An earnings record already exists for this unfinalized call. Administrator review is required."
       );
     }
 
+    const user = userSnapshot.data();
+    const host = hostSnapshot.data();
+
     const availableMinutes = readMinutes(
-      userSnapshot.get("minutes"),
+      user.minutes,
       "Customer"
     );
 
-    // Never allow the customer's minute balance to go negative.
     const billableMinutes = Math.min(
       calculatedMinutes,
       availableMinutes
@@ -217,8 +218,6 @@ export async function finalizeCallBilling(callId) {
       billableMinutes *
         SA_LIVE_PRICING.saLiveRevenuePerMinute
     );
-
-    const host = hostSnapshot.data();
 
     const currentAvailableCents = readCents(
       host.availableHostEarningsCents,
@@ -245,7 +244,20 @@ export async function finalizeCallBilling(callId) {
 
     const now = new Date();
 
-    // 3. Atomically update customer, host, call and earnings.
+    const billingFields = {
+      billingStatus: FINAL_BILLING_STATUS,
+      billableMinutes,
+      customerChargeCents,
+      hostEarningsCents,
+      saLiveRevenueCents,
+      customerCharge: centsToMoney(customerChargeCents),
+      hostEarnings: centsToMoney(hostEarningsCents),
+      saLiveRevenue: centsToMoney(saLiveRevenueCents),
+      billedAt: now,
+      updatedAt: now,
+    };
+
+    // All monetary changes and finalization occur atomically.
     transaction.update(userRef, {
       minutes: availableMinutes - billableMinutes,
       updatedAt: now,
@@ -257,28 +269,18 @@ export async function finalizeCallBilling(callId) {
       updatedAt: now,
     });
 
-    transaction.update(callRef, {
-      billingStatus: "finalized",
-      billableMinutes,
-      customerChargeCents,
-      hostEarningsCents,
-      saLiveRevenueCents,
-      hostEarnings: hostEarningsCents / 100,
-      billedAt: now,
-      updatedAt: now,
-    });
+    transaction.update(callRef, billingFields);
 
-    // Only create an earnings record when the host has
-    // billable minutes to earn from.
+    // Keep a deterministic earnings document ID for idempotency.
+    // Zero-minute calls have no payable earnings record.
     if (billableMinutes > 0) {
       transaction.create(earningRef, {
-        callId,
+        callId: normalizedCallId,
         userId,
         hostId,
         completedMinutes: billableMinutes,
-        ratePerMinute:
-          SA_LIVE_PRICING.hostEarningsPerMinute,
-        amount: hostEarningsCents / 100,
+        ratePerMinute: SA_LIVE_PRICING.hostEarningsPerMinute,
+        amount: centsToMoney(hostEarningsCents),
         amountCents: hostEarningsCents,
         currency: "ZAR",
         status: "available",
@@ -289,26 +291,31 @@ export async function finalizeCallBilling(callId) {
     return {
       success: true,
       alreadyFinalized: false,
-      callId,
+      callId: normalizedCallId,
+      billingStatus: FINAL_BILLING_STATUS,
       billableMinutes,
-      customerCharged: customerChargeCents / 100,
-      hostEarnings: hostEarningsCents / 100,
-      saLiveRevenue: saLiveRevenueCents / 100,
+      customerCharged: centsToMoney(customerChargeCents),
+      hostEarnings: centsToMoney(hostEarningsCents),
+      saLiveRevenue: centsToMoney(saLiveRevenueCents),
       remainingCustomerMinutes:
         availableMinutes - billableMinutes,
+      insufficientMinutes:
+        calculatedMinutes > availableMinutes,
     };
   });
 }
 
-// ============================================================
-// GET CALL BILLING SUMMARY
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| GET CALL BILLING SUMMARY
+|--------------------------------------------------------------------------
+*/
 
 export async function getCallBillingSummary(callId) {
-  callId = requireId(callId, "Call ID");
+  const normalizedCallId = requireId(callId, "Call ID");
 
   const snapshot = await callsCollection
-    .doc(callId)
+    .doc(normalizedCallId)
     .get();
 
   if (!snapshot.exists) {
@@ -318,16 +325,19 @@ export async function getCallBillingSummary(callId) {
   const call = snapshot.data();
 
   return {
-    callId,
+    callId: normalizedCallId,
     status: call.status,
     billingStatus: call.billingStatus,
     billableMinutes: call.billableMinutes ?? 0,
-    customerCharged:
-      (call.customerChargeCents ?? 0) / 100,
-    hostEarnings:
-      (call.hostEarningsCents ?? 0) / 100,
-    saLiveRevenue:
-      (call.saLiveRevenueCents ?? 0) / 100,
+    customerCharged: centsToMoney(
+      call.customerChargeCents ?? 0
+    ),
+    hostEarnings: centsToMoney(
+      call.hostEarningsCents ?? 0
+    ),
+    saLiveRevenue: centsToMoney(
+      call.saLiveRevenueCents ?? 0
+    ),
     currency: "ZAR",
   };
 }

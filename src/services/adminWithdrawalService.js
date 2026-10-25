@@ -4,30 +4,74 @@ import { db } from "../config/firebase.js";
 const withdrawalsCollection = db.collection("hostWithdrawals");
 const hostsCollection = db.collection("hosts");
 
-/*
-|--------------------------------------------------------------------------
-| HELPERS
-|--------------------------------------------------------------------------
-*/
+function createError(message, status = 400) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
 
-function toNumber(value) {
-  const number = Number(value ?? 0);
-  return Number.isFinite(number) ? number : 0;
+function requireDocumentId(value, fieldName) {
+  if (
+    typeof value !== "string" ||
+    !value.trim() ||
+    value.trim().length > 200 ||
+    value.includes("/") ||
+    value.includes("\0")
+  ) {
+    throw createError(`${fieldName} is invalid.`, 400);
+  }
+
+  return value.trim();
+}
+
+function requireAdminUid(adminUid) {
+  if (
+    typeof adminUid !== "string" ||
+    !adminUid.trim() ||
+    adminUid.trim().length > 128
+  ) {
+    throw createError("An authenticated admin is required.", 401);
+  }
+
+  return adminUid.trim();
+}
+
+function readCents(value, fieldName) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw createError(`${fieldName} is invalid.`, 409);
+  }
+
+  return value;
+}
+
+function readWithdrawalAmount(value) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw createError("The withdrawal amount is invalid.", 409);
+  }
+
+  return value;
 }
 
 function toDate(value) {
   if (!value) return null;
 
-  if (typeof value.toDate === "function") {
-    return value.toDate().toISOString();
-  }
+  const date =
+    typeof value.toDate === "function"
+      ? value.toDate()
+      : new Date(value);
 
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  return Number.isNaN(date.getTime())
+    ? null
+    : date.toISOString();
 }
 
 function serializeWithdrawal(document) {
   const data = document.data();
+
+  const amountCents =
+    Number.isSafeInteger(data.amountCents) && data.amountCents >= 0
+      ? data.amountCents
+      : 0;
 
   return {
     id: document.id,
@@ -35,11 +79,10 @@ function serializeWithdrawal(document) {
     hostFirebaseUid: data.hostFirebaseUid ?? null,
     hostUsername: data.hostUsername ?? null,
 
-    amountCents: Math.max(0, Math.floor(toNumber(data.amountCents))),
-    amount: Number((toNumber(data.amountCents) / 100).toFixed(2)),
+    amountCents,
+    amount: Number((amountCents / 100).toFixed(2)),
     currency: data.currency ?? "ZAR",
 
-    // This information is only returned by the admin service.
     bankDetails: data.bankDetails ?? null,
     bankDetailsConfirmed: data.bankDetailsConfirmed === true,
 
@@ -58,17 +101,11 @@ function serializeWithdrawal(document) {
   };
 }
 
-/*
-|--------------------------------------------------------------------------
-| LIST WITHDRAWALS
-|--------------------------------------------------------------------------
-*/
-
 export async function getAdminWithdrawals(status = "pending") {
   const allowedStatuses = ["pending", "paid", "rejected", "all"];
 
   if (!allowedStatuses.includes(status)) {
-    throw new Error("Invalid withdrawal status.");
+    throw createError("Invalid withdrawal status.", 400);
   }
 
   let query = withdrawalsCollection;
@@ -78,75 +115,70 @@ export async function getAdminWithdrawals(status = "pending") {
   }
 
   const snapshot = await query.get();
-
   const withdrawals = snapshot.docs.map(serializeWithdrawal);
 
-  withdrawals.sort((a, b) => {
-    return (
+  withdrawals.sort(
+    (a, b) =>
       new Date(b.requestedAt ?? 0).getTime() -
       new Date(a.requestedAt ?? 0).getTime()
-    );
-  });
+  );
 
   return withdrawals;
 }
 
 /*
-|--------------------------------------------------------------------------
-| MARK WITHDRAWAL AS PAID
-|--------------------------------------------------------------------------
-|
-| This records a payout that the admin has already completed externally.
-| It does not transfer money automatically.
-|
-*/
-
+ * Records an external payout that has already been completed.
+ * This function does not transfer money.
+ */
 export async function markWithdrawalPaid(
   withdrawalId,
   adminUid,
   payoutReference = ""
 ) {
-  if (!withdrawalId) {
-    throw new Error("A withdrawal ID is required.");
-  }
+  withdrawalId = requireDocumentId(withdrawalId, "Withdrawal ID");
+  adminUid = requireAdminUid(adminUid);
 
-  if (!adminUid) {
-    throw new Error("An authenticated admin is required.");
+  if (
+    payoutReference !== undefined &&
+    payoutReference !== null &&
+    typeof payoutReference !== "string"
+  ) {
+    throw createError("The payout reference is invalid.", 400);
   }
 
   const reference = String(payoutReference ?? "").trim();
 
   if (reference.length > 150) {
-    throw new Error("The payout reference is too long.");
+    throw createError("The payout reference is too long.", 400);
   }
 
   const withdrawalRef = withdrawalsCollection.doc(withdrawalId);
 
   return db.runTransaction(async (transaction) => {
-    const withdrawalSnapshot = await transaction.get(withdrawalRef);
+    const snapshot = await transaction.get(withdrawalRef);
 
-    if (!withdrawalSnapshot.exists) {
-      throw new Error("Withdrawal request not found.");
+    if (!snapshot.exists) {
+      throw createError("Withdrawal request not found.", 404);
     }
 
-    const withdrawal = withdrawalSnapshot.data();
+    const withdrawal = snapshot.data();
 
     if (withdrawal.status !== "pending") {
-      throw new Error("Only pending withdrawals can be marked as paid.");
+      throw createError(
+        "Only pending withdrawals can be marked as paid.",
+        409
+      );
     }
 
-    const amountCents = Math.floor(toNumber(withdrawal.amountCents));
-
-    if (amountCents <= 0) {
-      throw new Error("The withdrawal amount is invalid.");
-    }
+    const amountCents = readWithdrawalAmount(withdrawal.amountCents);
+    const now = new Date();
 
     transaction.update(withdrawalRef, {
       status: "paid",
       payoutNote: "Payout recorded by an admin.",
       payoutReference: reference || null,
-      paidAt: new Date(),
-      updatedAt: new Date(),
+      paidAt: now,
+      updatedAt: now,
       reviewedBy: adminUid,
     });
 
@@ -160,85 +192,99 @@ export async function markWithdrawalPaid(
   });
 }
 
-/*
-|--------------------------------------------------------------------------
-| REJECT WITHDRAWAL AND REFUND RESERVED BALANCE
-|--------------------------------------------------------------------------
-*/
-
 export async function rejectWithdrawal(
   withdrawalId,
   adminUid,
   reason
 ) {
-  if (!withdrawalId) {
-    throw new Error("A withdrawal ID is required.");
+  withdrawalId = requireDocumentId(withdrawalId, "Withdrawal ID");
+  adminUid = requireAdminUid(adminUid);
+
+  if (typeof reason !== "string") {
+    throw createError(
+      "Enter a rejection reason between 3 and 500 characters.",
+      400
+    );
   }
 
-  if (!adminUid) {
-    throw new Error("An authenticated admin is required.");
-  }
-
-  const rejectionReason = String(reason ?? "").trim();
+  const rejectionReason = reason.trim();
 
   if (rejectionReason.length < 3 || rejectionReason.length > 500) {
-    throw new Error("Enter a rejection reason between 3 and 500 characters.");
+    throw createError(
+      "Enter a rejection reason between 3 and 500 characters.",
+      400
+    );
   }
 
   const withdrawalRef = withdrawalsCollection.doc(withdrawalId);
 
   return db.runTransaction(async (transaction) => {
-    const withdrawalSnapshot = await transaction.get(withdrawalRef);
+    const snapshot = await transaction.get(withdrawalRef);
 
-    if (!withdrawalSnapshot.exists) {
-      throw new Error("Withdrawal request not found.");
+    if (!snapshot.exists) {
+      throw createError("Withdrawal request not found.", 404);
     }
 
-    const withdrawal = withdrawalSnapshot.data();
+    const withdrawal = snapshot.data();
 
     if (withdrawal.status !== "pending") {
-      throw new Error("Only pending withdrawals can be rejected.");
+      throw createError(
+        "Only pending withdrawals can be rejected.",
+        409
+      );
     }
 
     const hostId = withdrawal.hostId;
 
-    if (!hostId) {
-      throw new Error("The withdrawal has no associated host.");
+    if (typeof hostId !== "string" || !hostId.trim()) {
+      throw createError(
+        "The withdrawal has no associated host.",
+        409
+      );
     }
 
-    const amountCents = Math.floor(toNumber(withdrawal.amountCents));
-
-    if (amountCents <= 0) {
-      throw new Error("The withdrawal amount is invalid.");
-    }
-
+    const amountCents = readWithdrawalAmount(withdrawal.amountCents);
     const hostRef = hostsCollection.doc(hostId);
     const hostSnapshot = await transaction.get(hostRef);
 
     if (!hostSnapshot.exists) {
-      throw new Error(
-        "The host account was not found. The withdrawal remains pending."
+      throw createError(
+        "The host account was not found. The withdrawal remains pending.",
+        409
       );
     }
 
     const host = hostSnapshot.data();
 
-    const availableCents = Math.max(
-      0,
-      Math.floor(toNumber(host.availableHostEarningsCents))
+    const availableCents = readCents(
+      host.availableHostEarningsCents ?? 0,
+      "Available host earnings balance"
     );
 
+    const refundedBalance = availableCents + amountCents;
+
+    if (!Number.isSafeInteger(refundedBalance)) {
+      throw createError(
+        "The refunded host earnings balance is too large.",
+        409
+      );
+    }
+
+    const now = new Date();
+
+    // The refund and rejection happen atomically.
+    // A second rejection cannot refund the same request again.
     transaction.update(hostRef, {
-      availableHostEarningsCents: availableCents + amountCents,
-      updatedAt: new Date(),
+      availableHostEarningsCents: refundedBalance,
+      updatedAt: now,
     });
 
     transaction.update(withdrawalRef, {
       status: "rejected",
       payoutNote: "Withdrawal rejected; reserved balance returned.",
       rejectionReason,
-      rejectedAt: new Date(),
-      updatedAt: new Date(),
+      rejectedAt: now,
+      updatedAt: now,
       reviewedBy: adminUid,
     });
 

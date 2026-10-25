@@ -9,21 +9,56 @@ import {
   paymentITN,
 } from "../controllers/paymentController.js";
 
+import {
+  verifyFirebaseToken,
+} from "../middleware/authMiddleware.js";
+
 const router = express.Router();
 
-// Initialize a new payment for authenticated clients.
-router.post("/initialize", initializePayment);
+/*
+|--------------------------------------------------------------------------
+| AUTHENTICATED WEBSITE PAYMENT ROUTES
+|--------------------------------------------------------------------------
+| The user's identity comes from a verified Firebase ID token.
+| Never trust a user ID supplied by the browser.
+|--------------------------------------------------------------------------
+*/
 
-// Prepare PayFast checkout for the existing Telegram payment.
-router.post("/checkout/:reference", initializeExistingPaymentCheckout);
+// POST /api/payments/initialize
+router.post(
+  "/initialize",
+  verifyFirebaseToken,
+  initializePayment
+);
 
-// Check a payment belonging to the authenticated user.
-router.get("/verify/:reference", verifyPayment);
+// POST /api/payments/checkout/:reference
+router.post(
+  "/checkout/:reference",
+  verifyFirebaseToken,
+  initializeExistingPaymentCheckout
+);
 
-// Customer's browser return page.
-// This endpoint must never credit minutes by itself.
+// GET /api/payments/verify/:reference
+router.get(
+  "/verify/:reference",
+  verifyFirebaseToken,
+  verifyPayment
+);
+
+/*
+|--------------------------------------------------------------------------
+| PUBLIC PAYFAST ROUTES
+|--------------------------------------------------------------------------
+| PayFast must be able to reach these endpoints without a user's
+| Firebase session. The controller validates payment notifications.
+|--------------------------------------------------------------------------
+*/
+
+// GET /api/payments/callback
+// Browser redirect only. Never credits minutes by itself.
 router.get("/callback", paymentCallback);
 
+// POST /api/payments/itn
 // PayFast server-to-server Instant Transaction Notification.
 router.post(
   "/itn",

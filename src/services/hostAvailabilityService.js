@@ -247,19 +247,27 @@ export async function getHostAvailabilityProfile(hostId) {
 |--------------------------------------------------------------------------
 */
 
+
 export async function updateHostAvailabilityProfile(hostId, input) {
-  if (!input || typeof input !== "object" || Array.isArray(input)) {
+  if (
+    typeof hostId !== "string" ||
+    !hostId.trim() ||
+    !input ||
+    typeof input !== "object" ||
+    Array.isArray(input)
+  ) {
     throw new Error("Invalid profile details.");
   }
 
   const publicUsername = validateUsername(input.publicUsername);
+  const usernameLower = publicUsername.toLowerCase();
   const availability = validateAvailability(input.availability);
 
   if (typeof input.acceptingCalls !== "boolean") {
     throw new Error("Choose whether you want to accept calls.");
   }
 
-  const hostRef = hostsCollection.doc(hostId);
+  const hostRef = hostsCollection.doc(hostId.trim());
 
   await db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(hostRef);
@@ -274,16 +282,44 @@ export async function updateHostAvailabilityProfile(hostId, input) {
       throw new Error("An active, linked host account is required.");
     }
 
+    const usernameQuery = hostsCollection
+      .where("usernameLower", "==", usernameLower)
+      .limit(10);
+
+    const publicUsernameQuery = hostsCollection
+      .where("publicUsernameLower", "==", usernameLower)
+      .limit(10);
+
+    const [usernameMatches, publicUsernameMatches] = await Promise.all([
+      transaction.get(usernameQuery),
+      transaction.get(publicUsernameQuery),
+    ]);
+
+    const conflictingIds = new Set([
+      ...usernameMatches.docs.map((doc) => doc.id),
+      ...publicUsernameMatches.docs.map((doc) => doc.id),
+    ]);
+
+    for (const conflictingId of conflictingIds) {
+      if (conflictingId !== snapshot.id) {
+        throw new Error("That host username is already in use.");
+      }
+    }
+
     transaction.update(hostRef, {
+      username: publicUsername,
+      usernameLower,
       publicUsername,
+      publicUsernameLower: usernameLower,
       availability,
       acceptingCalls: input.acceptingCalls,
       updatedAt: new Date(),
     });
   });
 
-  return getHostAvailabilityProfile(hostId);
+  return getHostAvailabilityProfile(hostId.trim());
 }
+
 
 /*
 |--------------------------------------------------------------------------

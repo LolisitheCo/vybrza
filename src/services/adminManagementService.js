@@ -3,12 +3,12 @@ import { getAuth } from "firebase-admin/auth";
 import { db, firebaseApp } from "../config/firebase.js";
 
 const auth = getAuth(firebaseApp);
+
 const users = db.collection("users");
 const hosts = db.collection("hosts");
-const applications = db.collection("hostApplications");
-const drafts = db.collection("hostApplicationDrafts");
-const accountLinks = db.collection("hostAccountLinks");
 const admins = db.collection("admins");
+const verifications = db.collection("verifications");
+const hostWithdrawals = db.collection("hostWithdrawals");
 
 function fail(status, message) {
   const error = new Error(message);
@@ -33,17 +33,17 @@ function normalizeDocumentId(value) {
 async function ensureNotAdmin(firebaseUid) {
   if (!firebaseUid) return;
 
-  const snapshot = await admins.doc(firebaseUid).get();
+  const adminSnapshot = await admins.doc(firebaseUid).get();
 
-  if (snapshot.exists) {
+  if (adminSnapshot.exists) {
     fail(
       409,
-      "This account has an administrator record and cannot be removed here."
+      "Administrator accounts cannot be removed or deactivated here."
     );
   }
 }
 
-async function removeHostClaim(firebaseUid) {
+async function revokeHostClaim(firebaseUid) {
   if (!firebaseUid) return;
 
   let firebaseUser;
@@ -60,47 +60,33 @@ async function removeHostClaim(firebaseUid) {
 
   const claims = { ...(firebaseUser.customClaims || {}) };
 
-  if (claims.host !== true) return;
+  if (claims.host === true) {
+    delete claims.host;
+    await auth.setCustomUserClaims(firebaseUid, claims);
+  }
 
-  delete claims.host;
-
-  await auth.setCustomUserClaims(firebaseUid, claims);
+  // Force refreshed authentication tokens after a role change.
   await auth.revokeRefreshTokens(firebaseUid);
 }
 
-async function deleteRelatedVerifications(userId, telegramId) {
-  const verificationCollection = db.collection("verifications");
+async function deleteRelatedVerifications(userId) {
   const references = new Map();
 
-  // Check common document IDs first.
-  for (const id of [userId, telegramId]) {
-    if (!id) continue;
+  const directRef = verifications.doc(userId);
+  const directSnapshot = await directRef.get();
 
-    const ref = verificationCollection.doc(String(id));
-    const snapshot = await ref.get();
-
-    if (snapshot.exists) {
-      references.set(ref.path, ref);
-    }
+  if (directSnapshot.exists) {
+    references.set(directRef.path, directRef);
   }
 
-  // Also check common ownership fields.
-  for (const [field, value] of [
-    ["userId", userId],
-    ["telegramId", telegramId],
-  ]) {
-    if (!value) continue;
+  const snapshot = await verifications
+    .where("userId", "==", userId)
+    .get();
 
-    const snapshot = await verificationCollection
-      .where(field, "==", String(value))
-      .get();
-
-    for (const document of snapshot.docs) {
-      references.set(document.ref.path, document.ref);
-    }
+  for (const document of snapshot.docs) {
+    references.set(document.ref.path, document.ref);
   }
 
-  // Use batches to stay below Firestore's 500-write limit.
   const refs = [...references.values()];
 
   for (let index = 0; index < refs.length; index += 400) {
@@ -114,16 +100,32 @@ async function deleteRelatedVerifications(userId, telegramId) {
   }
 }
 
+async function ensureNoPendingWithdrawals(hostId) {
+  const snapshot = await hostWithdrawals
+    .where("hostId", "==", hostId)
+    .where("status", "==", "pending")
+    .limit(1)
+    .get();
+
+  if (!snapshot.empty) {
+    fail(
+      409,
+      "This host has a pending withdrawal. Resolve it before deactivating the host."
+    );
+  }
+}
+
 export async function removeUserRecord(documentId) {
   const id = normalizeDocumentId(documentId);
-  const ref = users.doc(id);
-  const snapshot = await ref.get();
+  const userRef = users.doc(id);
+  const userSnapshot = await userRef.get();
 
-  if (!snapshot.exists) {
+  if (!userSnapshot.exists) {
     fail(404, "User record not found.");
   }
 
-  const user = snapshot.data();
+  const user = userSnapshot.data();
+  const firebaseUid = user.firebaseUid || id;
 
   if (user.role === "admin") {
     fail(409, "Administrator accounts cannot be removed here.");
@@ -136,15 +138,17 @@ export async function removeUserRecord(documentId) {
     );
   }
 
-  await ensureNotAdmin(user.firebaseUid);
+  await ensureNotAdmin(firebaseUid);
 
-  // Remove the profile and verification state, not financial history.
-  await deleteRelatedVerifications(id, user.telegramId);
-  await ref.delete();
+  // Remove the user profile and verification state only.
+  // Payment, call, and financial records are preserved.
+  await deleteRelatedVerifications(id);
+  await userRef.delete();
 
   return {
     removed: true,
     documentId: id,
+    financialHistoryPreserved: true,
   };
 }
 
@@ -158,50 +162,47 @@ export async function removeHostRecord(documentId) {
   }
 
   const host = hostSnapshot.data();
-  const telegramId = host.telegramId
-    ? String(host.telegramId)
-    : null;
-  const firebaseUid = host.firebaseUid || null;
+  const firebaseUid = host.firebaseUid || host.firebaseUid;
+
+  if (!firebaseUid) {
+    fail(
+      409,
+      "This host has no linked Firebase account. Review the host record before proceeding."
+    );
+  }
 
   if (host.activeCallId) {
     fail(
       409,
-      "This host has an active call. End the call before removing the host."
+      "This host has an active call. End the call before deactivating the host."
     );
   }
 
   await ensureNotAdmin(firebaseUid);
+  await ensureNoPendingWithdrawals(id);
 
   // Revoke host privileges while preserving unrelated custom claims.
-  await removeHostClaim(firebaseUid);
+  await revokeHostClaim(firebaseUid);
 
-  const batch = db.batch();
-
-  batch.delete(hostRef);
-
-  // Application and draft documents use the Telegram ID as their ID.
-  if (telegramId) {
-    batch.delete(applications.doc(telegramId));
-    batch.delete(drafts.doc(telegramId));
-  }
-
-  // Delete only the account link belonging to this host.
-  if (firebaseUid) {
-    const linkRef = accountLinks.doc(firebaseUid);
-    const linkSnapshot = await linkRef.get();
-
-    if (
-      linkSnapshot.exists &&
-      linkSnapshot.data().hostId === id
-    ) {
-      batch.delete(linkRef);
-    }
-  }
-
-  await batch.commit();
+  // Keep the host document, application, earnings, call history,
+  // and withdrawal records for audit and financial reconciliation.
+  await hostRef.set(
+    {
+      active: false,
+      status: "inactive",
+      available: false,
+      deactivatedAt: new Date(),
+      deactivationReason: "Deactivated by an administrator.",
+      updatedAt: new Date(),
+    },
+    { merge: true }
+  );
 
   return {
-    removed: true,
+    removed: false,
+    deactivated: true,
     documentId: id,
+    financialHistoryPreserved: true,
+    applicationHistoryPreserved: true,
   };
 }

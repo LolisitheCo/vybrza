@@ -1,21 +1,12 @@
-// ============================================================
-// SA LIVE — AUTHENTICATION & AUTHORIZATION MIDDLEWARE
-// ============================================================
-// Firebase Admin SDK
-// Express ES modules
-//
-// Exports:
-//   verifyFirebaseToken
-//   requireAdmin
-//   requireHost
-// ============================================================
 
 import { getAuth } from "firebase-admin/auth";
 import { db } from "../config/firebase.js";
 
-// ============================================================
-// STANDARD ERROR RESPONSE
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| STANDARD ERROR RESPONSE
+|--------------------------------------------------------------------------
+*/
 
 function sendError(res, status, message) {
   return res.status(status).json({
@@ -24,9 +15,15 @@ function sendError(res, status, message) {
   });
 }
 
-// ============================================================
-// VERIFY FIREBASE ID TOKEN
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| VERIFY FIREBASE ID TOKEN
+|--------------------------------------------------------------------------
+| All protected website routes must use this middleware.
+| The UID and email must come from the verified Firebase token,
+| never from the request body or query string.
+|--------------------------------------------------------------------------
+*/
 
 export async function verifyFirebaseToken(req, res, next) {
   try {
@@ -36,37 +33,23 @@ export async function verifyFirebaseToken(req, res, next) {
       typeof authorization !== "string" ||
       authorization.length > 10000
     ) {
-      return sendError(
-        res,
-        401,
-        "Authentication required."
-      );
+      return sendError(res, 401, "Authentication required.");
     }
 
-    const match = /^Bearer\s+(\S+)$/i.exec(
-      authorization.trim()
-    );
+    const match = /^Bearer\s+(\S+)$/i.exec(authorization.trim());
 
     if (!match) {
-      return sendError(
-        res,
-        401,
-        "Authentication required."
-      );
+      return sendError(res, 401, "Authentication required.");
     }
 
-    const token = match[1];
-
-    // Verify the token signature, issuer, audience and expiry.
-    // Also check Firebase revocation status.
     const decodedToken = await getAuth().verifyIdToken(
-      token,
+      match[1],
       true
     );
 
     if (
-      !decodedToken.uid ||
-      typeof decodedToken.uid !== "string"
+      typeof decodedToken.uid !== "string" ||
+      !decodedToken.uid.trim()
     ) {
       return sendError(
         res,
@@ -81,19 +64,18 @@ export async function verifyFirebaseToken(req, res, next) {
         typeof decodedToken.email === "string"
           ? decodedToken.email
           : null,
-      emailVerified:
-        decodedToken.email_verified === true,
+      emailVerified: decodedToken.email_verified === true,
     });
 
     return next();
   } catch (error) {
-    // Do not log the token or authorization header.
-    // Invalid, expired and revoked tokens are unauthorized.
     if (
       error?.code === "auth/id-token-expired" ||
       error?.code === "auth/id-token-revoked" ||
       error?.code === "auth/invalid-id-token" ||
-      error?.code === "auth/argument-error"
+      error?.code === "auth/argument-error" ||
+      error?.code === "auth/user-disabled" ||
+      error?.code === "auth/user-not-found"
     ) {
       return sendError(
         res,
@@ -115,20 +97,21 @@ export async function verifyFirebaseToken(req, res, next) {
   }
 }
 
-// ============================================================
-// REQUIRE ACTIVE ADMINISTRATOR
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| REQUIRE ACTIVE ADMINISTRATOR
+|--------------------------------------------------------------------------
+| Firestore remains the authoritative source of admin access.
+| A client-side role or custom token claim alone is not sufficient.
+|--------------------------------------------------------------------------
+*/
 
 export async function requireAdmin(req, res, next) {
   try {
     const uid = req.user?.uid;
 
     if (!uid) {
-      return sendError(
-        res,
-        401,
-        "Authentication required."
-      );
+      return sendError(res, 401, "Authentication required.");
     }
 
     const adminSnapshot = await db
@@ -147,9 +130,7 @@ export async function requireAdmin(req, res, next) {
       );
     }
 
-    req.admin = Object.freeze({
-      uid,
-    });
+    req.admin = Object.freeze({ uid });
 
     return next();
   } catch (error) {
@@ -166,20 +147,21 @@ export async function requireAdmin(req, res, next) {
   }
 }
 
-// ============================================================
-// REQUIRE ACTIVE HOST
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| REQUIRE ACTIVE HOST
+|--------------------------------------------------------------------------
+| The host must have exactly one active host record associated
+| with the authenticated Firebase UID.
+|--------------------------------------------------------------------------
+*/
 
 export async function requireHost(req, res, next) {
   try {
     const uid = req.user?.uid;
 
     if (!uid) {
-      return sendError(
-        res,
-        401,
-        "Authentication required."
-      );
+      return sendError(res, 401, "Authentication required.");
     }
 
     const hostSnapshot = await db
@@ -196,8 +178,6 @@ export async function requireHost(req, res, next) {
       );
     }
 
-    // Multiple records for one Firebase UID indicate
-    // inconsistent host-account data. Fail closed.
     if (hostSnapshot.size !== 1) {
       console.error(
         "Host authorization failed: duplicate host records."
@@ -221,22 +201,27 @@ export async function requireHost(req, res, next) {
       );
     }
 
-    // Return only server-loaded host data.
-    req.hostAccount = Object.freeze({
-      ...hostData,
-      id: hostDoc.id,
-    });
+    if (hostData.firebaseUid !== uid) {
+      return sendError(
+        res,
+        403,
+        "Host account does not match the authenticated user."
+      );
+    }
+
+    // Expose only the fields host controllers need for authorization.
+req.hostAccount = Object.freeze({
+  id: hostDoc.id,
+  firebaseUid: uid,
+  status: hostData.status,
+});
 
     return next();
-   } catch (error) {
-    console.error("Host authorization diagnostic:", {
-      name: error?.name || "UnknownError",
-      code: error?.code || "NO_ERROR_CODE",
-      message:
-        typeof error?.message === "string"
-          ? error.message.slice(0, 500)
-          : "No error message available",
-    });
+  } catch (error) {
+    console.error(
+      "Host authorization failed:",
+      error?.code || "UNKNOWN_ERROR"
+    );
 
     return sendError(
       res,

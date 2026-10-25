@@ -6,6 +6,8 @@ import {
   getMyHostProfile,
   updateMyHostProfile,
   publicHostDirectory,
+  applyToBecomeHost,
+  getMyHostApplicationStatus,
 } from "../controllers/hostController.js";
 
 import {
@@ -27,15 +29,32 @@ const router = express.Router();
 |--------------------------------------------------------------------------
 */
 
+// Public directory returns sanitized host information only.
 router.get("/public", publicHostDirectory);
 
 /*
 |--------------------------------------------------------------------------
-| AUTHENTICATED HOST ROUTES
+| WEBSITE-ACCOUNT ROUTES
+|--------------------------------------------------------------------------
+| A signed-in user may apply to become a host before being approved.
+| These routes must NOT require the host role.
 |--------------------------------------------------------------------------
 */
 
 router.use(verifyFirebaseToken);
+
+router.post("/applications", applyToBecomeHost);
+router.get("/applications/me", getMyHostApplicationStatus);
+
+/*
+|--------------------------------------------------------------------------
+| APPROVED HOST ROUTES
+|--------------------------------------------------------------------------
+| Everything below requires a valid Firebase session and an active
+| host record linked to the authenticated Firebase UID.
+|--------------------------------------------------------------------------
+*/
+
 router.use(requireHost);
 
 // Host profile and availability

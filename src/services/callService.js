@@ -1,10 +1,20 @@
-import { db } from "../config/firebase.js";
 
-import {
-  finalizeCallBilling,
-} from "./billingService.js";
+import { db } from "../config/firebase.js";
+import { finalizeCallBilling } from "./billingService.js";
 
 const callsCollection = db.collection("callSessions");
+
+const ALLOWED_END_REASONS = new Set([
+  "completed",
+  "user_ended",
+  "host_ended",
+  "insufficient_balance",
+  "connection_lost",
+  "admin_ended",
+  "system_error",
+]);
+
+const VALID_ID_PATTERN = /^[A-Za-z0-9_-]{1,150}$/;
 
 /*
 |--------------------------------------------------------------------------
@@ -12,10 +22,21 @@ const callsCollection = db.collection("callSessions");
 |--------------------------------------------------------------------------
 */
 
-function toCall(doc) {
-  if (!doc.exists) {
-    return null;
+function validateId(value, fieldName) {
+  if (
+    typeof value !== "string" ||
+    !value.trim() ||
+    value.trim().length > 150 ||
+    !VALID_ID_PATTERN.test(value.trim())
+  ) {
+    throw new Error(`A valid ${fieldName} is required.`);
   }
+
+  return value.trim();
+}
+
+function toCall(doc) {
+  if (!doc?.exists) return null;
 
   return {
     id: doc.id,
@@ -32,39 +53,46 @@ function toDate(value) {
 
   const date = new Date(value);
 
-  return Number.isNaN(date.getTime())
-    ? null
-    : date;
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function sortNewestFirst(calls) {
+  return calls.sort((a, b) => {
+    const aTime = toDate(a.createdAt)?.getTime() || 0;
+    const bTime = toDate(b.createdAt)?.getTime() || 0;
+
+    return bTime - aTime;
+  });
 }
 
 /*
 |--------------------------------------------------------------------------
 | CREATE CALL SESSION
 |--------------------------------------------------------------------------
+| Creates a pending call request.
+| The host must be assigned by trusted backend code, never by trusting
+| a host ID supplied directly by an unauthenticated client.
+|--------------------------------------------------------------------------
 */
 
-export async function createCallSession({
-  userId,
-  hostId,
-}) {
-  if (
-    typeof userId !== "string" ||
-    !userId.trim() ||
-    typeof hostId !== "string" ||
-    !hostId.trim()
-  ) {
-    throw new Error("Valid user and host IDs are required.");
+export async function createCallSession({ userId, hostId }) {
+  const normalizedUserId = validateId(userId, "user ID");
+  const normalizedHostId = validateId(hostId, "host ID");
+
+  if (normalizedUserId === normalizedHostId) {
+    throw new Error("A user cannot call their own host account.");
   }
 
   const now = new Date();
   const callRef = callsCollection.doc();
 
   const callData = {
-    userId: userId.trim(),
-    hostId: hostId.trim(),
+    userId: normalizedUserId,
+    hostId: normalizedHostId,
 
     status: "matching",
 
+    // LiveKit room data is populated by trusted backend code.
     roomId: null,
     roomUrl: null,
 
@@ -72,19 +100,20 @@ export async function createCallSession({
     endedAt: null,
 
     durationSeconds: 0,
-minutesUsed: 0,
-billableMinutes: 0,
+    minutesUsed: 0,
+    billableMinutes: 0,
 
-endReason: null,
+    endReason: null,
 
-billingStatus: "pending",
-billedAt: null,
+    billingStatus: "pending",
+    billedAt: null,
+    billingError: null,
 
-customerCharge: 0,
-hostEarnings: 0,
-saLiveRevenue: 0,
+    customerCharge: 0,
+    hostEarnings: 0,
+    saLiveRevenue: 0,
 
-hostPayoutStatus: "pending",
+    hostPayoutStatus: "pending",
 
     createdAt: now,
     updatedAt: now,
@@ -105,15 +134,10 @@ hostPayoutStatus: "pending",
 */
 
 export async function getCallById(callId) {
-  if (
-    typeof callId !== "string" ||
-    !callId.trim()
-  ) {
-    throw new Error("A valid call ID is required.");
-  }
+  const normalizedCallId = validateId(callId, "call ID");
 
   const snapshot = await callsCollection
-    .doc(callId)
+    .doc(normalizedCallId)
     .get();
 
   return toCall(snapshot);
@@ -123,29 +147,32 @@ export async function getCallById(callId) {
 |--------------------------------------------------------------------------
 | START CALL
 |--------------------------------------------------------------------------
-| A call can only start once.
+| Only a matched call can start.
+| Call this from trusted backend code after verifying both participants
+| and ensuring the LiveKit room is ready.
 |--------------------------------------------------------------------------
 */
 
-export async function startCall(
-  callId,
-  roomId,
-  roomUrl
-) {
+export async function startCall(callId, roomId, roomUrl) {
+  const normalizedCallId = validateId(callId, "call ID");
+
   if (
-    typeof callId !== "string" ||
-    !callId.trim() ||
     typeof roomId !== "string" ||
     !roomId.trim() ||
-    typeof roomUrl !== "string" ||
-    !roomUrl.trim()
+    roomId.trim().length > 256
   ) {
-    throw new Error(
-      "Call ID, room ID, and room URL are required."
-    );
+    throw new Error("A valid LiveKit room ID is required.");
   }
 
-  const callRef = callsCollection.doc(callId);
+  if (
+    typeof roomUrl !== "string" ||
+    !/^https:\/\/[^\s]+$/i.test(roomUrl.trim()) ||
+    roomUrl.trim().length > 2048
+  ) {
+    throw new Error("A valid secure LiveKit room URL is required.");
+  }
+
+  const callRef = callsCollection.doc(normalizedCallId);
 
   return db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(callRef);
@@ -156,36 +183,42 @@ export async function startCall(
 
     const call = snapshot.data();
 
+    // Idempotency: retries for the same active room do not reset its timer.
+    if (
+      call.status === "active" &&
+      call.roomId === roomId.trim() &&
+      call.roomUrl === roomUrl.trim()
+    ) {
+      return {
+        id: snapshot.id,
+        ...call,
+      };
+    }
+
     if (call.status !== "matched") {
-      throw new Error(
-        "Only a matched call can be started."
-      );
+      throw new Error("Only a matched call can be started.");
     }
 
     if (call.startedAt || call.endedAt) {
-      throw new Error(
-        "This call has already started or ended."
-      );
+      throw new Error("This call has already started or ended.");
     }
 
     const now = new Date();
 
-    transaction.update(callRef, {
+    const update = {
       status: "active",
-      roomId,
-      roomUrl,
+      roomId: roomId.trim(),
+      roomUrl: roomUrl.trim(),
       startedAt: now,
       updatedAt: now,
-    });
+    };
+
+    transaction.update(callRef, update);
 
     return {
-      id: callRef.id,
+      id: snapshot.id,
       ...call,
-      status: "active",
-      roomId,
-      roomUrl,
-      startedAt: now,
-      updatedAt: now,
+      ...update,
     };
   });
 }
@@ -194,38 +227,19 @@ export async function startCall(
 |--------------------------------------------------------------------------
 | END CALL
 |--------------------------------------------------------------------------
-| Marks the call as completed exactly once.
-| Billing and host earnings must be handled separately.
+| Ending is idempotent. If the call is already completed but billing
+| remains pending, the billing finalization step is retried.
 |--------------------------------------------------------------------------
 */
 
+export async function endCall(callId, reason = "completed") {
+  const normalizedCallId = validateId(callId, "call ID");
 
-export async function endCall(
-  callId,
-  reason = "completed"
-) {
-  if (
-    typeof callId !== "string" ||
-    !callId.trim()
-  ) {
-    throw new Error("A valid call ID is required.");
-  }
-
-  const allowedReasons = new Set([
-    "completed",
-    "user_ended",
-    "host_ended",
-    "insufficient_balance",
-    "connection_lost",
-    "admin_ended",
-    "system_error",
-  ]);
-
-  if (!allowedReasons.has(reason)) {
+  if (!ALLOWED_END_REASONS.has(reason)) {
     throw new Error("Invalid call end reason.");
   }
 
-  const callRef = callsCollection.doc(callId.trim());
+  const callRef = callsCollection.doc(normalizedCallId);
 
   const endedCall = await db.runTransaction(
     async (transaction) => {
@@ -237,6 +251,7 @@ export async function endCall(
 
       const call = snapshot.data();
 
+      // Already completed: return it so pending billing can be retried.
       if (call.status === "completed") {
         return {
           id: snapshot.id,
@@ -246,9 +261,7 @@ export async function endCall(
       }
 
       if (
-        call.status !== "active" &&
-        call.status !== "matching" &&
-        call.status !== "matched"
+        !["active", "matching", "matched"].includes(call.status)
       ) {
         throw new Error(
           "This call cannot be ended from its current state."
@@ -269,46 +282,59 @@ export async function endCall(
 
       const minutesUsed = Math.ceil(durationSeconds / 60);
 
-      const updatedCall = {
+      const update = {
         status: "completed",
         endedAt: now,
         durationSeconds,
         minutesUsed,
         endReason: reason,
         billingStatus: "pending",
-        billedAt: null,
         updatedAt: now,
       };
 
-      transaction.update(callRef, updatedCall);
+      transaction.update(callRef, update);
 
       return {
         id: snapshot.id,
         ...call,
-        ...updatedCall,
+        ...update,
       };
     }
   );
 
-  // Finalize billing after the call is marked completed.
-  // Already-ended calls are not billed again here.
-  if (
-    endedCall.status === "completed" &&
-    !endedCall.alreadyEnded
-  ) {
-    const billing = await finalizeCallBilling(endedCall.id);
+  // finalizeCallBilling must itself be transactionally idempotent.
+  // It must not deduct customer minutes or credit host earnings twice.
+  if (endedCall.billingStatus !== "paid") {
+    try {
+      const billing = await finalizeCallBilling(endedCall.id);
 
-    console.log("SA LIVE call billing:", billing);
+      console.log("SA LIVE call billing finalized:", {
+        callId: endedCall.id,
+        billingStatus: billing?.billingStatus ?? "returned",
+      });
 
-    return {
-      ...endedCall,
-      billing,
-    };
+      const latestCall = await getCallById(endedCall.id);
+
+      return {
+        ...(latestCall ?? endedCall),
+        billing,
+      };
+    } catch (error) {
+      // Preserve the completed call so a later retry can finalize billing.
+      console.error("SA LIVE call billing finalization failed:", {
+        callId: endedCall.id,
+        message:
+          typeof error?.message === "string"
+            ? error.message.slice(0, 300)
+            : "Unknown billing error",
+      });
+
+      throw error;
+    }
   }
 
   return endedCall;
 }
-
 
 /*
 |--------------------------------------------------------------------------
@@ -317,30 +343,18 @@ export async function endCall(
 */
 
 export async function getUserCallHistory(userId) {
-  if (
-    typeof userId !== "string" ||
-    !userId.trim()
-  ) {
-    throw new Error("A valid user ID is required.");
-  }
+  const normalizedUserId = validateId(userId, "user ID");
 
   const snapshot = await callsCollection
-    .where("userId", "==", userId)
+    .where("userId", "==", normalizedUserId)
     .get();
 
-  const calls = snapshot.docs.map((doc) => ({
-    id: doc.id,
-    ...doc.data(),
-  }));
-
-  calls.sort((a, b) => {
-    const aTime = toDate(a.createdAt)?.getTime() || 0;
-    const bTime = toDate(b.createdAt)?.getTime() || 0;
-
-    return bTime - aTime;
-  });
-
-  return calls;
+  return sortNewestFirst(
+    snapshot.docs.map((doc) => ({
+      id: doc.id,
+      ...doc.data(),
+    }))
+  );
 }
 
 /*
@@ -350,28 +364,16 @@ export async function getUserCallHistory(userId) {
 */
 
 export async function getHostCallHistory(hostId) {
-  if (
-    typeof hostId !== "string" ||
-    !hostId.trim()
-  ) {
-    throw new Error("A valid host ID is required.");
-  }
+  const normalizedHostId = validateId(hostId, "host ID");
 
   const snapshot = await callsCollection
-    .where("hostId", "==", hostId)
+    .where("hostId", "==", normalizedHostId)
     .get();
 
-  const calls = snapshot.docs.map((doc) => ({
-    id: doc.id,
-    ...doc.data(),
-  }));
-
-  calls.sort((a, b) => {
-    const aTime = toDate(a.createdAt)?.getTime() || 0;
-    const bTime = toDate(b.createdAt)?.getTime() || 0;
-
-    return bTime - aTime;
-  });
-
-  return calls;
+  return sortNewestFirst(
+    snapshot.docs.map((doc) => ({
+      id: doc.id,
+      ...doc.data(),
+    }))
+  );
 }

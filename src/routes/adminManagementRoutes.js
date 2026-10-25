@@ -11,40 +11,17 @@ import {
   removeHost,
 } from "../controllers/adminManagementController.js";
 
-import {
-  listAdminWithdrawals,
-  payAdminWithdrawal,
-  rejectAdminWithdrawal,
-} from "../controllers/adminWithdrawalController.js";
-
 const router = express.Router();
 
-/*
-|--------------------------------------------------------------------------
-| ADMIN AUTHORIZATION
-|--------------------------------------------------------------------------
-*/
-
+// All admin management routes require Firebase authentication
+// and an active admin account.
 router.use(verifyFirebaseToken);
 router.use(requireAdmin);
 
-/*
-|--------------------------------------------------------------------------
-| USER AND HOST MANAGEMENT
-|--------------------------------------------------------------------------
-*/
-
+// User management.
 router.delete("/users/:id", removeUser);
+
+// Host management.
 router.delete("/hosts/:id", removeHost);
-
-/*
-|--------------------------------------------------------------------------
-| WITHDRAWAL MANAGEMENT
-|--------------------------------------------------------------------------
-*/
-
-router.get("/withdrawals", listAdminWithdrawals);
-router.post("/withdrawals/:id/paid", payAdminWithdrawal);
-router.post("/withdrawals/:id/reject", rejectAdminWithdrawal);
 
 export default router;
