@@ -15,6 +15,7 @@ import {
   listPendingHostApplications,
   approveHostApplicationAdmin,
   rejectHostApplicationAdmin,
+  syncApprovedHostApplicationAdmin,
 } from "../controllers/adminManagementController.js";
 
 const router = express.Router();
@@ -47,6 +48,12 @@ router.post(
   "/host-applications/:id/reject",
   rejectHostApplicationAdmin
 );
+
+router.post(
+  "/host-applications/:id/sync",
+  syncApprovedHostApplicationAdmin
+);
+
 
 // Existing user management.
 router.delete("/users/:id", removeUser);

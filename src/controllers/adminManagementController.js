@@ -212,6 +212,44 @@ export async function listPendingHostApplications(req, res) {
   }
 }
 
+
+/*
+|--------------------------------------------------------------------------
+| REPAIR AN ALREADY-APPROVED HOST APPLICATION
+|--------------------------------------------------------------------------
+*/
+
+export async function syncApprovedHostApplicationAdmin(req, res) {
+  const adminUid = getAdminUid(req);
+
+  if (!adminUid) {
+    return res.status(401).json({
+      success: false,
+      message: "Authenticated administrator required.",
+    });
+  }
+
+  try {
+    const result = await approveHostApplication(
+      req.params.id,
+      adminUid
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Host account synchronization completed.",
+      result,
+    });
+  } catch (error) {
+    return handleError(
+      res,
+      error,
+      "synchronizing approved host account"
+    );
+  }
+}
+
+
 /*
 |--------------------------------------------------------------------------
 | APPROVE HOST APPLICATION
