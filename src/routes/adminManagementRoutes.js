@@ -1,4 +1,3 @@
-
 import express from "express";
 
 import {
@@ -9,9 +8,6 @@ import {
 import {
   removeUser,
   removeHost,
-  listPendingVerifications,
-  approveCustomerVerification,
-  rejectCustomerVerification,
   listPendingHostApplications,
   approveHostApplicationAdmin,
   rejectHostApplicationAdmin,
@@ -24,26 +20,17 @@ const router = express.Router();
 router.use(verifyFirebaseToken);
 router.use(requireAdmin);
 
-// Customer verification review.
-router.get("/verifications", listPendingVerifications);
-router.post(
-  "/verifications/:id/approve",
-  approveCustomerVerification
-);
-router.post(
-  "/verifications/:id/reject",
-  rejectCustomerVerification
-);
-
 // Host application review.
 router.get(
   "/host-applications",
   listPendingHostApplications
 );
+
 router.post(
   "/host-applications/:id/approve",
   approveHostApplicationAdmin
 );
+
 router.post(
   "/host-applications/:id/reject",
   rejectHostApplicationAdmin
@@ -54,11 +41,10 @@ router.post(
   syncApprovedHostApplicationAdmin
 );
 
-
-// Existing user management.
+// User management.
 router.delete("/users/:id", removeUser);
 
-// Existing host management.
+// Host management.
 router.delete("/hosts/:id", removeHost);
 
 export default router;
