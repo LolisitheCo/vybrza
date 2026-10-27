@@ -1,9 +1,13 @@
 
 import express from "express";
-import { AccessToken } from "livekit-server-sdk";
+import {
+  AccessToken,
+  RoomServiceClient,
+} from "livekit-server-sdk";
 
 import { db } from "../config/firebase.js";
 import { verifyFirebaseToken } from "../middleware/authMiddleware.js";
+import { startCall, endCall } from "../services/callService.js";
 
 const router = express.Router();
 
@@ -36,63 +40,78 @@ function getLiveKitConfig() {
   return { url, apiKey, apiSecret };
 }
 
+function getCallId(req) {
+  const callId =
+    typeof req.body?.callId === "string"
+      ? req.body.callId.trim()
+      : "";
+
+  if (!callId || callId.length > 150) {
+    const error = new Error("A valid callId is required.");
+    error.status = 400;
+    throw error;
+  }
+
+  return callId;
+}
+
+async function getAuthorizedCall(callId, firebaseUid) {
+  const snapshot = await callSessions.doc(callId).get();
+
+  if (!snapshot.exists) {
+    const error = new Error("Call session not found.");
+    error.status = 404;
+    throw error;
+  }
+
+  const call = snapshot.data();
+
+  const isCustomer = call.userId === firebaseUid;
+  let isAssignedHost = false;
+
+  if (typeof call.hostId === "string" && call.hostId) {
+    const hostSnapshot = await hosts.doc(call.hostId).get();
+
+    isAssignedHost =
+      hostSnapshot.exists &&
+      hostSnapshot.data()?.firebaseUid === firebaseUid &&
+      hostSnapshot.data()?.status === "active";
+  }
+
+  if (!isCustomer && !isAssignedHost) {
+    const error = new Error(
+      "You are not a participant in this call."
+    );
+    error.status = 403;
+    throw error;
+  }
+
+  return {
+    call,
+    isCustomer,
+    isAssignedHost,
+    callRef: snapshot.ref,
+  };
+}
+
+function getRoomService() {
+  const { url, apiKey, apiSecret } = getLiveKitConfig();
+
+  return new RoomServiceClient(url, apiKey, apiSecret);
+}
+
 /*
  * POST /api/livekit/token
  *
- * Body:
- * { "callId": "your-call-session-id" }
- *
- * Only the customer or the assigned host can obtain a room token.
- * This endpoint does not start the call timer or finalize billing.
+ * Body: { "callId": "..." }
  */
 router.post("/token", async (req, res, next) => {
   try {
-    const callId =
-      typeof req.body?.callId === "string"
-        ? req.body.callId.trim()
-        : "";
-
-    if (!callId || callId.length > 200) {
-      return res.status(400).json({
-        success: false,
-        message: "A valid callId is required.",
-      });
-    }
-
-    const callRef = callSessions.doc(callId);
-    const callSnapshot = await callRef.get();
-
-    if (!callSnapshot.exists) {
-      return res.status(404).json({
-        success: false,
-        message: "Call session not found.",
-      });
-    }
-
-    const call = callSnapshot.data();
-    const firebaseUid = req.user.uid;
-
-    const isCustomer = call.userId === firebaseUid;
-
-    let isAssignedHost = false;
-
-    if (typeof call.hostId === "string" && call.hostId) {
-      const hostSnapshot = await hosts
-        .doc(call.hostId)
-        .get();
-
-      isAssignedHost =
-        hostSnapshot.exists &&
-        hostSnapshot.data()?.firebaseUid === firebaseUid &&
-        hostSnapshot.data()?.status === "active";
-    }
-
-    if (!isCustomer && !isAssignedHost) {
-      return res.status(403).json({
-        success: false,
-        message: "You are not a participant in this call.",
-      });
-    }
+    const callId = getCallId(req);
+    const { call, isCustomer } = await getAuthorizedCall(
+      callId,
+      req.user.uid
+    );
 
     if (!["matched", "active"].includes(call.status)) {
       return res.status(409).json({
@@ -102,18 +121,13 @@ router.post("/token", async (req, res, next) => {
     }
 
     const { url, apiKey, apiSecret } = getLiveKitConfig();
-
-    // Both participants receive tokens for the same room.
-    const roomName = `salive-${callSnapshot.id}`;
-
-    // Use a stable identity for each authenticated participant.
-    const identity = firebaseUid;
+    const roomName = `salive-${callId}`;
 
     const token = new AccessToken(apiKey, apiSecret, {
-      identity,
+      identity: req.user.uid,
       ttl: "10m",
       metadata: JSON.stringify({
-        callId: callSnapshot.id,
+        callId,
         role: isCustomer ? "customer" : "host",
       }),
     });
@@ -126,16 +140,139 @@ router.post("/token", async (req, res, next) => {
       canPublishData: true,
     });
 
-    const jwt = await token.toJwt();
-
     res.setHeader("Cache-Control", "no-store");
 
     return res.status(200).json({
       success: true,
       serverUrl: url,
       roomName,
-      token: jwt,
-      callId: callSnapshot.id,
+      token: await token.toJwt(),
+      callId,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/*
+ * POST /api/livekit/start
+ *
+ * Body: { "callId": "..." }
+ *
+ * Starts the timer only after both assigned participants are
+ * present in the expected LiveKit room.
+ */
+router.post("/start", async (req, res, next) => {
+  try {
+    const callId = getCallId(req);
+    const { call } = await getAuthorizedCall(
+      callId,
+      req.user.uid
+    );
+
+    if (call.status === "active") {
+      return res.status(200).json({
+        success: true,
+        message: "Call is already active.",
+        call,
+      });
+    }
+
+    if (call.status !== "matched") {
+      return res.status(409).json({
+        success: false,
+        message: "Only a matched call can be started.",
+      });
+    }
+
+    const roomName = `salive-${callId}`;
+    const roomService = getRoomService();
+
+    const participants = await roomService.listParticipants(roomName);
+    const identities = new Set(
+      participants.map((participant) => participant.identity)
+    );
+
+    const hostSnapshot = await hosts.doc(call.hostId).get();
+    const hostUid = hostSnapshot.data()?.firebaseUid;
+
+    if (
+      !hostUid ||
+      !identities.has(call.userId) ||
+      !identities.has(hostUid)
+    ) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "Both the customer and assigned host must join the call before the timer starts.",
+      });
+    }
+
+    const { url } = getLiveKitConfig();
+
+    const startedCall = await startCall(
+      callId,
+      roomName,
+      url
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Call started.",
+      call: startedCall,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/*
+ * POST /api/livekit/end
+ *
+ * Body: { "callId": "...", "reason": "user_ended" }
+ *
+ * Only an assigned participant can end the call.
+ */
+router.post("/end", async (req, res, next) => {
+  try {
+    const callId = getCallId(req);
+    const { call } = await getAuthorizedCall(
+      callId,
+      req.user.uid
+    );
+
+    const requestedReason =
+      typeof req.body?.reason === "string"
+        ? req.body.reason
+        : "completed";
+
+    const allowedReasons = new Set([
+      "completed",
+      "user_ended",
+      "host_ended",
+      "connection_lost",
+      "insufficient_balance",
+    ]);
+
+    if (!allowedReasons.has(requestedReason)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid call end reason.",
+      });
+    }
+
+    // A participant cannot claim that the other participant ended it.
+    const reason =
+      requestedReason === "user_ended" && call.userId !== req.user.uid
+        ? "host_ended"
+        : requestedReason;
+
+    const result = await endCall(callId, reason);
+
+    return res.status(200).json({
+      success: true,
+      message: "Call ended.",
+      call: result,
     });
   } catch (error) {
     return next(error);

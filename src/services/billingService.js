@@ -238,12 +238,19 @@ export async function finalizeCallBilling(callId) {
 
     const availableMinutes = readMinutes(user.minutes, "Customer");
 
-    // Charge only minutes available when billing is finalized.
-    // This caps the charge if the balance is lower than call duration.
-    const billableMinutes = Math.min(
-      calculatedMinutes,
-      availableMinutes
-    );
+// New calls should store the customer's balance when the
+// call timer starts. This prevents billing for more minutes
+// than were available at the start of the call.
+const minutesAtStart =
+  call.minutesAtStart === undefined
+    ? availableMinutes // Compatibility with older call records.
+    : readMinutes(call.minutesAtStart, "Call-start customer");
+
+const billableMinutes = Math.min(
+  calculatedMinutes,
+  minutesAtStart,
+  availableMinutes
+);
 
     const customerChargeCents = moneyToCents(
       billableMinutes * SA_LIVE_PRICING.customerPricePerMinute
