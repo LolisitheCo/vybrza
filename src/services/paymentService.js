@@ -283,6 +283,7 @@ export function getPaymentPackage(packageId) {
 // CREATE PENDING PAYMENT
 // ============================================================
 
+
 export async function createPaymentRecord({
   userId,
   reference,
@@ -300,6 +301,10 @@ export async function createPaymentRecord({
 
   const normalizedEmail = validateEmail(email);
 
+  if (!normalizedEmail) {
+    throw new Error("A valid payment email is required.");
+  }
+
   const amountCents = toCentsFromRand(
     paymentPackage.amount,
     "Package amount"
@@ -309,20 +314,38 @@ export async function createPaymentRecord({
   const paymentRef = paymentsCollection.doc(reference);
 
   await db.runTransaction(async (transaction) => {
+    // Read both documents before writing anything.
     const userSnapshot = await transaction.get(userRef);
     const paymentSnapshot = await transaction.get(paymentRef);
-
-    if (!userSnapshot.exists) {
-      throw new Error(
-        `User account was not found for user ID: ${userId}.`
-      );
-    }
 
     if (paymentSnapshot.exists) {
       throw new Error("Payment reference already exists.");
     }
 
     const now = new Date();
+
+    if (!userSnapshot.exists) {
+      // This ID must be the authenticated Firebase UID
+      // supplied by the website's verified backend middleware.
+      transaction.create(userRef, {
+        uid: userId,
+        email: normalizedEmail,
+        paymentEmail: normalizedEmail,
+        minutes: 0,
+        role: "user",
+        verificationStatus: "pending",
+        activeCallId: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+    } else {
+      // Keep an existing website user's details and balance.
+      transaction.update(userRef, {
+        email: userSnapshot.get("email") || normalizedEmail,
+        paymentEmail: normalizedEmail,
+        updatedAt: now,
+      });
+    }
 
     transaction.create(paymentRef, {
       userId,
@@ -348,6 +371,7 @@ export async function createPaymentRecord({
     status: "pending",
   };
 }
+
 
 // ============================================================
 // GET PAYMENT BY REFERENCE
