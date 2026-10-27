@@ -1,7 +1,11 @@
 
 import express from "express";
 
-import { verifyFirebaseToken } from "../middleware/authMiddleware.js";
+import {
+  verifyFirebaseToken,
+  requireVerifiedEmail,
+} from "../middleware/authMiddleware.js";
+
 import { matchUserToHost } from "../services/matchingService.js";
 
 const router = express.Router();
@@ -12,11 +16,13 @@ router.use(verifyFirebaseToken);
 /*
  * POST /api/customer-calls/match
  *
- * Matches the authenticated customer with an available host.
- * The customer's UID comes from the verified Firebase token,
- * never from a UID supplied in the request body.
+ * Requires:
+ * 1. A valid Firebase ID token.
+ * 2. A verified Firebase Authentication email.
+ *
+ * Customer identity comes exclusively from the verified token.
  */
-router.post("/match", async (req, res, next) => {
+router.post("/match", requireVerifiedEmail, async (req, res, next) => {
   try {
     const userId = req.user.uid;
 

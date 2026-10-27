@@ -102,13 +102,8 @@ function validateUserForMatching(user) {
     throw makeError("User not found.", 404);
   }
 
-  // Email verification replaces the old admin-approval requirement.
-  if (user.emailVerified !== true) {
-    throw makeError(
-      "Please verify your email address before starting a call.",
-      403
-    );
-  }
+  // Email verification is enforced by requireVerifiedEmail
+  // using the verified Firebase Authentication token.
 
   if (!hasPaidMinutes(user)) {
     throw makeError(
