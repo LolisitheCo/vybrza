@@ -11,6 +11,7 @@ import customerCallRoutes from "./routes/customerCallRoutes.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
 import adminManagementRoutes from "./routes/adminManagementRoutes.js";
 import adminWithdrawalRoutes from "./routes/adminWithdrawalRoutes.js";
+import livekitWebhookRoutes from "./routes/livekitWebhookRoutes.js";
 
 const app = express();
 const PORT = Number(process.env.PORT) || 5000;
@@ -177,6 +178,7 @@ app.use("/api/admin", adminManagementRoutes);
 app.use("/api/admin/withdrawals", adminWithdrawalRoutes);
 app.use("/api/calls", callRoutes);
 app.use("/api/livekit", livekitRoutes);
+app.use("/api/livekit", livekitWebhookRoutes);
 
 // ------------------------------------------------------------
 // UNKNOWN ENDPOINTS
