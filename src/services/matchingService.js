@@ -1,4 +1,3 @@
-
 import { db } from "../config/firebase.js";
 
 const usersCollection = db.collection("users");
@@ -61,7 +60,11 @@ function timestampToMilliseconds(value) {
 
 function isHostAvailable(host) {
   if (!host || host.status !== "active") return false;
-  if (typeof host.firebaseUid !== "string" || !host.firebaseUid.trim()) {
+
+  if (
+    typeof host.firebaseUid !== "string" ||
+    !host.firebaseUid.trim()
+  ) {
     return false;
   }
 
@@ -84,14 +87,25 @@ function hasPaidMinutes(user) {
   return user.minutes > 0;
 }
 
+/*
+|--------------------------------------------------------------------------
+| CUSTOMER ELIGIBILITY
+|--------------------------------------------------------------------------
+| Customers do NOT need manual admin approval.
+| Their email must be verified.
+| They must have paid minutes and no active call.
+|--------------------------------------------------------------------------
+*/
+
 function validateUserForMatching(user) {
   if (!user) {
     throw makeError("User not found.", 404);
   }
 
-  if (user.verificationStatus !== "approved") {
+  // Email verification replaces the old admin-approval requirement.
+  if (user.emailVerified !== true) {
     throw makeError(
-      "Your account must be approved before you can start a call.",
+      "Please verify your email address before starting a call.",
       403
     );
   }
@@ -104,15 +118,22 @@ function validateUserForMatching(user) {
   }
 
   if (user.activeCallId) {
-    throw makeError("You already have a call in progress.", 409);
+    throw makeError(
+      "You already have a call in progress.",
+      409
+    );
   }
 }
 
-/**
- * Return only fields intended for public display.
- * Never send Firebase identifiers, payout details, internal state,
- * credentials, or link-code hashes to the customer.
- */
+/*
+|--------------------------------------------------------------------------
+| SAFE PUBLIC HOST DATA
+|--------------------------------------------------------------------------
+| Never expose Firebase identifiers, payout details, credentials,
+| private internal state, or link-code hashes to customers.
+|--------------------------------------------------------------------------
+*/
+
 function toSafeHost(hostId, host) {
   const safeHost = { id: hostId };
 
@@ -133,8 +154,10 @@ function toSafeHost(hostId, host) {
 
     if (
       typeof value === "string" ||
-      (Array.isArray(value) &&
-        value.every((item) => typeof item === "string"))
+      (
+        Array.isArray(value) &&
+        value.every((item) => typeof item === "string")
+      )
     ) {
       safeHost[field] = value;
     }
@@ -145,9 +168,15 @@ function toSafeHost(hostId, host) {
 
 /*
 |--------------------------------------------------------------------------
-| MATCH USER TO HOST
+| MATCH CUSTOMER TO HOST
 |--------------------------------------------------------------------------
-| Creates a matched call and atomically reserves the customer and host.
+| This function:
+| - Requires a verified customer email.
+| - Requires available paid minutes.
+| - Prevents multiple active calls for the same customer.
+| - Selects an active host with a recent heartbeat.
+| - Reserves the customer and host atomically.
+| - Creates a callSessions document.
 |
 | This function does NOT:
 | - Add free minutes.
@@ -166,7 +195,7 @@ export async function matchUserToHost(userId) {
 
   /*
   |--------------------------------------------------------------------------
-  | LOAD HOST CANDIDATES
+  | LOAD ACTIVE HOST CANDIDATES
   |--------------------------------------------------------------------------
   */
 
@@ -206,8 +235,8 @@ export async function matchUserToHost(userId) {
   |--------------------------------------------------------------------------
   | ATOMIC RESERVATION
   |--------------------------------------------------------------------------
-  | Candidate availability can change after discovery, so the user and host
-  | are re-read and checked within each transaction.
+  | Recheck customer eligibility and host availability inside the
+  | transaction because either record may have changed since discovery.
   |--------------------------------------------------------------------------
   */
 
@@ -216,7 +245,7 @@ export async function matchUserToHost(userId) {
     const callRef = callsCollection.doc();
 
     const result = await db.runTransaction(async (transaction) => {
-      // Read all documents before making any transaction writes.
+      // Read all documents before writing any documents.
       const [userSnapshot, hostSnapshot] = await Promise.all([
         transaction.get(userRef),
         transaction.get(hostRef),
@@ -245,7 +274,7 @@ export async function matchUserToHost(userId) {
         };
       }
 
-      // Recheck the current heartbeat inside the transaction.
+      // Recheck the host's heartbeat immediately before reservation.
       const lastSeenMs = timestampToMilliseconds(host.lastSeenAt);
       const ageMs = Date.now() - lastSeenMs;
 
@@ -264,9 +293,9 @@ export async function matchUserToHost(userId) {
 
       /*
        * Keep this schema aligned with callService.js and billingService.js.
-       * Money values are stored in both cents (integer arithmetic) and
-       * currency units for display/compatibility.
+       * Monetary values are stored in cents and currency units.
        */
+
       const callData = {
         userId: normalizedUserId,
         hostId: hostRef.id,
@@ -336,7 +365,7 @@ export async function matchUserToHost(userId) {
       };
     }
 
-    // The host became unavailable; try the next candidate.
+    // This host became unavailable, so try the next candidate.
   }
 
   return {
