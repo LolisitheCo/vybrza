@@ -3,29 +3,39 @@ import { db } from "../config/firebase.js";
 
 const usersCollection = db.collection("users");
 
-// ============================================================
-// VALIDATION HELPERS
-// ============================================================
+const VALID_UID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+const MAX_EMAIL_LENGTH = 254;
+
+/*
+|--------------------------------------------------------------------------
+| VALIDATION HELPERS
+|--------------------------------------------------------------------------
+*/
+
+function makeError(message, status = 400) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
 
 function requireUserId(userId) {
   if (
     typeof userId !== "string" ||
     !userId.trim() ||
-    userId.includes("/") ||
-    userId.includes("\0") ||
-    userId.length > 128
+    userId.trim().length > 128 ||
+    !VALID_UID_PATTERN.test(userId.trim())
   ) {
-    throw new Error("A valid Firebase user ID is required.");
+    throw makeError("A valid Firebase user ID is required.");
   }
 
   return userId.trim();
 }
 
 function normalizeMinutes(value) {
-  const minutes = Number(value ?? 0);
+  const minutes = value ?? 0;
 
   if (!Number.isSafeInteger(minutes) || minutes < 0) {
-    throw new Error("Invalid user minute balance.");
+    throw makeError("Invalid user minute balance.", 500);
   }
 
   return minutes;
@@ -33,16 +43,16 @@ function normalizeMinutes(value) {
 
 function normalizeEmail(email) {
   if (typeof email !== "string") {
-    throw new Error("A valid email address is required.");
+    throw makeError("A valid email address is required.");
   }
 
   const normalized = email.trim().toLowerCase();
 
   if (
-    normalized.length > 254 ||
+    normalized.length > MAX_EMAIL_LENGTH ||
     !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)
   ) {
-    throw new Error("A valid email address is required.");
+    throw makeError("A valid email address is required.");
   }
 
   return normalized;
@@ -52,7 +62,7 @@ function normalizeGmail(email) {
   const normalized = normalizeEmail(email);
 
   if (!/^[a-z0-9._%+-]+@gmail\.com$/i.test(normalized)) {
-    throw new Error(
+    throw makeError(
       "Please use a valid Gmail address ending in @gmail.com."
     );
   }
@@ -61,42 +71,77 @@ function normalizeGmail(email) {
 }
 
 function toUser(doc) {
+  if (!doc?.exists) return null;
+
   return {
     id: doc.id,
     ...doc.data(),
   };
 }
 
-// ============================================================
-// GET WEBSITE USER BY FIREBASE UID
-// ============================================================
+function getFirebaseEmail(firebaseUser) {
+  if (
+    typeof firebaseUser?.email !== "string" ||
+    !firebaseUser.email.trim()
+  ) {
+    return null;
+  }
+
+  try {
+    return normalizeEmail(firebaseUser.email);
+  } catch {
+    return null;
+  }
+}
+
+function getTimestampMillis(value) {
+  if (value && typeof value.toMillis === "function") {
+    return value.toMillis();
+  }
+
+  if (value && typeof value.toDate === "function") {
+    return value.toDate().getTime();
+  }
+
+  if (value instanceof Date) {
+    return value.getTime();
+  }
+
+  return 0;
+}
+
+/*
+|--------------------------------------------------------------------------
+| GET WEBSITE USER BY FIREBASE UID
+|--------------------------------------------------------------------------
+*/
 
 export async function getUserById(userId) {
   const uid = requireUserId(userId);
   const snapshot = await usersCollection.doc(uid).get();
 
-  if (!snapshot.exists) {
-    return null;
-  }
-
   return toUser(snapshot);
 }
 
-// Alias for services that use this function name.
 export async function getUserByUid(uid) {
   return getUserById(uid);
 }
 
-// ============================================================
-// GET OR CREATE WEBSITE USER
-// ============================================================
-// Call only with a UID obtained from verified Firebase
-// Authentication middleware. Never use a body-supplied UID.
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| GET OR CREATE WEBSITE USER
+|--------------------------------------------------------------------------
+| Call with an identity obtained from verified Firebase authentication.
+| New accounts are NOT considered verification requests until submitted.
+|--------------------------------------------------------------------------
+*/
 
 export async function getOrCreateUser(firebaseUser) {
   if (!firebaseUser || typeof firebaseUser !== "object") {
-    throw new Error("An authenticated Firebase user is required.");
+    throw makeError(
+      "An authenticated Firebase user is required.",
+      401
+    );
   }
 
   const uid = requireUserId(firebaseUser.uid);
@@ -106,43 +151,48 @@ export async function getOrCreateUser(firebaseUser) {
     const snapshot = await transaction.get(userRef);
 
     if (snapshot.exists) {
+      // Never overwrite balances, verification, role, or account state.
       return toUser(snapshot);
     }
 
-    const email =
-      typeof firebaseUser.email === "string"
-        ? firebaseUser.email.trim().toLowerCase()
-        : null;
-
+    const email = getFirebaseEmail(firebaseUser);
     const now = new Date();
 
     const displayName =
       (typeof firebaseUser.displayName === "string"
-        ? firebaseUser.displayName.trim()
+        ? firebaseUser.displayName.trim().slice(0, 100)
         : "") || "SA LIVE User";
+
+    const photoURL =
+      typeof firebaseUser.photoURL === "string" &&
+      firebaseUser.photoURL.trim()
+        ? firebaseUser.photoURL.trim().slice(0, 2048)
+        : null;
 
     const userData = {
       uid,
       email,
-      paymentEmail: email,
+      paymentEmail: null,
+
       profile: {
         displayName,
         bio: "",
-        photoURL:
-          typeof firebaseUser.photoURL === "string"
-            ? firebaseUser.photoURL
-            : null,
+        photoURL,
       },
-      verificationStatus: "pending",
+
+      verificationStatus: "not_submitted",
+
       verification: {
         submittedAt: null,
         reviewedAt: null,
         reviewedBy: null,
         rejectionReason: null,
       },
+
       minutes: 0,
       activeCallId: null,
       role: "user",
+
       createdAt: now,
       updatedAt: now,
     };
@@ -156,9 +206,14 @@ export async function getOrCreateUser(firebaseUser) {
   });
 }
 
-// ============================================================
-// SUBMIT VERIFICATION
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| SUBMIT VERIFICATION REQUEST
+|--------------------------------------------------------------------------
+| The route must authenticate the user and pass their verified UID.
+| The request is stored in users/{uid} for the admin panel to review.
+|--------------------------------------------------------------------------
+*/
 
 export async function submitVerification(userId, email) {
   const uid = requireUserId(userId);
@@ -169,7 +224,7 @@ export async function submitVerification(userId, email) {
     const snapshot = await transaction.get(userRef);
 
     if (!snapshot.exists) {
-      throw new Error("User account not found.");
+      throw makeError("User account not found.", 404);
     }
 
     const user = snapshot.data();
@@ -183,15 +238,18 @@ export async function submitVerification(userId, email) {
       };
     }
 
+    // A new submission or resubmission requires admin review.
     const now = new Date();
 
     transaction.update(userRef, {
       paymentEmail: normalizedEmail,
       verificationStatus: "pending",
+
       "verification.submittedAt": now,
       "verification.reviewedAt": null,
       "verification.reviewedBy": null,
       "verification.rejectionReason": null,
+
       updatedAt: now,
     });
 
@@ -204,9 +262,14 @@ export async function submitVerification(userId, email) {
   });
 }
 
-// ============================================================
-// APPROVE VERIFICATION
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| ADMIN: APPROVE VERIFICATION
+|--------------------------------------------------------------------------
+| The calling controller must enforce requireAdmin and pass the
+| authenticated administrator's Firebase UID.
+|--------------------------------------------------------------------------
+*/
 
 export async function approveVerification(userId, adminId) {
   const uid = requireUserId(userId);
@@ -217,7 +280,7 @@ export async function approveVerification(userId, adminId) {
     const snapshot = await transaction.get(userRef);
 
     if (!snapshot.exists) {
-      throw new Error("User account not found.");
+      throw makeError("User account not found.", 404);
     }
 
     const user = snapshot.data();
@@ -231,9 +294,24 @@ export async function approveVerification(userId, adminId) {
       };
     }
 
+    if (user.verificationStatus !== "pending") {
+      throw makeError(
+        "This user has no pending verification request.",
+        409
+      );
+    }
+
+    if (!user.verification?.submittedAt) {
+      throw makeError(
+        "Cannot approve a verification request that was not submitted.",
+        409
+      );
+    }
+
     if (!user.paymentEmail) {
-      throw new Error(
-        "Cannot approve verification without a saved payment email."
+      throw makeError(
+        "Cannot approve verification without a saved payment email.",
+        409
       );
     }
 
@@ -257,9 +335,11 @@ export async function approveVerification(userId, adminId) {
   });
 }
 
-// ============================================================
-// REJECT VERIFICATION
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| ADMIN: REJECT VERIFICATION
+|--------------------------------------------------------------------------
+*/
 
 export async function rejectVerification(
   userId,
@@ -270,21 +350,35 @@ export async function rejectVerification(
   const reviewer = requireUserId(adminId);
 
   if (typeof reason !== "string" || !reason.trim()) {
-    throw new Error("A rejection reason is required.");
+    throw makeError("A rejection reason is required.");
   }
 
+  const normalizedReason = reason.trim().slice(0, 1000);
   const userRef = usersCollection.doc(uid);
 
   return db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(userRef);
 
     if (!snapshot.exists) {
-      throw new Error("User account not found.");
+      throw makeError("User account not found.", 404);
     }
 
-    if (snapshot.data().verificationStatus === "approved") {
-      throw new Error(
-        "An approved user's verification cannot be rejected directly."
+    const user = snapshot.data();
+
+    if (user.verificationStatus === "approved") {
+      throw makeError(
+        "An approved user's verification cannot be rejected directly.",
+        409
+      );
+    }
+
+    if (
+      user.verificationStatus !== "pending" ||
+      !user.verification?.submittedAt
+    ) {
+      throw makeError(
+        "This user has no pending verification request.",
+        409
       );
     }
 
@@ -294,7 +388,7 @@ export async function rejectVerification(
       verificationStatus: "rejected",
       "verification.reviewedAt": now,
       "verification.reviewedBy": reviewer,
-      "verification.rejectionReason": reason.trim(),
+      "verification.rejectionReason": normalizedReason,
       updatedAt: now,
     });
 
@@ -305,58 +399,69 @@ export async function rejectVerification(
   });
 }
 
-// ============================================================
-// GET PENDING USERS
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| ADMIN: GET PENDING VERIFICATION REQUESTS
+|--------------------------------------------------------------------------
+| Only submitted requests are returned.
+| The calling controller must enforce requireAdmin.
+|--------------------------------------------------------------------------
+*/
 
 export async function getPendingUsers() {
   const snapshot = await usersCollection
     .where("verificationStatus", "==", "pending")
     .get();
 
-  const users = snapshot.docs.map(toUser);
+  return snapshot.docs
+    .map(toUser)
+    .filter((user) => Boolean(user?.verification?.submittedAt))
+    .sort((a, b) => {
+      const aTime = getTimestampMillis(
+        a.verification?.submittedAt
+      );
 
-  function timestamp(value) {
-    if (value?.toMillis) return value.toMillis();
-    if (value instanceof Date) return value.getTime();
-    return 0;
-  }
+      const bTime = getTimestampMillis(
+        b.verification?.submittedAt
+      );
 
-  users.sort(
-    (a, b) =>
-      timestamp(a.verification?.submittedAt || a.createdAt) -
-      timestamp(b.verification?.submittedAt || b.createdAt)
-  );
-
-  return users;
+      return aTime - bTime;
+    });
 }
 
-// ============================================================
-// GET USER MINUTES
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| GET USER MINUTES
+|--------------------------------------------------------------------------
+*/
 
 export async function getUserMinutes(userId) {
   const uid = requireUserId(userId);
   const snapshot = await usersCollection.doc(uid).get();
 
   if (!snapshot.exists) {
-    throw new Error("User account not found.");
+    throw makeError("User account not found.", 404);
   }
 
   return normalizeMinutes(snapshot.data().minutes);
 }
 
-// ============================================================
-// ADD MINUTES
-// Only verified payment processing should call this function.
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| ADD MINUTES
+|--------------------------------------------------------------------------
+| Only verified, deduplicated payment processing should call this.
+| This function is not idempotent by itself.
+|--------------------------------------------------------------------------
+*/
 
 export async function addMinutes(userId, minutes) {
   const uid = requireUserId(userId);
-  const amount = Number(minutes);
 
-  if (!Number.isSafeInteger(amount) || amount <= 0) {
-    throw new Error("Minutes to add must be a positive whole number.");
+  if (!Number.isSafeInteger(minutes) || minutes <= 0) {
+    throw makeError(
+      "Minutes to add must be a positive whole number."
+    );
   }
 
   const userRef = usersCollection.doc(uid);
@@ -365,14 +470,26 @@ export async function addMinutes(userId, minutes) {
     const snapshot = await transaction.get(userRef);
 
     if (!snapshot.exists) {
-      throw new Error("User account not found.");
+      throw makeError("User account not found.", 404);
     }
 
-    const current = normalizeMinutes(snapshot.data().minutes);
-    const updated = current + amount;
+    const user = snapshot.data();
+
+    if (user.verificationStatus !== "approved") {
+      throw makeError(
+        "User verification must be approved before minutes can be credited.",
+        403
+      );
+    }
+
+    const current = normalizeMinutes(user.minutes);
+    const updated = current + minutes;
 
     if (!Number.isSafeInteger(updated)) {
-      throw new Error("The resulting minute balance is invalid.");
+      throw makeError(
+        "The resulting minute balance is invalid.",
+        500
+      );
     }
 
     transaction.update(userRef, {
@@ -384,16 +501,22 @@ export async function addMinutes(userId, minutes) {
   });
 }
 
-// ============================================================
-// DEDUCT MINUTES
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| DEDUCT MINUTES
+|--------------------------------------------------------------------------
+| Call billingService.js for call billing so balances and earnings are
+| updated together in one Firestore transaction.
+|--------------------------------------------------------------------------
+*/
 
 export async function deductMinutes(userId, minutes) {
   const uid = requireUserId(userId);
-  const amount = Number(minutes);
 
-  if (!Number.isSafeInteger(amount) || amount <= 0) {
-    throw new Error("Minutes to deduct must be a positive whole number.");
+  if (!Number.isSafeInteger(minutes) || minutes <= 0) {
+    throw makeError(
+      "Minutes to deduct must be a positive whole number."
+    );
   }
 
   const userRef = usersCollection.doc(uid);
@@ -402,16 +525,16 @@ export async function deductMinutes(userId, minutes) {
     const snapshot = await transaction.get(userRef);
 
     if (!snapshot.exists) {
-      throw new Error("User account not found.");
+      throw makeError("User account not found.", 404);
     }
 
     const current = normalizeMinutes(snapshot.data().minutes);
 
-    if (current < amount) {
-      throw new Error("Insufficient available minutes.");
+    if (current < minutes) {
+      throw makeError("Insufficient available minutes.", 409);
     }
 
-    const updated = current - amount;
+    const updated = current - minutes;
 
     transaction.update(userRef, {
       minutes: updated,
@@ -422,9 +545,11 @@ export async function deductMinutes(userId, minutes) {
   });
 }
 
-// ============================================================
-// UPDATE PAYMENT EMAIL
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| UPDATE PAYMENT EMAIL
+|--------------------------------------------------------------------------
+*/
 
 export async function updateUserPaymentEmail(userId, email) {
   const uid = requireUserId(userId);
@@ -435,7 +560,7 @@ export async function updateUserPaymentEmail(userId, email) {
     const snapshot = await transaction.get(userRef);
 
     if (!snapshot.exists) {
-      throw new Error("User account not found.");
+      throw makeError("User account not found.", 404);
     }
 
     transaction.update(userRef, {
@@ -450,47 +575,53 @@ export async function updateUserPaymentEmail(userId, email) {
   };
 }
 
-// ============================================================
-// GET PAYMENT EMAIL
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| GET PAYMENT EMAIL
+|--------------------------------------------------------------------------
+*/
 
 export async function getUserPaymentEmail(userId) {
   const uid = requireUserId(userId);
   const snapshot = await usersCollection.doc(uid).get();
 
   if (!snapshot.exists) {
-    throw new Error("User account not found.");
+    throw makeError("User account not found.", 404);
   }
 
   const user = snapshot.data();
   const email = user.paymentEmail || user.email || null;
 
-  if (!email) {
-    return null;
-  }
+  if (!email) return null;
 
   return normalizeGmail(email);
 }
 
-// ============================================================
-// SET PENDING PAYMENT PACKAGE
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| SET PENDING PAYMENT PACKAGE
+|--------------------------------------------------------------------------
+*/
 
 export async function setPendingPaymentPackage(userId, packageId) {
   const uid = requireUserId(userId);
 
-  if (typeof packageId !== "string" || !packageId.trim()) {
-    throw new Error("A valid package ID is required.");
+  if (
+    typeof packageId !== "string" ||
+    !packageId.trim() ||
+    packageId.trim().length > 100
+  ) {
+    throw makeError("A valid package ID is required.");
   }
 
-  const userRef = usersCollection.doc(uid);
   const normalizedPackageId = packageId.trim();
+  const userRef = usersCollection.doc(uid);
 
   await db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(userRef);
 
     if (!snapshot.exists) {
-      throw new Error("User account not found.");
+      throw makeError("User account not found.", 404);
     }
 
     transaction.update(userRef, {
@@ -505,9 +636,11 @@ export async function setPendingPaymentPackage(userId, packageId) {
   };
 }
 
-// ============================================================
-// CLEAR PENDING PAYMENT
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| CLEAR PENDING PAYMENT
+|--------------------------------------------------------------------------
+*/
 
 export async function clearPendingPayment(userId) {
   const uid = requireUserId(userId);
@@ -517,7 +650,7 @@ export async function clearPendingPayment(userId) {
     const snapshot = await transaction.get(userRef);
 
     if (!snapshot.exists) {
-      throw new Error("User account not found.");
+      throw makeError("User account not found.", 404);
     }
 
     transaction.update(userRef, {

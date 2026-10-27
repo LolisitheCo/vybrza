@@ -6,6 +6,7 @@ const hostsCollection = db.collection("hosts");
 const callsCollection = db.collection("callSessions");
 
 const HOST_TIMEOUT_MS = 45_000;
+const VALID_ID_PATTERN = /^[A-Za-z0-9_-]{1,150}$/;
 
 /*
 |--------------------------------------------------------------------------
@@ -13,50 +14,62 @@ const HOST_TIMEOUT_MS = 45_000;
 |--------------------------------------------------------------------------
 */
 
+function makeError(message, status = 400) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+function validateId(value, fieldName) {
+  if (
+    typeof value !== "string" ||
+    !value.trim() ||
+    value.trim().length > 150 ||
+    !VALID_ID_PATTERN.test(value.trim())
+  ) {
+    throw makeError(`A valid ${fieldName} is required.`, 400);
+  }
+
+  return value.trim();
+}
+
 function timestampToMilliseconds(value) {
-  if (!value) {
+  if (!value) return NaN;
+
+  try {
+    if (typeof value.toMillis === "function") {
+      return value.toMillis();
+    }
+
+    if (typeof value.toDate === "function") {
+      return value.toDate().getTime();
+    }
+
+    if (value instanceof Date) {
+      return value.getTime();
+    }
+
+    if (typeof value === "string" || typeof value === "number") {
+      return new Date(value).getTime();
+    }
+  } catch {
     return NaN;
-  }
-
-  if (typeof value.toMillis === "function") {
-    return value.toMillis();
-  }
-
-  if (typeof value.toDate === "function") {
-    return value.toDate().getTime();
-  }
-
-  if (value instanceof Date) {
-    return value.getTime();
-  }
-
-  if (typeof value === "string" || typeof value === "number") {
-    return new Date(value).getTime();
   }
 
   return NaN;
 }
 
 function isHostAvailable(host) {
-  if (!host || host.status !== "active") {
+  if (!host || host.status !== "active") return false;
+  if (typeof host.firebaseUid !== "string" || !host.firebaseUid.trim()) {
     return false;
   }
 
-  if (!host.firebaseUid) {
-    return false;
-  }
+  if (host.activeCallId) return false;
 
-  if (host.activeCallId) {
-    return false;
-  }
+  const lastSeenMs = timestampToMilliseconds(host.lastSeenAt);
 
-  const lastSeenMs = timestampToMilliseconds(
-    host.lastSeenAt
-  );
-
-  if (!Number.isFinite(lastSeenMs)) {
-    return false;
-  }
+  if (!Number.isFinite(lastSeenMs)) return false;
 
   const ageMs = Date.now() - lastSeenMs;
 
@@ -64,61 +77,91 @@ function isHostAvailable(host) {
 }
 
 function hasPaidMinutes(user) {
-  const minutes = Number(user.minutes);
+  if (!user || !Number.isSafeInteger(user.minutes)) {
+    return false;
+  }
 
-  return (
-    Number.isFinite(minutes) &&
-    minutes > 0
-  );
+  return user.minutes > 0;
 }
 
 function validateUserForMatching(user) {
+  if (!user) {
+    throw makeError("User not found.", 404);
+  }
+
   if (user.verificationStatus !== "approved") {
-    throw new Error(
-      "Your account must be approved before you can start a call."
+    throw makeError(
+      "Your account must be approved before you can start a call.",
+      403
     );
   }
 
   if (!hasPaidMinutes(user)) {
-    throw new Error(
-      "You have no available minutes. Please buy minutes before starting a call."
+    throw makeError(
+      "You have no available minutes. Please buy minutes before starting a call.",
+      409
     );
   }
 
   if (user.activeCallId) {
-    throw new Error(
-      "User already has an active call."
-    );
+    throw makeError("You already have a call in progress.", 409);
   }
+}
+
+/**
+ * Return only fields intended for public display.
+ * Never send Firebase identifiers, payout details, internal state,
+ * credentials, or link-code hashes to the customer.
+ */
+function toSafeHost(hostId, host) {
+  const safeHost = { id: hostId };
+
+  const publicFields = [
+    "displayName",
+    "name",
+    "bio",
+    "photoURL",
+    "profileImage",
+    "profilePicture",
+    "avatarUrl",
+    "language",
+    "languages",
+  ];
+
+  for (const field of publicFields) {
+    const value = host[field];
+
+    if (
+      typeof value === "string" ||
+      (Array.isArray(value) &&
+        value.every((item) => typeof item === "string"))
+    ) {
+      safeHost[field] = value;
+    }
+  }
+
+  return safeHost;
 }
 
 /*
 |--------------------------------------------------------------------------
 | MATCH USER TO HOST
 |--------------------------------------------------------------------------
-| This function reserves a host and creates a call session.
+| Creates a matched call and atomically reserves the customer and host.
 |
-| It does NOT:
-| - Credit free minutes.
+| This function does NOT:
+| - Add free minutes.
 | - Deduct customer minutes.
-| - Start a billable timer.
-| - Generate a video-room URL.
+| - Start the billable timer.
+| - Create or join a LiveKit room.
 | - Calculate host earnings.
 |
-| Those operations must be handled by the relevant trusted services.
+| Those operations belong to other trusted backend services.
 |--------------------------------------------------------------------------
 */
 
 export async function matchUserToHost(userId) {
-  if (
-    typeof userId !== "string" ||
-    !userId.trim() ||
-    userId.length > 256
-  ) {
-    throw new Error("A valid user ID is required.");
-  }
-
-  const normalizedUserId = userId.trim();
+  const normalizedUserId = validateId(userId, "user ID");
   const userRef = usersCollection.doc(normalizedUserId);
 
   /*
@@ -146,7 +189,7 @@ export async function matchUserToHost(userId) {
       id: doc.id,
       ...doc.data(),
     }))
-    .filter(isHostAvailable)
+    .filter((host) => isHostAvailable(host))
     .sort((a, b) => a.id.localeCompare(b.id));
 
   if (candidates.length === 0) {
@@ -161,10 +204,10 @@ export async function matchUserToHost(userId) {
 
   /*
   |--------------------------------------------------------------------------
-  | ATTEMPT ATOMIC RESERVATION
+  | ATOMIC RESERVATION
   |--------------------------------------------------------------------------
-  | Availability can change after candidate discovery, so all critical
-  | conditions are checked again inside each transaction.
+  | Candidate availability can change after discovery, so the user and host
+  | are re-read and checked within each transaction.
   |--------------------------------------------------------------------------
   */
 
@@ -172,131 +215,128 @@ export async function matchUserToHost(userId) {
     const hostRef = hostsCollection.doc(candidate.id);
     const callRef = callsCollection.doc();
 
-    try {
-      const result = await db.runTransaction(
-        async (transaction) => {
-          /*
-           * Read every document before performing writes.
-           */
-          const [userSnapshot, hostSnapshot] =
-            await Promise.all([
-              transaction.get(userRef),
-              transaction.get(hostRef),
-            ]);
+    const result = await db.runTransaction(async (transaction) => {
+      // Read all documents before making any transaction writes.
+      const [userSnapshot, hostSnapshot] = await Promise.all([
+        transaction.get(userRef),
+        transaction.get(hostRef),
+      ]);
 
-          if (!userSnapshot.exists) {
-            throw new Error("User not found.");
-          }
+      if (!userSnapshot.exists) {
+        throw makeError("User not found.", 404);
+      }
 
-          if (!hostSnapshot.exists) {
-            return {
-              matched: false,
-              reason: "host_unavailable",
-            };
-          }
-
-          const user = userSnapshot.data();
-          const host = hostSnapshot.data();
-
-          /*
-           * Enforce customer eligibility inside the transaction.
-           */
-          validateUserForMatching(user);
-
-          /*
-           * The host may have gone offline or been reserved by
-           * another customer since candidate discovery.
-           */
-          if (!isHostAvailable(host)) {
-            return {
-              matched: false,
-              reason: "host_unavailable",
-            };
-          }
-
-          const now = new Date();
-
-          const callData = {
-            userId: normalizedUserId,
-            hostId: hostRef.id,
-
-            status: "matched",
-
-            roomId: null,
-            roomUrl: null,
-
-            startedAt: null,
-            endedAt: null,
-
-            durationSeconds: 0,
-            minutesUsed: 0,
-
-            endReason: null,
-
-            createdAt: now,
-            updatedAt: now,
-          };
-
-          /*
-           * Reserve the host and assign the user to the call
-           * atomically with creating the call session.
-           */
-          transaction.update(hostRef, {
-            activeCallId: callRef.id,
-            updatedAt: now,
-          });
-
-          transaction.update(userRef, {
-            activeCallId: callRef.id,
-            updatedAt: now,
-          });
-
-          transaction.create(callRef, callData);
-
-          return {
-            matched: true,
-            callId: callRef.id,
-            call: callData,
-          };
-        }
-      );
-
-      if (result.matched) {
-        // Return only the host fields needed by the matching caller.
-        // Never return the private link-code hash.
-        const {
-          linkCodeHash,
-          ...safeHost
-        } = candidate;
-
+      if (!hostSnapshot.exists) {
         return {
-          matched: true,
-          host: safeHost,
-          call: {
-            id: result.callId,
-            ...result.call,
-          },
-          retry: false,
+          matched: false,
+          reason: "host_unavailable",
         };
       }
 
-      // Another customer may have claimed this host. Try the next one.
-      continue;
-    } catch (error) {
-      /*
-       * Eligibility failures must not be mistaken for a lack of hosts.
-       * Unexpected Firestore failures should be visible to the caller.
-       */
-      console.error(
-        "Host matching transaction failed:",
-        {
-          hostId: candidate.id,
-          error: error.message,
-        }
-      );
+      const user = userSnapshot.data();
+      const host = hostSnapshot.data();
 
-      throw error;
+      validateUserForMatching(user);
+
+      if (!isHostAvailable(host)) {
+        return {
+          matched: false,
+          reason: "host_unavailable",
+        };
+      }
+
+      // Recheck the current heartbeat inside the transaction.
+      const lastSeenMs = timestampToMilliseconds(host.lastSeenAt);
+      const ageMs = Date.now() - lastSeenMs;
+
+      if (
+        !Number.isFinite(lastSeenMs) ||
+        ageMs < 0 ||
+        ageMs > HOST_TIMEOUT_MS
+      ) {
+        return {
+          matched: false,
+          reason: "host_unavailable",
+        };
+      }
+
+      const now = new Date();
+
+      /*
+       * Keep this schema aligned with callService.js and billingService.js.
+       * Money values are stored in both cents (integer arithmetic) and
+       * currency units for display/compatibility.
+       */
+      const callData = {
+        userId: normalizedUserId,
+        hostId: hostRef.id,
+
+        status: "matched",
+
+        roomId: null,
+        roomUrl: null,
+
+        startedAt: null,
+        endedAt: null,
+
+        durationSeconds: 0,
+        minutesUsed: 0,
+        billableMinutes: 0,
+
+        endReason: null,
+
+        billingStatus: "pending",
+        billedAt: null,
+        billingError: null,
+
+        customerCharge: 0,
+        hostEarnings: 0,
+        saLiveRevenue: 0,
+
+        customerChargeCents: 0,
+        hostEarningsCents: 0,
+        saLiveRevenueCents: 0,
+
+        hostPayoutStatus: "pending",
+
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      // Reserve both records and create the call atomically.
+      transaction.update(hostRef, {
+        activeCallId: callRef.id,
+        updatedAt: now,
+      });
+
+      transaction.update(userRef, {
+        activeCallId: callRef.id,
+        updatedAt: now,
+      });
+
+      transaction.create(callRef, callData);
+
+      return {
+        matched: true,
+        callId: callRef.id,
+        call: callData,
+        host: toSafeHost(hostRef.id, host),
+      };
+    });
+
+    if (result.matched) {
+      return {
+        matched: true,
+        host: result.host,
+        call: {
+          id: result.callId,
+          ...result.call,
+        },
+        retry: false,
+      };
     }
+
+    // The host became unavailable; try the next candidate.
   }
 
   return {

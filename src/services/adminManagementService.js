@@ -9,6 +9,8 @@ const hosts = db.collection("hosts");
 const admins = db.collection("admins");
 const verifications = db.collection("verifications");
 const hostWithdrawals = db.collection("hostWithdrawals");
+const payments = db.collection("payments");
+const callSessions = db.collection("callSessions");
 
 function fail(status, message) {
   const error = new Error(message);
@@ -20,9 +22,9 @@ function normalizeDocumentId(value) {
   if (
     typeof value !== "string" ||
     !value.trim() ||
-    value.includes("/") ||
+    value.trim().includes("/") ||
     value.includes("\0") ||
-    value.length > 256
+    value.trim().length > 256
   ) {
     fail(400, "A valid document ID is required.");
   }
@@ -44,14 +46,12 @@ async function ensureNotAdmin(firebaseUid) {
 }
 
 async function revokeHostClaim(firebaseUid) {
-  if (!firebaseUid) return;
-
   let firebaseUser;
 
   try {
     firebaseUser = await auth.getUser(firebaseUid);
   } catch (error) {
-    if (error.code === "auth/user-not-found") {
+    if (error?.code === "auth/user-not-found") {
       return;
     }
 
@@ -65,7 +65,6 @@ async function revokeHostClaim(firebaseUid) {
     await auth.setCustomUserClaims(firebaseUid, claims);
   }
 
-  // Force refreshed authentication tokens after a role change.
   await auth.revokeRefreshTokens(firebaseUid);
 }
 
@@ -115,6 +114,45 @@ async function ensureNoPendingWithdrawals(hostId) {
   }
 }
 
+async function ensureNoActiveCalls(field, documentId) {
+  const snapshot = await callSessions
+    .where(field, "==", documentId)
+    .where("status", "in", ["matching", "matched", "active"])
+    .limit(1)
+    .get();
+
+  if (!snapshot.empty) {
+    fail(
+      409,
+      "This account has an active or pending call. Resolve it before proceeding."
+    );
+  }
+}
+
+async function ensureNoUnresolvedPayments(userId) {
+  const snapshot = await payments
+    .where("userId", "==", userId)
+    .where("status", "in", ["pending", "processing"])
+    .limit(1)
+    .get();
+
+  if (!snapshot.empty) {
+    fail(
+      409,
+      "This user has an unresolved payment. Resolve it before removing the account."
+    );
+  }
+}
+
+/*
+|--------------------------------------------------------------------------
+| REMOVE USER PROFILE
+|--------------------------------------------------------------------------
+| This intentionally does not delete payment, call, or financial records.
+| Check the live data model before enabling destructive account removal.
+|--------------------------------------------------------------------------
+*/
+
 export async function removeUserRecord(documentId) {
   const id = normalizeDocumentId(documentId);
   const userRef = users.doc(id);
@@ -125,7 +163,7 @@ export async function removeUserRecord(documentId) {
   }
 
   const user = userSnapshot.data();
-  const firebaseUid = user.firebaseUid || id;
+  const firebaseUid = user.uid || user.firebaseUid || id;
 
   if (user.role === "admin") {
     fail(409, "Administrator accounts cannot be removed here.");
@@ -139,9 +177,10 @@ export async function removeUserRecord(documentId) {
   }
 
   await ensureNotAdmin(firebaseUid);
+  await ensureNoActiveCalls("userId", id);
+  await ensureNoUnresolvedPayments(id);
 
-  // Remove the user profile and verification state only.
-  // Payment, call, and financial records are preserved.
+  // Preserve the financial/call history; remove only profile-related data.
   await deleteRelatedVerifications(id);
   await userRef.delete();
 
@@ -151,6 +190,14 @@ export async function removeUserRecord(documentId) {
     financialHistoryPreserved: true,
   };
 }
+
+/*
+|--------------------------------------------------------------------------
+| DEACTIVATE HOST
+|--------------------------------------------------------------------------
+| Preserve the host record for earnings and audit history.
+|--------------------------------------------------------------------------
+*/
 
 export async function removeHostRecord(documentId) {
   const id = normalizeDocumentId(documentId);
@@ -162,7 +209,7 @@ export async function removeHostRecord(documentId) {
   }
 
   const host = hostSnapshot.data();
-  const firebaseUid = host.firebaseUid || host.firebaseUid;
+  const firebaseUid = host.firebaseUid || host.uid;
 
   if (!firebaseUid) {
     fail(
@@ -179,18 +226,17 @@ export async function removeHostRecord(documentId) {
   }
 
   await ensureNotAdmin(firebaseUid);
+  await ensureNoActiveCalls("hostId", id);
   await ensureNoPendingWithdrawals(id);
 
-  // Revoke host privileges while preserving unrelated custom claims.
   await revokeHostClaim(firebaseUid);
 
-  // Keep the host document, application, earnings, call history,
-  // and withdrawal records for audit and financial reconciliation.
   await hostRef.set(
     {
       active: false,
       status: "inactive",
       available: false,
+      acceptingCalls: false,
       deactivatedAt: new Date(),
       deactivationReason: "Deactivated by an administrator.",
       updatedAt: new Date(),

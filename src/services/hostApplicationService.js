@@ -1,13 +1,19 @@
 
 import { db, firebaseApp } from "../config/firebase.js";
 import { getAuth } from "firebase-admin/auth";
-import { createHost } from "./hostService.js";
 
 const auth = getAuth(firebaseApp);
+
 const applications = db.collection("hostApplications");
 const hosts = db.collection("hosts");
 
 export const HOST_CONTRACT_VERSION = "1.0";
+
+/*
+|--------------------------------------------------------------------------
+| HELPERS
+|--------------------------------------------------------------------------
+*/
 
 function fail(status, message) {
   const error = new Error(message);
@@ -35,7 +41,13 @@ function normalizeString(value, field, maxLength, required = true) {
 }
 
 function normalizeUid(value) {
-  return normalizeString(value, "Firebase UID", 128);
+  const uid = normalizeString(value, "Firebase UID", 128);
+
+  if (uid.includes("/")) {
+    fail(400, "Invalid Firebase UID.");
+  }
+
+  return uid;
 }
 
 function normalizeEmail(value) {
@@ -73,6 +85,10 @@ function normalizeLanguages(value) {
       )
     ),
   ];
+
+  if (languages.length === 0) {
+    fail(400, "Please provide at least one language.");
+  }
 
   return languages;
 }
@@ -149,7 +165,7 @@ async function getVerifiedAccount(uid, email) {
   try {
     user = await auth.getUser(uid);
   } catch (error) {
-    if (error.code === "auth/user-not-found") {
+    if (error?.code === "auth/user-not-found") {
       fail(401, "Your website account could not be verified.");
     }
 
@@ -165,52 +181,71 @@ async function getVerifiedAccount(uid, email) {
   }
 
   if (user.email.toLowerCase() !== email) {
-    fail(400, "The application email must match your verified account email.");
+    fail(
+      400,
+      "The application email must match your verified account email."
+    );
   }
 
   return user;
 }
 
 async function findUsernameConflict(username, uid) {
-  const snapshot = await applications
-    .where("usernameLower", "==", username.toLowerCase())
-    .limit(10)
-    .get();
+  const usernameLower = username.toLowerCase();
 
-  const applicationConflict = snapshot.docs.some((doc) => {
-    const data = doc.data();
+  const [
+    applicationUsernameMatches,
+    hostUsernameMatches,
+    hostPublicUsernameMatches,
+  ] = await Promise.all([
+    applications
+      .where("usernameLower", "==", usernameLower)
+      .limit(20)
+      .get(),
 
-    return (
-      doc.id !== uid &&
-      data.status !== "rejected" &&
-      data.status !== "withdrawn"
-    );
-  });
+    hosts
+      .where("usernameLower", "==", usernameLower)
+      .limit(20)
+      .get(),
 
-  if (applicationConflict) {
-    fail(409, "That username is already in use.");
-  }
+    hosts
+      .where("publicUsernameLower", "==", usernameLower)
+      .limit(20)
+      .get(),
+  ]);
 
-  const hostSnapshot = await hosts
-    .where("usernameLower", "==", username.toLowerCase())
-    .limit(10)
-    .get();
+  const applicationConflict = applicationUsernameMatches.docs.some(
+    (doc) => {
+      const data = doc.data();
 
-  const hostConflict = hostSnapshot.docs.some(
-    (doc) => doc.data().firebaseUid !== uid
+      return (
+        doc.id !== uid &&
+        !["rejected", "withdrawn"].includes(data.status)
+      );
+    }
   );
 
-  if (hostConflict) {
+  const hostIds = new Set([
+    ...hostUsernameMatches.docs.map((doc) => doc.id),
+    ...hostPublicUsernameMatches.docs.map((doc) => doc.id),
+  ]);
+
+  const hostConflict = [...hostIds].some((hostId) => hostId !== uid);
+
+  if (applicationConflict || hostConflict) {
     fail(409, "That username is already in use.");
   }
 }
 
 /*
- * Website host application.
- *
- * The controller MUST pass req.user.uid from verified Firebase
- * authentication. Never trust a UID supplied by the browser body.
- */
+|--------------------------------------------------------------------------
+| SUBMIT WEBSITE HOST APPLICATION
+|--------------------------------------------------------------------------
+| The controller must pass the UID and email from verified Firebase auth.
+| Application document ID is the Firebase UID.
+|--------------------------------------------------------------------------
+*/
+
 export async function startHostApplication({
   firebaseUid,
   fullName,
@@ -232,7 +267,6 @@ export async function startHostApplication({
     firebaseUid: uid,
     fullName: normalizeString(fullName, "Full legal name", 120),
     username: normalizeUsername(username),
-    usernameLower: "",
     email: normalizedEmail,
     phoneNumber: normalizeString(phoneNumber, "Phone number", 30),
     country: normalizeString(country, "Country", 80),
@@ -263,23 +297,6 @@ export async function startHostApplication({
   await findUsernameConflict(data.username, uid);
 
   const applicationRef = applications.doc(uid);
-  const existingSnapshot = await applicationRef.get();
-
-  if (existingSnapshot.exists) {
-    const existing = existingSnapshot.data();
-
-    if (existing.status === "pending") {
-      fail(409, "Your host application is already being reviewed.");
-    }
-
-    if (existing.status === "approved" || existing.status === "approving") {
-      fail(409, "Your host application has already been approved or is being processed.");
-    }
-
-    if (existing.status === "suspended" || existing.status === "disabled") {
-      fail(403, "Your host account is restricted. Please contact support.");
-    }
-  }
 
   const now = new Date();
 
@@ -297,24 +314,42 @@ export async function startHostApplication({
     rejectionReason: null,
   };
 
-  // Recheck status within a transaction to avoid overwriting an
-  // application that was reviewed between the earlier read and write.
   await db.runTransaction(async (transaction) => {
     const currentSnapshot = await transaction.get(applicationRef);
 
     if (currentSnapshot.exists) {
       const current = currentSnapshot.data();
 
+      if (current.status === "pending") {
+        fail(409, "Your host application is already being reviewed.");
+      }
+
       if (
-        ["pending", "approving", "approved", "suspended", "disabled"].includes(
-          current.status
-        )
+        ["approving", "approved"].includes(current.status)
       ) {
+        fail(
+          409,
+          "Your host application has already been approved or is being processed."
+        );
+      }
+
+      if (["suspended", "disabled"].includes(current.status)) {
+        fail(
+          403,
+          "Your host account is restricted. Please contact support."
+        );
+      }
+
+      if (current.status !== "rejected" && current.status !== "withdrawn") {
         fail(409, "An existing host application prevents resubmission.");
       }
+
+      // Only a rejected or withdrawn application can be resubmitted.
+      transaction.set(applicationRef, applicationData);
+      return;
     }
 
-    transaction.set(applicationRef, applicationData);
+    transaction.create(applicationRef, applicationData);
   });
 
   return {
@@ -325,9 +360,13 @@ export async function startHostApplication({
 }
 
 /*
- * Admin: list pending applications.
- * The calling controller must enforce requireAdmin.
- */
+|--------------------------------------------------------------------------
+| ADMIN: GET PENDING HOST APPLICATIONS
+|--------------------------------------------------------------------------
+| The controller must enforce requireAdmin.
+|--------------------------------------------------------------------------
+*/
+
 export async function getPendingHostApplications() {
   const snapshot = await applications
     .where("status", "==", "pending")
@@ -338,15 +377,20 @@ export async function getPendingHostApplications() {
     .sort((a, b) => {
       const first = a.submittedAt?.toMillis?.() ?? 0;
       const second = b.submittedAt?.toMillis?.() ?? 0;
+
       return first - second;
     });
 }
 
 /*
- * Admin: approve an application.
- * The calling controller must enforce requireAdmin and pass the
- * authenticated administrator's UID.
- */
+|--------------------------------------------------------------------------
+| ADMIN: APPROVE HOST APPLICATION
+|--------------------------------------------------------------------------
+| Firestore is the authoritative source of host access.
+| The application and host status are changed in one transaction.
+| The caller must enforce requireAdmin and pass the authenticated admin UID.
+|--------------------------------------------------------------------------
+*/
 
 export async function approveHostApplication(applicationId, adminUid) {
   const uid = normalizeUid(applicationId);
@@ -355,170 +399,147 @@ export async function approveHostApplication(applicationId, adminUid) {
   const applicationRef = applications.doc(uid);
   const hostRef = hosts.doc(uid);
 
-  const applicationSnapshot = await applicationRef.get();
+  const initialSnapshot = await applicationRef.get();
 
-  if (!applicationSnapshot.exists) {
+  if (!initialSnapshot.exists) {
     fail(404, "Host application not found.");
   }
 
-  const application = applicationSnapshot.data();
+  const initialApplication = initialSnapshot.data();
 
-  if (application.status === "approved") {
+  if (initialApplication.status === "approved") {
     return { id: uid, alreadyApproved: true };
   }
 
-  if (application.status !== "pending") {
+  if (initialApplication.status !== "pending") {
     fail(409, "This application is no longer pending.");
   }
 
   if (
-    application.contractAccepted !== true ||
-    !application.contractAcceptedAt ||
-    application.contractAcceptedBy !== uid ||
-    application.contractVersion !== HOST_CONTRACT_VERSION
+    initialApplication.contractAccepted !== true ||
+    !initialApplication.contractAcceptedAt ||
+    initialApplication.contractAcceptedBy !== uid ||
+    initialApplication.contractVersion !== HOST_CONTRACT_VERSION
   ) {
-    fail(409, "The application has no valid recorded contract acceptance.");
+    fail(
+      409,
+      "The application has no valid recorded contract acceptance."
+    );
   }
 
-  const email = normalizeEmail(application.email);
-  const firebaseUser = await getVerifiedAccount(uid, email);
+  const email = normalizeEmail(initialApplication.email);
+  await getVerifiedAccount(uid, email);
 
-  // Reserve the application so two admins cannot approve it at once.
-  await db.runTransaction(async (transaction) => {
-    const currentSnapshot = await transaction.get(applicationRef);
+  // Avoid granting access to a username that was claimed after submission.
+  await findUsernameConflict(initialApplication.username, uid);
 
-    if (
-      !currentSnapshot.exists ||
-      currentSnapshot.data().status !== "pending"
-    ) {
+  return db.runTransaction(async (transaction) => {
+    // Read all documents before writing anything.
+    const [applicationSnapshot, hostSnapshot] = await Promise.all([
+      transaction.get(applicationRef),
+      transaction.get(hostRef),
+    ]);
+
+    if (!applicationSnapshot.exists) {
+      fail(404, "Host application not found.");
+    }
+
+    const application = applicationSnapshot.data();
+
+    if (application.status === "approved") {
+      return { id: uid, alreadyApproved: true };
+    }
+
+    if (application.status !== "pending") {
       fail(409, "This application is no longer pending.");
     }
 
-    transaction.update(applicationRef, {
-      status: "approving",
-      updatedAt: new Date(),
-    });
-  });
-
-  let hostClaimChanged = false;
-
-  try {
-    // Create a pending host record first.
-    // This must never grant active host access by itself.
-    await createHost({
-      firebaseUid: uid,
-      username: application.username,
-      displayName: application.fullName,
-      status: "pending",
-    });
-
-    // Preserve unrelated custom claims.
-    const existingClaims = firebaseUser.customClaims || {};
-
-    if (existingClaims.host !== true) {
-      await auth.setCustomUserClaims(uid, {
-        ...existingClaims,
-        host: true,
-      });
-      hostClaimChanged = true;
+    if (
+      application.firebaseUid !== uid ||
+      application.contractAccepted !== true ||
+      application.contractAcceptedBy !== uid ||
+      application.contractVersion !== HOST_CONTRACT_VERSION
+    ) {
+      fail(409, "The application requires administrator review.");
     }
 
-    // Activate the host and approve the application atomically.
-    await db.runTransaction(async (transaction) => {
-      const currentApplication = await transaction.get(applicationRef);
-      const currentHost = await transaction.get(hostRef);
+    const username = normalizeUsername(application.username);
+    const usernameLower = username.toLowerCase();
+    const now = new Date();
+
+    if (hostSnapshot.exists) {
+      const existingHost = hostSnapshot.data();
 
       if (
-        !currentApplication.exists ||
-        currentApplication.data().status !== "approving"
-      ) {
-        fail(409, "The application approval state changed unexpectedly.");
-      }
-
-      if (!currentHost.exists) {
-        fail(409, "The host record could not be found.");
-      }
-
-      const host = currentHost.data();
-
-      if (
-        host.firebaseUid !== uid ||
-        !["pending", "active"].includes(host.status)
+        existingHost.firebaseUid !== uid ||
+        !["pending", "active"].includes(existingHost.status)
       ) {
         fail(409, "The host record requires administrator review.");
       }
 
-      const now = new Date();
-
       transaction.update(hostRef, {
+        username,
+        usernameLower,
+        publicUsername: username,
+        publicUsernameLower: usernameLower,
+        displayName: application.fullName,
+        bio: application.bio,
+        languages: application.languages,
+        role: "host",
         status: "active",
+        acceptingCalls: existingHost.acceptingCalls === true,
+        availability: Array.isArray(existingHost.availability)
+          ? existingHost.availability
+          : [],
         updatedAt: now,
       });
+    } else {
+      transaction.create(hostRef, {
+        firebaseUid: uid,
+        username,
+        usernameLower,
+        publicUsername: username,
+        publicUsernameLower: usernameLower,
+        displayName: application.fullName,
+        bio: application.bio,
+        languages: application.languages,
+        role: "host",
+        status: "active",
+        acceptingCalls: false,
+        availability: [],
+        lastSeenAt: null,
+        activeCallId: null,
+        earningsCents: 0,
+        availableBalanceCents: 0,
+        totalEarningsCents: 0,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
 
-      transaction.update(applicationRef, {
-        status: "approved",
-        reviewedAt: now,
-        reviewedBy: reviewerUid,
-        updatedAt: now,
-        rejectionReason: null,
-      });
+    transaction.update(applicationRef, {
+      status: "approved",
+      reviewedAt: now,
+      reviewedBy: reviewerUid,
+      updatedAt: now,
+      rejectionReason: null,
     });
-  } catch (error) {
-    // Restore the application to pending only if this operation
-    // still owns the "approving" state.
-    try {
-      await db.runTransaction(async (transaction) => {
-        const currentSnapshot = await transaction.get(applicationRef);
 
-        if (
-          currentSnapshot.exists &&
-          currentSnapshot.data().status === "approving"
-        ) {
-          transaction.update(applicationRef, {
-            status: "pending",
-            updatedAt: new Date(),
-          });
-        }
-      });
-    } catch (rollbackError) {
-      console.error(
-        "Could not restore pending host application:",
-        rollbackError?.code || "UNKNOWN_ERROR"
-      );
-    }
-
-    // If this attempt added the host claim, remove only that claim.
-    // Keep all unrelated custom claims.
-    if (hostClaimChanged) {
-      try {
-        const latestUser = await auth.getUser(uid);
-        const latestClaims = { ...(latestUser.customClaims || {}) };
-        delete latestClaims.host;
-
-        await auth.setCustomUserClaims(uid, latestClaims);
-      } catch (claimError) {
-        console.error(
-          "Could not roll back host custom claim:",
-          claimError?.code || "UNKNOWN_ERROR"
-        );
-      }
-    }
-
-    throw error;
-  }
-
-  return {
-    id: uid,
-    firebaseUid: uid,
-    email,
-    alreadyApproved: false,
-  };
+    return {
+      id: uid,
+      firebaseUid: uid,
+      email,
+      alreadyApproved: false,
+    };
+  });
 }
 
-
 /*
- * Admin: reject a pending application.
- */
+|--------------------------------------------------------------------------
+| ADMIN: REJECT HOST APPLICATION
+|--------------------------------------------------------------------------
+*/
+
 export async function rejectHostApplication(
   applicationId,
   adminUid,
@@ -562,8 +583,11 @@ export async function rejectHostApplication(
 }
 
 /*
- * Applicant: check their own application status.
- */
+|--------------------------------------------------------------------------
+| APPLICANT: GET OWN APPLICATION STATUS
+|--------------------------------------------------------------------------
+*/
+
 export async function getHostApplicationStatus(firebaseUid) {
   const uid = normalizeUid(firebaseUid);
   const snapshot = await applications.doc(uid).get();

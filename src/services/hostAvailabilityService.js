@@ -18,11 +18,32 @@ const DAYS = [
 
 const TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
 
+const MAX_AVAILABILITY_SLOTS = 21;
+
 /*
 |--------------------------------------------------------------------------
 | HELPERS
 |--------------------------------------------------------------------------
 */
+
+function makeError(message, status = 400) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+function validateHostId(hostId) {
+  if (
+    typeof hostId !== "string" ||
+    !hostId.trim() ||
+    hostId.trim().length > 150 ||
+    hostId.includes("/")
+  ) {
+    throw makeError("Invalid host account identifier.");
+  }
+
+  return hostId.trim();
+}
 
 function getMillis(value) {
   if (value && typeof value.toMillis === "function") {
@@ -39,7 +60,10 @@ function getMillis(value) {
 
   if (typeof value === "string" || typeof value === "number") {
     const milliseconds = new Date(value).getTime();
-    return Number.isFinite(milliseconds) ? milliseconds : NaN;
+
+    return Number.isFinite(milliseconds)
+      ? milliseconds
+      : NaN;
   }
 
   return NaN;
@@ -47,7 +71,7 @@ function getMillis(value) {
 
 function validateUsername(value) {
   if (typeof value !== "string") {
-    throw new Error("Enter a public username.");
+    throw makeError("Enter a public username.");
   }
 
   const username = value.trim();
@@ -57,7 +81,7 @@ function validateUsername(value) {
     username.length > 32 ||
     !/^[a-zA-Z0-9_]+$/.test(username)
   ) {
-    throw new Error(
+    throw makeError(
       "Username must be 3–32 characters and contain only letters, numbers, or underscores."
     );
   }
@@ -66,19 +90,26 @@ function validateUsername(value) {
 }
 
 function validateAvailability(value) {
-  if (!Array.isArray(value) || value.length > 21) {
-    throw new Error("Invalid availability schedule.");
+  if (
+    !Array.isArray(value) ||
+    value.length > MAX_AVAILABILITY_SLOTS
+  ) {
+    throw makeError("Invalid availability schedule.");
   }
 
-  return value.map((slot) => {
-    if (!slot || typeof slot !== "object" || Array.isArray(slot)) {
-      throw new Error("Invalid availability entry.");
+  const slots = value.map((slot) => {
+    if (
+      !slot ||
+      typeof slot !== "object" ||
+      Array.isArray(slot)
+    ) {
+      throw makeError("Invalid availability entry.");
     }
 
     const { day, startTime, endTime } = slot;
 
     if (!DAYS.includes(day)) {
-      throw new Error("Choose a valid day.");
+      throw makeError("Choose a valid day.");
     }
 
     if (
@@ -88,13 +119,56 @@ function validateAvailability(value) {
       !TIME_PATTERN.test(endTime) ||
       startTime >= endTime
     ) {
-      throw new Error(
+      throw makeError(
         "Each time slot must have a valid start and end time on the same day."
       );
     }
 
     return { day, startTime, endTime };
   });
+
+  // Reject duplicate and overlapping slots on the same day.
+  const slotsByDay = new Map();
+
+  for (const slot of slots) {
+    if (!slotsByDay.has(slot.day)) {
+      slotsByDay.set(slot.day, []);
+    }
+
+    slotsByDay.get(slot.day).push(slot);
+  }
+
+  for (const daySlots of slotsByDay.values()) {
+    daySlots.sort((a, b) =>
+      a.startTime.localeCompare(b.startTime)
+    );
+
+    for (let index = 1; index < daySlots.length; index += 1) {
+      if (
+        daySlots[index].startTime <
+        daySlots[index - 1].endTime
+      ) {
+        throw makeError(
+          "Availability slots on the same day cannot overlap."
+        );
+      }
+    }
+  }
+
+  return slots;
+}
+
+function sanitizeAvailability(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  try {
+    return validateAvailability(value);
+  } catch {
+    // Do not expose malformed stored schedule entries.
+    return [];
+  }
 }
 
 function getSouthAfricanDayAndTime(date = new Date()) {
@@ -128,42 +202,53 @@ function isRecentlySeen(host, nowMs) {
   return age >= 0 && age <= HOST_TIMEOUT_MS;
 }
 
-function sanitizeAvailability(value) {
-  if (!Array.isArray(value)) {
-    return [];
+function isValidSlot(slot) {
+  return Boolean(
+    slot &&
+      typeof slot === "object" &&
+      !Array.isArray(slot) &&
+      DAYS.includes(slot.day) &&
+      typeof slot.startTime === "string" &&
+      typeof slot.endTime === "string" &&
+      TIME_PATTERN.test(slot.startTime) &&
+      TIME_PATTERN.test(slot.endTime) &&
+      slot.startTime < slot.endTime
+  );
+}
+
+function isHostOnline(host, date = new Date()) {
+  if (
+    !host ||
+    !(date instanceof Date) ||
+    !Number.isFinite(date.getTime())
+  ) {
+    return false;
   }
 
-  return value
-    .filter((slot) => {
-      return (
-        slot &&
-        typeof slot === "object" &&
-        !Array.isArray(slot) &&
-        DAYS.includes(slot.day) &&
-        typeof slot.startTime === "string" &&
-        typeof slot.endTime === "string" &&
-        TIME_PATTERN.test(slot.startTime) &&
-        TIME_PATTERN.test(slot.endTime) &&
-        slot.startTime < slot.endTime
-      );
-    })
-    .map(({ day, startTime, endTime }) => ({
-      day,
-      startTime,
-      endTime,
-    }));
+  return Boolean(
+    host.status === "active" &&
+      typeof host.firebaseUid === "string" &&
+      host.firebaseUid.trim() &&
+      host.acceptingCalls === true &&
+      !host.activeCallId &&
+      isRecentlySeen(host, date.getTime()) &&
+      isWithinHostSchedule(host, date)
+  );
 }
 
 /*
 |--------------------------------------------------------------------------
 | SHARED SCHEDULE CHECK
 |--------------------------------------------------------------------------
-| All schedule times use Africa/Johannesburg.
-| Start time is inclusive; end time is exclusive.
+| Schedule times use Africa/Johannesburg.
+| Start is inclusive; end is exclusive.
 |--------------------------------------------------------------------------
 */
 
-export function isWithinHostSchedule(host, date = new Date()) {
+export function isWithinHostSchedule(
+  host,
+  date = new Date()
+) {
   if (
     !host ||
     !Array.isArray(host.availability) ||
@@ -176,15 +261,7 @@ export function isWithinHostSchedule(host, date = new Date()) {
   const { day, time } = getSouthAfricanDayAndTime(date);
 
   return host.availability.some((slot) => {
-    if (
-      !slot ||
-      slot.day !== day ||
-      typeof slot.startTime !== "string" ||
-      typeof slot.endTime !== "string" ||
-      !TIME_PATTERN.test(slot.startTime) ||
-      !TIME_PATTERN.test(slot.endTime) ||
-      slot.startTime >= slot.endTime
-    ) {
+    if (!isValidSlot(slot) || slot.day !== day) {
       return false;
     }
 
@@ -194,40 +271,22 @@ export function isWithinHostSchedule(host, date = new Date()) {
 
 /*
 |--------------------------------------------------------------------------
-| SHARED DIRECTORY ONLINE CHECK
-|--------------------------------------------------------------------------
-*/
-
-function isHostOnline(host, date = new Date()) {
-  if (!(date instanceof Date) || !Number.isFinite(date.getTime())) {
-    return false;
-  }
-
-  return Boolean(
-    host &&
-      host.status === "active" &&
-      typeof host.firebaseUid === "string" &&
-      host.firebaseUid.trim() &&
-      host.acceptingCalls === true &&
-      !host.activeCallId &&
-      isRecentlySeen(host, date.getTime()) &&
-      isWithinHostSchedule(host, date)
-  );
-}
-
-/*
-|--------------------------------------------------------------------------
 | GET HOST AVAILABILITY PROFILE
 |--------------------------------------------------------------------------
-| This profile is returned only to the authenticated host.
+| Intended for the authenticated host's own profile.
+| Route middleware must verify host ownership.
 |--------------------------------------------------------------------------
 */
 
 export async function getHostAvailabilityProfile(hostId) {
-  const snapshot = await hostsCollection.doc(hostId).get();
+  const safeHostId = validateHostId(hostId);
+
+  const snapshot = await hostsCollection
+    .doc(safeHostId)
+    .get();
 
   if (!snapshot.exists) {
-    throw new Error("Host account not found.");
+    throw makeError("Host account not found.", 404);
   }
 
   const host = snapshot.data();
@@ -237,7 +296,7 @@ export async function getHostAvailabilityProfile(hostId) {
     publicUsername: host.publicUsername || "",
     acceptingCalls: host.acceptingCalls === true,
     availability: sanitizeAvailability(host.availability),
-    accountStatus: host.status,
+    accountStatus: host.status || "unknown",
   };
 }
 
@@ -245,43 +304,65 @@ export async function getHostAvailabilityProfile(hostId) {
 |--------------------------------------------------------------------------
 | UPDATE HOST AVAILABILITY PROFILE
 |--------------------------------------------------------------------------
+| Only public username, schedule and acceptingCalls are editable here.
+| Account status, Firebase UID, earnings, and activeCallId cannot be
+| changed through this function.
+|--------------------------------------------------------------------------
 */
 
+export async function updateHostAvailabilityProfile(
+  hostId,
+  input
+) {
+  const safeHostId = validateHostId(hostId);
 
-export async function updateHostAvailabilityProfile(hostId, input) {
   if (
-    typeof hostId !== "string" ||
-    !hostId.trim() ||
     !input ||
     typeof input !== "object" ||
     Array.isArray(input)
   ) {
-    throw new Error("Invalid profile details.");
+    throw makeError("Invalid profile details.");
   }
 
-  const publicUsername = validateUsername(input.publicUsername);
+  const publicUsername = validateUsername(
+    input.publicUsername
+  );
+
   const usernameLower = publicUsername.toLowerCase();
-  const availability = validateAvailability(input.availability);
+
+  const availability = validateAvailability(
+    input.availability
+  );
 
   if (typeof input.acceptingCalls !== "boolean") {
-    throw new Error("Choose whether you want to accept calls.");
+    throw makeError(
+      "Choose whether you want to accept calls."
+    );
   }
 
-  const hostRef = hostsCollection.doc(hostId.trim());
+  const hostRef = hostsCollection.doc(safeHostId);
 
   await db.runTransaction(async (transaction) => {
-    const snapshot = await transaction.get(hostRef);
+    const hostSnapshot = await transaction.get(hostRef);
 
-    if (!snapshot.exists) {
-      throw new Error("Host account not found.");
+    if (!hostSnapshot.exists) {
+      throw makeError("Host account not found.", 404);
     }
 
-    const host = snapshot.data();
+    const host = hostSnapshot.data();
 
-    if (host.status !== "active" || !host.firebaseUid) {
-      throw new Error("An active, linked host account is required.");
+    if (
+      host.status !== "active" ||
+      typeof host.firebaseUid !== "string" ||
+      !host.firebaseUid.trim()
+    ) {
+      throw makeError(
+        "An active, linked host account is required.",
+        403
+      );
     }
 
+    // Check both fields to remain compatible with older host records.
     const usernameQuery = hostsCollection
       .where("usernameLower", "==", usernameLower)
       .limit(10);
@@ -290,7 +371,10 @@ export async function updateHostAvailabilityProfile(hostId, input) {
       .where("publicUsernameLower", "==", usernameLower)
       .limit(10);
 
-    const [usernameMatches, publicUsernameMatches] = await Promise.all([
+    const [
+      usernameMatches,
+      publicUsernameMatches,
+    ] = await Promise.all([
       transaction.get(usernameQuery),
       transaction.get(publicUsernameQuery),
     ]);
@@ -301,8 +385,11 @@ export async function updateHostAvailabilityProfile(hostId, input) {
     ]);
 
     for (const conflictingId of conflictingIds) {
-      if (conflictingId !== snapshot.id) {
-        throw new Error("That host username is already in use.");
+      if (conflictingId !== hostSnapshot.id) {
+        throw makeError(
+          "That host username is already in use.",
+          409
+        );
       }
     }
 
@@ -317,18 +404,16 @@ export async function updateHostAvailabilityProfile(hostId, input) {
     });
   });
 
-  return getHostAvailabilityProfile(hostId.trim());
+  return getHostAvailabilityProfile(safeHostId);
 }
-
 
 /*
 |--------------------------------------------------------------------------
 | PUBLIC HOST DIRECTORY
 |--------------------------------------------------------------------------
-| Only approved, linked hosts with a public username are included.
-| The response contains only explicitly selected public fields.
-| Never return Telegram IDs, Firebase UIDs, email addresses,
-| bank details, internal call IDs, or raw host documents.
+| Return an allowlist of public fields only.
+| Do not return Firebase UIDs, email addresses, financial details,
+| internal call IDs, or raw Firestore documents.
 |--------------------------------------------------------------------------
 */
 
@@ -356,16 +441,21 @@ export async function getPublicHostDirectory() {
       const online = isHostOnline(host, now);
 
       return {
-        // Public, non-sensitive identifier.
-        // The username is already displayed publicly.
+        // Public display identifier, not an authorization identifier.
         id: username.toLowerCase(),
         username,
-        displayName: username,
+        displayName:
+          typeof host.displayName === "string" &&
+          host.displayName.trim()
+            ? host.displayName.trim()
+            : username,
         online,
         status: online ? "online" : "offline",
         availability: sanitizeAvailability(host.availability),
       };
     })
     .filter(Boolean)
-    .sort((a, b) => a.username.localeCompare(b.username));
+    .sort((a, b) =>
+      a.username.localeCompare(b.username)
+    );
 }

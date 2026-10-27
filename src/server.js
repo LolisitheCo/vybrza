@@ -6,6 +6,8 @@ import cors from "cors";
 
 import hostRoutes from "./routes/hostRoutes.js";
 import callRoutes from "./routes/callRoutes.js";
+import livekitRoutes from "./routes/livekitRoutes.js";
+import customerCallRoutes from "./routes/customerCallRoutes.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
 import adminManagementRoutes from "./routes/adminManagementRoutes.js";
 import adminWithdrawalRoutes from "./routes/adminWithdrawalRoutes.js";
@@ -170,9 +172,11 @@ app.get("/health", (req, res) => {
 
 app.use("/api/hosts", hostRoutes);
 app.use("/api/payments", paymentRoutes);
+app.use("/api/customer-calls", customerCallRoutes);
 app.use("/api/admin", adminManagementRoutes);
 app.use("/api/admin/withdrawals", adminWithdrawalRoutes);
 app.use("/api/calls", callRoutes);
+app.use("/api/livekit", livekitRoutes);
 
 // ------------------------------------------------------------
 // UNKNOWN ENDPOINTS
