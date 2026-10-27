@@ -6,6 +6,7 @@ const auth = getAuth(firebaseApp);
 
 const applications = db.collection("hostApplications");
 const hosts = db.collection("hosts");
+const users = db.collection("users");
 
 export const HOST_CONTRACT_VERSION = "1.0";
 
@@ -392,12 +393,14 @@ export async function getPendingHostApplications() {
 |--------------------------------------------------------------------------
 */
 
+
 export async function approveHostApplication(applicationId, adminUid) {
   const uid = normalizeUid(applicationId);
   const reviewerUid = normalizeUid(adminUid);
 
   const applicationRef = applications.doc(uid);
   const hostRef = hosts.doc(uid);
+  const userRef = users.doc(uid);
 
   const initialSnapshot = await applicationRef.get();
 
@@ -407,38 +410,34 @@ export async function approveHostApplication(applicationId, adminUid) {
 
   const initialApplication = initialSnapshot.data();
 
-  if (initialApplication.status === "approved") {
-    return { id: uid, alreadyApproved: true };
-  }
-
-  if (initialApplication.status !== "pending") {
-    fail(409, "This application is no longer pending.");
+  if (!["pending", "approved"].includes(initialApplication.status)) {
+    fail(409, "This application is not pending or approved.");
   }
 
   if (
+    initialApplication.firebaseUid !== uid ||
     initialApplication.contractAccepted !== true ||
     !initialApplication.contractAcceptedAt ||
     initialApplication.contractAcceptedBy !== uid ||
     initialApplication.contractVersion !== HOST_CONTRACT_VERSION
   ) {
-    fail(
-      409,
-      "The application has no valid recorded contract acceptance."
-    );
+    fail(409, "The application requires administrator review.");
   }
 
   const email = normalizeEmail(initialApplication.email);
-  await getVerifiedAccount(uid, email);
+  const verifiedUser = await getVerifiedAccount(uid, email);
 
-  // Avoid granting access to a username that was claimed after submission.
+  // Check username conflicts before granting host access.
   await findUsernameConflict(initialApplication.username, uid);
 
   return db.runTransaction(async (transaction) => {
-    // Read all documents before writing anything.
-    const [applicationSnapshot, hostSnapshot] = await Promise.all([
-      transaction.get(applicationRef),
-      transaction.get(hostRef),
-    ]);
+    // Read all documents before writing.
+    const [applicationSnapshot, hostSnapshot, userSnapshot] =
+      await Promise.all([
+        transaction.get(applicationRef),
+        transaction.get(hostRef),
+        transaction.get(userRef),
+      ]);
 
     if (!applicationSnapshot.exists) {
       fail(404, "Host application not found.");
@@ -446,12 +445,8 @@ export async function approveHostApplication(applicationId, adminUid) {
 
     const application = applicationSnapshot.data();
 
-    if (application.status === "approved") {
-      return { id: uid, alreadyApproved: true };
-    }
-
-    if (application.status !== "pending") {
-      fail(409, "This application is no longer pending.");
+    if (!["pending", "approved"].includes(application.status)) {
+      fail(409, "This application is no longer eligible for approval.");
     }
 
     if (
@@ -467,6 +462,7 @@ export async function approveHostApplication(applicationId, adminUid) {
     const usernameLower = username.toLowerCase();
     const now = new Date();
 
+    // Create or activate the host profile.
     if (hostSnapshot.exists) {
       const existingHost = hostSnapshot.data();
 
@@ -517,10 +513,42 @@ export async function approveHostApplication(applicationId, adminUid) {
       });
     }
 
+    // IMPORTANT: update the role used by customer/host login routing.
+    if (userSnapshot.exists) {
+      transaction.update(userRef, {
+        role: "host",
+        updatedAt: now,
+      });
+    } else {
+      // Preserve the verified Firebase account details if its
+      // Firestore profile hasn't been created yet.
+      transaction.create(userRef, {
+        uid,
+        firebaseUid: uid,
+        email,
+        name:
+          application.fullName ||
+          verifiedUser.displayName ||
+          "",
+        displayName:
+          application.fullName ||
+          verifiedUser.displayName ||
+          "",
+        role: "host",
+        minutes: 0,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+
+    // Repair an already-approved application as well as approving
+    // a pending application for the first time.
+    const wasAlreadyApproved = application.status === "approved";
+
     transaction.update(applicationRef, {
       status: "approved",
-      reviewedAt: now,
-      reviewedBy: reviewerUid,
+      reviewedAt: application.reviewedAt || now,
+      reviewedBy: application.reviewedBy || reviewerUid,
       updatedAt: now,
       rejectionReason: null,
     });
@@ -529,10 +557,15 @@ export async function approveHostApplication(applicationId, adminUid) {
       id: uid,
       firebaseUid: uid,
       email,
-      alreadyApproved: false,
+      alreadyApproved: wasAlreadyApproved,
+      role: "host",
+      message: wasAlreadyApproved
+        ? "Host access synchronized successfully."
+        : "Host application approved successfully.",
     };
   });
 }
+
 
 /*
 |--------------------------------------------------------------------------
