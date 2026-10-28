@@ -100,7 +100,9 @@ export async function getMyCallHistory(req, res, next) {
 }
 
 // POST /api/calls/:callId/accept
-export async function acceptCallRequest(req, res, next) {
+
+ // GET /api/calls/requests
+export async function getMyCallRequests(req, res, next) {
   try {
     const hostId = getAuthenticatedHostId(req);
 
@@ -108,103 +110,65 @@ export async function acceptCallRequest(req, res, next) {
       return sendError(res, 401, "An authenticated host account is required.");
     }
 
-    const callId =
-      typeof req.params.callId === "string"
-        ? req.params.callId.trim()
-        : "";
+    const snapshot = await callSessions
+      .where("hostId", "==", hostId)
+      .get();
 
-    if (!callId || callId.length > 200) {
-      return sendError(res, 400, "A valid call ID is required.");
+    const now = Date.now();
+    const REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
+
+    function getTimestampMs(value) {
+      if (!value) return 0;
+
+      if (typeof value.toMillis === "function") {
+        return value.toMillis();
+      }
+
+      if (value instanceof Date) {
+        return value.getTime();
+      }
+
+      const parsed = new Date(value).getTime();
+      return Number.isFinite(parsed) ? parsed : 0;
     }
 
-    const callRef = callSessions.doc(callId);
+    const calls = snapshot.docs
+      .map((doc) => safeCallResponse(doc.id, doc.data()))
+      .filter((call) => {
+        if (call.endedAt) return false;
 
-    const result = await db.runTransaction(async (transaction) => {
-      const snapshot = await transaction.get(callRef);
+        if (!ACTIVE_REQUEST_STATUSES.has(call.status)) {
+          return false;
+        }
 
-      if (!snapshot.exists) {
-        return {
-          status: 404,
-          body: {
-            success: false,
-            message: "Call not found.",
-          },
-        };
-      }
+        // Never hide a call that has already started.
+        if (call.status === "active" || call.startedAt) {
+          return true;
+        }
 
-      const call = snapshot.data();
+        const createdMs = getTimestampMs(call.createdAt);
 
-      if (call.hostId !== hostId) {
-        return {
-          status: 403,
-          body: {
-            success: false,
-            message: "This call is not assigned to your host account.",
-          },
-        };
-      }
+        // Keep requests with missing timestamps visible for investigation.
+        if (!createdMs) return true;
 
-      if (call.endedAt || call.status === "completed") {
-        return {
-          status: 409,
-          body: {
-            success: false,
-            message: "This call has already ended.",
-          },
-        };
-      }
-
-      // Matching already assigns the host and sets status to "matched".
-      // Do not create another call or reset the existing assignment.
-      if (call.status === "matched" || call.status === "active") {
-        return {
-          status: 200,
-          body: {
-            success: true,
-            message:
-              call.status === "active"
-                ? "This call is already active."
-                : "This call is already assigned and ready to join.",
-            call: safeCallResponse(snapshot.id, call),
-          },
-        };
-      }
-
-      if (call.status !== "matching") {
-        return {
-          status: 409,
-          body: {
-            success: false,
-            message: "This call cannot be accepted in its current state.",
-          },
-        };
-      }
-
-      const now = new Date();
-
-      transaction.update(callRef, {
-        status: "matched",
-        updatedAt: now,
+        // Hide old, unstarted requests from the host dashboard.
+        return now - createdMs <= REQUEST_TIMEOUT_MS;
+      })
+      .sort((a, b) => {
+        return (
+          getTimestampMs(b.createdAt) -
+          getTimestampMs(a.createdAt)
+        );
       });
-
-      return {
-        status: 200,
-        body: {
-          success: true,
-          message: "Call accepted. You can now join the call.",
-          call: safeCallResponse(snapshot.id, {
-            ...call,
-            status: "matched",
-            updatedAt: now,
-          }),
-        },
-      };
-    });
 
     res.setHeader("Cache-Control", "no-store");
 
-    return res.status(result.status).json(result.body);
+    return res.status(200).json({
+      success: true,
+      calls,
+    });
   } catch (error) {
     return next(error);
   }
 }
+
