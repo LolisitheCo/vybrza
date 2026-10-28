@@ -1,17 +1,14 @@
+
 import { db } from "../config/firebase.js";
+import {
+  matchCustomerToGroupRoom,
+} from "./groupRoomService.js";
 
 const usersCollection = db.collection("users");
 const hostsCollection = db.collection("hosts");
-const callsCollection = db.collection("callSessions");
 
 const HOST_TIMEOUT_MS = 45_000;
 const VALID_ID_PATTERN = /^[A-Za-z0-9_-]{1,150}$/;
-
-/*
-|--------------------------------------------------------------------------
-| HELPERS
-|--------------------------------------------------------------------------
-*/
 
 function makeError(message, status = 400) {
   const error = new Error(message);
@@ -48,7 +45,10 @@ function timestampToMilliseconds(value) {
       return value.getTime();
     }
 
-    if (typeof value === "string" || typeof value === "number") {
+    if (
+      typeof value === "string" ||
+      typeof value === "number"
+    ) {
       return new Date(value).getTime();
     }
   } catch {
@@ -59,7 +59,9 @@ function timestampToMilliseconds(value) {
 }
 
 function isHostAvailable(host) {
-  if (!host || host.status !== "active") return false;
+  if (!host || host.status !== "active") {
+    return false;
+  }
 
   if (
     typeof host.firebaseUid !== "string" ||
@@ -68,11 +70,19 @@ function isHostAvailable(host) {
     return false;
   }
 
-  if (host.activeCallId) return false;
+  // Legacy one-to-one reservations still make a host unavailable.
+  // Group reservations are handled by groupRoomService.js.
+  if (host.activeCallId) {
+    return false;
+  }
 
-  const lastSeenMs = timestampToMilliseconds(host.lastSeenAt);
+  const lastSeenMs = timestampToMilliseconds(
+    host.lastSeenAt
+  );
 
-  if (!Number.isFinite(lastSeenMs)) return false;
+  if (!Number.isFinite(lastSeenMs)) {
+    return false;
+  }
 
   const ageMs = Date.now() - lastSeenMs;
 
@@ -80,30 +90,20 @@ function isHostAvailable(host) {
 }
 
 function hasPaidMinutes(user) {
-  if (!user || !Number.isSafeInteger(user.minutes)) {
-    return false;
-  }
-
-  return user.minutes > 0;
+  return (
+    user &&
+    Number.isSafeInteger(user.minutes) &&
+    user.minutes > 0
+  );
 }
-
-/*
-|--------------------------------------------------------------------------
-| CUSTOMER ELIGIBILITY
-|--------------------------------------------------------------------------
-| Customers do NOT need manual admin approval.
-| Their email must be verified.
-| They must have paid minutes and no active call.
-|--------------------------------------------------------------------------
-*/
 
 function validateUserForMatching(user) {
   if (!user) {
     throw makeError("User not found.", 404);
   }
 
-  // Email verification is enforced by requireVerifiedEmail
-  // using the verified Firebase Authentication token.
+  // Firebase email verification is enforced by requireVerifiedEmail
+  // on the customer matching route.
 
   if (!hasPaidMinutes(user)) {
     throw makeError(
@@ -119,15 +119,6 @@ function validateUserForMatching(user) {
     );
   }
 }
-
-/*
-|--------------------------------------------------------------------------
-| SAFE PUBLIC HOST DATA
-|--------------------------------------------------------------------------
-| Never expose Firebase identifiers, payout details, credentials,
-| private internal state, or link-code hashes to customers.
-|--------------------------------------------------------------------------
-*/
 
 function toSafeHost(hostId, host) {
   const safeHost = { id: hostId };
@@ -163,36 +154,36 @@ function toSafeHost(hostId, host) {
 
 /*
 |--------------------------------------------------------------------------
-| MATCH CUSTOMER TO HOST
+| MATCH CUSTOMER TO HOST GROUP ROOM
 |--------------------------------------------------------------------------
-| This function:
-| - Requires a verified customer email.
-| - Requires available paid minutes.
-| - Prevents multiple active calls for the same customer.
-| - Selects an active host with a recent heartbeat.
-| - Reserves the customer and host atomically.
-| - Creates a callSessions document.
 |
-| This function does NOT:
-| - Add free minutes.
-| - Deduct customer minutes.
-| - Start the billable timer.
-| - Create or join a LiveKit room.
-| - Calculate host earnings.
+| Each customer receives a separate callSessions document.
+| Up to three customers can share a host's group room.
 |
-| Those operations belong to other trusted backend services.
+| groupRoomService.js is responsible for atomically checking:
+| - customer eligibility and balance;
+| - host availability and heartbeat;
+| - existing group-room capacity;
+| - user activeCallId;
+| - host activeGroupRoomId;
+| - creating the individual call session.
+|
+| This file does not deduct minutes or calculate earnings.
 |--------------------------------------------------------------------------
 */
 
 export async function matchUserToHost(userId) {
   const normalizedUserId = validateId(userId, "user ID");
-  const userRef = usersCollection.doc(normalizedUserId);
 
-  /*
-  |--------------------------------------------------------------------------
-  | LOAD ACTIVE HOST CANDIDATES
-  |--------------------------------------------------------------------------
-  */
+  const userSnapshot = await usersCollection
+    .doc(normalizedUserId)
+    .get();
+
+  if (!userSnapshot.exists) {
+    throw makeError("User not found.", 404);
+  }
+
+  validateUserForMatching(userSnapshot.data());
 
   const hostSnapshot = await hostsCollection
     .where("status", "==", "active")
@@ -203,8 +194,10 @@ export async function matchUserToHost(userId) {
       matched: false,
       host: null,
       call: null,
-      retry: false,
+      retry: true,
       reason: "no_host_available",
+      message:
+        "No available host was found. Please try again shortly.",
     };
   }
 
@@ -213,7 +206,7 @@ export async function matchUserToHost(userId) {
       id: doc.id,
       ...doc.data(),
     }))
-    .filter((host) => isHostAvailable(host))
+    .filter(isHostAvailable)
     .sort((a, b) => a.id.localeCompare(b.id));
 
   if (candidates.length === 0) {
@@ -221,146 +214,34 @@ export async function matchUserToHost(userId) {
       matched: false,
       host: null,
       call: null,
-      retry: false,
+      retry: true,
       reason: "no_host_available",
+      message:
+        "No available host was found. Please try again shortly.",
     };
   }
 
-  /*
-  |--------------------------------------------------------------------------
-  | ATOMIC RESERVATION
-  |--------------------------------------------------------------------------
-  | Recheck customer eligibility and host availability inside the
-  | transaction because either record may have changed since discovery.
-  |--------------------------------------------------------------------------
-  */
-
   for (const candidate of candidates) {
-    const hostRef = hostsCollection.doc(candidate.id);
-    const callRef = callsCollection.doc();
-
-    const result = await db.runTransaction(async (transaction) => {
-      // Read all documents before writing any documents.
-      const [userSnapshot, hostSnapshot] = await Promise.all([
-        transaction.get(userRef),
-        transaction.get(hostRef),
-      ]);
-
-      if (!userSnapshot.exists) {
-        throw makeError("User not found.", 404);
-      }
-
-      if (!hostSnapshot.exists) {
-        return {
-          matched: false,
-          reason: "host_unavailable",
-        };
-      }
-
-      const user = userSnapshot.data();
-      const host = hostSnapshot.data();
-
-      validateUserForMatching(user);
-
-      if (!isHostAvailable(host)) {
-        return {
-          matched: false,
-          reason: "host_unavailable",
-        };
-      }
-
-      // Recheck the host's heartbeat immediately before reservation.
-      const lastSeenMs = timestampToMilliseconds(host.lastSeenAt);
-      const ageMs = Date.now() - lastSeenMs;
-
-      if (
-        !Number.isFinite(lastSeenMs) ||
-        ageMs < 0 ||
-        ageMs > HOST_TIMEOUT_MS
-      ) {
-        return {
-          matched: false,
-          reason: "host_unavailable",
-        };
-      }
-
-      const now = new Date();
-
-      /*
-       * Keep this schema aligned with callService.js and billingService.js.
-       * Monetary values are stored in cents and currency units.
-       */
-
-      const callData = {
-        userId: normalizedUserId,
-        hostId: hostRef.id,
-
-        status: "matched",
-
-        roomId: null,
-        roomUrl: null,
-
-        startedAt: null,
-        endedAt: null,
-
-        durationSeconds: 0,
-        minutesUsed: 0,
-        billableMinutes: 0,
-
-        endReason: null,
-
-        billingStatus: "pending",
-        billedAt: null,
-        billingError: null,
-
-        customerCharge: 0,
-        hostEarnings: 0,
-        saLiveRevenue: 0,
-
-        customerChargeCents: 0,
-        hostEarningsCents: 0,
-        saLiveRevenueCents: 0,
-
-        hostPayoutStatus: "pending",
-
-        createdAt: now,
-        updatedAt: now,
-      };
-
-      // Reserve both records and create the call atomically.
-      transaction.update(hostRef, {
-        activeCallId: callRef.id,
-        updatedAt: now,
-      });
-
-      transaction.update(userRef, {
-        activeCallId: callRef.id,
-        updatedAt: now,
-      });
-
-      transaction.create(callRef, callData);
-
-      return {
-        matched: true,
-        callId: callRef.id,
-        call: callData,
-        host: toSafeHost(hostRef.id, host),
-      };
+    // groupRoomService performs the authoritative transaction.
+    // It rechecks the user and host instead of trusting this
+    // preliminary candidate list.
+    const result = await matchCustomerToGroupRoom({
+      userId: normalizedUserId,
+      hostId: candidate.id,
     });
 
-    if (result.matched) {
+    if (result?.matched) {
       return {
-        matched: true,
-        host: result.host,
-        call: {
-          id: result.callId,
-          ...result.call,
-        },
+        ...result,
+        host:
+          result.host ||
+          toSafeHost(candidate.id, candidate),
         retry: false,
       };
     }
 
-    // This host became unavailable, so try the next candidate.
+    // Try another host if this candidate became unavailable or
+    // their group room cannot accept another customer.
   }
 
   return {
@@ -368,6 +249,8 @@ export async function matchUserToHost(userId) {
     host: null,
     call: null,
     retry: true,
-    reason: "hosts_became_unavailable",
+    reason: "no_group_room_available",
+    message:
+      "No available host or group-room space was found. Please try again shortly.",
   };
 }

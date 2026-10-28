@@ -16,14 +16,15 @@ const ALLOWED_END_REASONS = new Set([
   "system_error",
 ]);
 
-const ACTIVE_STATUSES = new Set(["matching", "matched", "active"]);
+const ACTIVE_STATUSES = new Set([
+  "matching",
+  "matched",
+  "active",
+]);
+
 const VALID_ID_PATTERN = /^[A-Za-z0-9_-]{1,150}$/;
 const MAX_ROOM_URL_LENGTH = 2048;
 const MAX_ROOM_ID_LENGTH = 256;
-
-/* -------------------------------------------------------------------------- */
-/* HELPERS                                                                    */
-/* -------------------------------------------------------------------------- */
 
 function makeError(message, status = 400) {
   const error = new Error(message);
@@ -121,45 +122,60 @@ function validateRoomUrl(roomUrl) {
     throw makeError("A secure LiveKit server URL is required.", 400);
   }
 
-  return parsed.toString().replace(/\/$/, "");
+  return parsed.toString().replace(/\/+$/, "");
 }
 
 function validateEndReason(reason) {
-  if (typeof reason !== "string" || !ALLOWED_END_REASONS.has(reason)) {
+  if (
+    typeof reason !== "string" ||
+    !ALLOWED_END_REASONS.has(reason)
+  ) {
     throw makeError("Invalid call end reason.", 400);
   }
 
   return reason;
 }
 
-/**
- * Clears a reservation only if it still belongs to this call.
- * Never clear a reservation belonging to another call.
+function isGroupCall(call) {
+  return (
+    typeof call?.groupRoomId === "string" &&
+    call.groupRoomId.trim().length > 0
+  );
+}
+
+/*
+ * Release a reservation only if it still belongs to this call.
+ *
+ * For group calls, the host's shared reservation is managed through
+ * hosts.activeGroupRoomId. Ending one customer must never release it.
  */
-function releaseReservation(transaction, snapshot, callId, now) {
+function releaseReservation(
+  transaction,
+  snapshot,
+  callId,
+  now,
+  { preserveHostReservation = false } = {}
+) {
   if (!snapshot?.exists) return;
 
   const data = snapshot.data();
 
-  if (data.activeCallId === callId) {
-    transaction.update(snapshot.ref, {
-      activeCallId: null,
-      updatedAt: now,
-    });
-  }
+  if (data.activeCallId !== callId) return;
+
+  if (preserveHostReservation) return;
+
+  transaction.update(snapshot.ref, {
+    activeCallId: null,
+    updatedAt: now,
+  });
 }
 
-/* -------------------------------------------------------------------------- */
-/* CREATE CALL SESSION                                                        */
-/* -------------------------------------------------------------------------- */
+/*
+|--------------------------------------------------------------------------
+| CREATE CALL SESSION
+|--------------------------------------------------------------------------
+*/
 
-/**
- * Creates a call request.
- *
- * This function does not independently verify customer eligibility or host
- * availability. The trusted matching workflow must enforce eligibility and
- * reserve both records atomically.
- */
 export async function createCallSession({ userId, hostId }) {
   const normalizedUserId = validateId(userId, "user ID");
   const normalizedHostId = validateId(hostId, "host ID");
@@ -179,6 +195,7 @@ export async function createCallSession({ userId, hostId }) {
 
     roomId: null,
     roomUrl: null,
+    groupRoomId: null,
 
     startedAt: null,
     endedAt: null,
@@ -215,9 +232,11 @@ export async function createCallSession({ userId, hostId }) {
   };
 }
 
-/* -------------------------------------------------------------------------- */
-/* GET CALL BY ID                                                             */
-/* -------------------------------------------------------------------------- */
+/*
+|--------------------------------------------------------------------------
+| GET CALL BY ID
+|--------------------------------------------------------------------------
+*/
 
 export async function getCallById(callId) {
   const normalizedCallId = validateId(callId, "call ID");
@@ -226,17 +245,16 @@ export async function getCallById(callId) {
   return toCall(snapshot);
 }
 
-/* -------------------------------------------------------------------------- */
-/* START CALL                                                                 */
-/* -------------------------------------------------------------------------- */
+/*
+|--------------------------------------------------------------------------
+| START CALL
+|--------------------------------------------------------------------------
+|
+| Trusted backend code must verify participant presence before calling
+| this function. Each customer has a separate call session and timer.
+|--------------------------------------------------------------------------
+*/
 
-/**
- * Starts a matched call.
- *
- * IMPORTANT: Only trusted backend code should invoke this after independently
- * verifying that both assigned participants joined the expected LiveKit room.
- * This function does not itself verify participant presence.
- */
 export async function startCall(callId, roomId, roomUrl) {
   const normalizedCallId = validateId(callId, "call ID");
   const normalizedRoomId = validateRoomId(roomId);
@@ -253,7 +271,7 @@ export async function startCall(callId, roomId, roomUrl) {
 
     const call = snapshot.data();
 
-    // Idempotent retry: preserve the original start time.
+    // An identical retry must not reset the timer.
     if (call.status === "active") {
       if (
         call.roomId === normalizedRoomId &&
@@ -276,7 +294,10 @@ export async function startCall(callId, roomId, roomUrl) {
     }
 
     if (call.startedAt || call.endedAt) {
-      throw makeError("This call has already started or ended.", 409);
+      throw makeError(
+        "This call has already started or ended.",
+        409
+      );
     }
 
     const now = new Date();
@@ -299,18 +320,27 @@ export async function startCall(callId, roomId, roomUrl) {
   });
 }
 
-/* -------------------------------------------------------------------------- */
-/* END CALL                                                                   */
-/* -------------------------------------------------------------------------- */
+/*
+|--------------------------------------------------------------------------
+| END CALL
+|--------------------------------------------------------------------------
+|
+| Each customer session is ended and billed independently.
+|
+| Group call:
+| - clears the customer's activeCallId;
+| - preserves the host's group reservation;
+| - finalizes only this customer's billing.
+|
+| Legacy one-to-one call:
+| - releases the customer's reservation;
+| - releases the host's matching activeCallId reservation.
+|
+| The group-room lifecycle is managed by the trusted group-room and
+| LiveKit route/webhook workflows, not by an individual customer's exit.
+|--------------------------------------------------------------------------
+*/
 
-/**
- * Ends a call, releases its matching reservations, and attempts billing.
- *
- * The call-ending transaction and billing transaction are deliberately
- * separate. If billing fails, the completed call can be billed on a safe retry.
- *
- * Calls that never started are finalized with zero usage and no charge.
- */
 export async function endCall(callId, reason = "completed") {
   const normalizedCallId = validateId(callId, "call ID");
   const normalizedReason = validateEndReason(reason);
@@ -346,10 +376,11 @@ export async function endCall(callId, reason = "completed") {
     ]);
 
     const now = new Date();
+    const groupCall = isGroupCall(call);
 
     if (call.status === "completed") {
-      // Safe cleanup for older completed calls whose reservations were left
-      // behind. Reservations are cleared only if they still reference this call.
+      // Safe cleanup for older completed calls. A group call never
+      // releases the host's shared reservation here.
       releaseReservation(
         transaction,
         userSnapshot,
@@ -361,7 +392,8 @@ export async function endCall(callId, reason = "completed") {
         transaction,
         hostSnapshot,
         normalizedCallId,
-        now
+        now,
+        { preserveHostReservation: groupCall }
       );
 
       return {
@@ -410,8 +442,6 @@ export async function endCall(callId, reason = "completed") {
       endReason: normalizedReason,
       updatedAt: now,
 
-      // A never-started call has no billable usage. Finalize it without
-      // invoking the normal billing transaction.
       ...(neverStarted
         ? {
             billingStatus: "finalized",
@@ -434,6 +464,7 @@ export async function endCall(callId, reason = "completed") {
 
     transaction.update(callRef, update);
 
+    // Always release this customer's own reservation.
     releaseReservation(
       transaction,
       userSnapshot,
@@ -441,11 +472,14 @@ export async function endCall(callId, reason = "completed") {
       now
     );
 
+    // For group calls, only the group-room lifecycle may release
+    // the host's shared reservation after the group has ended.
     releaseReservation(
       transaction,
       hostSnapshot,
       normalizedCallId,
-      now
+      now,
+      { preserveHostReservation: groupCall }
     );
 
     return {
@@ -456,15 +490,14 @@ export async function endCall(callId, reason = "completed") {
     };
   });
 
-  // Never-started calls were already finalized at zero cost.
   if (endedCall.neverStarted) {
     const latestCall = await getCallById(endedCall.id);
 
     return latestCall ?? endedCall;
   }
 
-  // Do not skip billing just because the call was already ended. A previous
-  // attempt might have completed the call but failed before billing finished.
+  // If a previous attempt ended the call but billing failed,
+  // retrying endCall must retry the billing finalization.
   try {
     const billing = await finalizeCallBilling(endedCall.id);
     const latestCall = await getCallById(endedCall.id);
@@ -491,14 +524,16 @@ export async function endCall(callId, reason = "completed") {
           : "Unknown billing error",
     });
 
-    // The call remains completed and can be retried by trusted backend code.
+    // The call remains completed. Trusted backend code can retry billing.
     throw error;
   }
 }
 
-/* -------------------------------------------------------------------------- */
-/* GET USER CALL HISTORY                                                      */
-/* -------------------------------------------------------------------------- */
+/*
+|--------------------------------------------------------------------------
+| GET USER CALL HISTORY
+|--------------------------------------------------------------------------
+*/
 
 export async function getUserCallHistory(userId) {
   const normalizedUserId = validateId(userId, "user ID");
@@ -515,9 +550,11 @@ export async function getUserCallHistory(userId) {
   );
 }
 
-/* -------------------------------------------------------------------------- */
-/* GET HOST CALL HISTORY                                                      */
-/* -------------------------------------------------------------------------- */
+/*
+|--------------------------------------------------------------------------
+| GET HOST CALL HISTORY
+|--------------------------------------------------------------------------
+*/
 
 export async function getHostCallHistory(hostId) {
   const normalizedHostId = validateId(hostId, "host ID");
