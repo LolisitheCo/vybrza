@@ -1,4 +1,3 @@
-
 import { db } from "../config/firebase.js";
 import {
   matchCustomerToGroupRoom,
@@ -6,144 +5,129 @@ import {
 
 const usersCollection = db.collection("users");
 const hostsCollection = db.collection("hosts");
-const callSessions = db.collection("callSessions");
-const callRooms = db.collection("callRooms");
+const callSessionsCollection = db.collection("callSessions");
+const callRoomsCollection = db.collection("callRooms");
 
 const HOST_TIMEOUT_MS = 45_000;
-const VALID_ID_PATTERN = /^[A-Za-z0-9_-]{1,150}$/;
 
-function makeError(message, status = 400) {
-  const error = new Error(message);
-  error.status = status;
-  return error;
+function timestampMillis(value) {
+  if (!value) return 0;
+
+  if (typeof value.toMillis === "function") {
+    return value.toMillis();
+  }
+
+  if (typeof value.toDate === "function") {
+    return value.toDate().getTime();
+  }
+
+  const result = new Date(value).getTime();
+  return Number.isFinite(result) ? result : 0;
 }
 
-function validateId(value, fieldName) {
-  if (
-    typeof value !== "string" ||
-    !value.trim() ||
-    value.trim().length > 150 ||
-    !VALID_ID_PATTERN.test(value.trim())
-  ) {
-    throw makeError(`A valid ${fieldName} is required.`, 400);
-  }
+function hasRecentHeartbeat(host) {
+  const lastSeen = timestampMillis(host.lastSeenAt);
+  const age = Date.now() - lastSeen;
 
-  return value.trim();
-}
-
-function timestampToMilliseconds(value) {
-  if (!value) return NaN;
-
-  try {
-    if (typeof value.toMillis === "function") {
-      return value.toMillis();
-    }
-
-    if (typeof value.toDate === "function") {
-      return value.toDate().getTime();
-    }
-
-    if (value instanceof Date) {
-      return value.getTime();
-    }
-
-    if (
-      typeof value === "string" ||
-      typeof value === "number"
-    ) {
-      return new Date(value).getTime();
-    }
-  } catch {
-    return NaN;
-  }
-
-  return NaN;
-}
-
-function isHostAvailable(host) {
-  if (!host || host.status !== "active") {
-    return false;
-  }
-
-  if (
-    typeof host.firebaseUid !== "string" ||
-    !host.firebaseUid.trim()
-  ) {
-    return false;
-  }
-
-  // Legacy one-to-one reservations still block host availability.
-  // Group-room reservations are handled by groupRoomService.
-  if (host.activeCallId) {
-    return false;
-  }
-
-  const lastSeenMs = timestampToMilliseconds(host.lastSeenAt);
-
-  if (!Number.isFinite(lastSeenMs)) {
-    return false;
-  }
-
-  const ageMs = Date.now() - lastSeenMs;
-
-  return ageMs >= 0 && ageMs <= HOST_TIMEOUT_MS;
-}
-
-function hasPaidMinutes(user) {
   return (
-    user &&
-    Number.isSafeInteger(user.minutes) &&
-    user.minutes > 0
+    lastSeen > 0 &&
+    age >= 0 &&
+    age <= HOST_TIMEOUT_MS
   );
 }
 
-/*
- * Verify the customer's current call pointer.
+function normalizeMinutes(value) {
+  const minutes = Number(value ?? 0);
+
+  return Number.isSafeInteger(minutes) && minutes >= 0
+    ? minutes
+    : null;
+}
+
+function isTerminalCall(call) {
+  if (!call) return true;
+
+  if (call.endedAt) return true;
+
+  return [
+    "ended",
+    "completed",
+    "cancelled",
+    "canceled",
+    "failed",
+  ].includes(String(call.status ?? "").toLowerCase());
+}
+
+function roomHasCapacity(room, hostId) {
+  if (!room || room.hostId !== hostId) return false;
+
+  if (
+    typeof room.roomName !== "string" ||
+    !room.roomName.startsWith("salive-group-")
+  ) {
+    return false;
+  }
+
+  if (!["waiting_host", "active"].includes(room.status)) {
+    return false;
+  }
+
+  if (room.endedAt) return false;
+
+  const customerIds = Array.isArray(room.customerIds)
+    ? room.customerIds
+    : [];
+
+  const maxCustomers = Number(room.maxCustomers ?? 3);
+
+  return (
+    Number.isInteger(maxCustomers) &&
+    maxCustomers > 0 &&
+    customerIds.length < Math.min(maxCustomers, 3)
+  );
+}
+
+/**
+ * Validate that the customer has minutes and no active call.
  *
- * Only clear activeCallId when the referenced call is demonstrably
- * ended, missing, or linked to a group room that is demonstrably ended
- * or missing. Do not clear a matched/active call just because it is old.
+ * A dangling activeCallId is cleared only when the corresponding call
+ * is missing or demonstrably terminal. An active call is never cleared
+ * just to make matching succeed.
  */
-async function validateUserForMatching(userId) {
+export async function validateUserForMatching(userId) {
+  if (typeof userId !== "string" || !userId.trim()) {
+    throw new Error("A valid customer ID is required.");
+  }
+
   const userRef = usersCollection.doc(userId);
 
-  const result = await db.runTransaction(async (transaction) => {
+  return db.runTransaction(async (transaction) => {
     const userSnapshot = await transaction.get(userRef);
 
     if (!userSnapshot.exists) {
-      return {
-        error: {
-          message: "User not found.",
-          status: 404,
-        },
-      };
+      throw new Error("Customer account not found.");
     }
 
     const user = userSnapshot.data();
+    const minutes = normalizeMinutes(user.minutes);
 
-    if (!hasPaidMinutes(user)) {
+    if (minutes === null || minutes <= 0) {
+      throw new Error(
+        "You need available minutes before starting a call."
+      );
+    }
+
+    if (!user.activeCallId) {
       return {
-        error: {
-          message:
-            "You have no available minutes. Please buy minutes before starting a call.",
-          status: 409,
-        },
+        ...user,
+        id: userSnapshot.id,
+        minutes,
       };
     }
 
-    const activeCallId = user.activeCallId;
-
-    if (
-      typeof activeCallId !== "string" ||
-      !activeCallId.trim()
-    ) {
-      return { user };
-    }
-
-    const callRef = callSessions.doc(activeCallId);
+    const callRef = callSessionsCollection.doc(user.activeCallId);
     const callSnapshot = await transaction.get(callRef);
 
-    // No call document exists for the stored pointer.
     if (!callSnapshot.exists) {
       transaction.update(userRef, {
         activeCallId: null,
@@ -151,207 +135,115 @@ async function validateUserForMatching(userId) {
       });
 
       return {
-        user: {
-          ...user,
-          activeCallId: null,
-        },
-        repaired: true,
+        ...user,
+        id: userSnapshot.id,
+        activeCallId: null,
+        minutes,
       };
     }
 
     const call = callSnapshot.data();
 
-    // Explicitly finished calls no longer reserve the customer.
-    if (
-      call.endedAt ||
-      ["completed", "ended", "cancelled", "failed"].includes(
-        String(call.status || "").toLowerCase()
-      )
-    ) {
-      transaction.update(userRef, {
-        activeCallId: null,
-        updatedAt: new Date(),
-      });
-
-      return {
-        user: {
-          ...user,
-          activeCallId: null,
-        },
-        repaired: true,
-      };
+    if (!isTerminalCall(call)) {
+      throw new Error(
+        "You already have a call in progress. End it before starting another."
+      );
     }
 
-    // For group calls, inspect the shared room before deciding whether
-    // a call pointer can safely be cleared.
-    if (
-      typeof call.groupRoomId === "string" &&
-      call.groupRoomId.trim()
-    ) {
-      const roomRef = callRooms.doc(call.groupRoomId);
-      const roomSnapshot = await transaction.get(roomRef);
+    transaction.update(userRef, {
+      activeCallId: null,
+      updatedAt: new Date(),
+    });
 
-      if (!roomSnapshot.exists) {
-        transaction.update(userRef, {
-          activeCallId: null,
-          updatedAt: new Date(),
-        });
-
-        return {
-          user: {
-            ...user,
-            activeCallId: null,
-          },
-          repaired: true,
-        };
-      }
-
-      const room = roomSnapshot.data();
-
-      if (
-        room.endedAt ||
-        ["ended", "completed", "cancelled"].includes(
-          String(room.status || "").toLowerCase()
-        )
-      ) {
-        transaction.update(userRef, {
-          activeCallId: null,
-          updatedAt: new Date(),
-        });
-
-        return {
-          user: {
-            ...user,
-            activeCallId: null,
-          },
-          repaired: true,
-        };
-      }
-    }
-
-    // The call still looks live or its state is uncertain.
-    // Preserve the pointer rather than risk overlapping calls.
     return {
-      error: {
-        message:
-          "You already have a call in progress. If your previous call did not connect, please contact support so the call state can be checked.",
-        status: 409,
-      },
+      ...user,
+      id: userSnapshot.id,
+      activeCallId: null,
+      minutes,
     };
   });
-
-  if (result.error) {
-    throw makeError(result.error.message, result.error.status);
-  }
-
-  return result.user;
 }
 
-function toSafeHost(hostId, host) {
-  const safeHost = { id: hostId };
+/**
+ * A host is eligible if active, linked, recently online, accepting calls,
+ * scheduled now, and either has no existing reservation or has a group
+ * room with space remaining.
+ */
+async function isHostAvailable(host, date = new Date()) {
+  if (!host || host.status !== "active") return false;
+  if (!host.firebaseUid) return false;
+  if (host.acceptingCalls !== true) return false;
+  if (!hasRecentHeartbeat(host)) return false;
 
-  const publicFields = [
-    "displayName",
-    "name",
-    "bio",
-    "photoURL",
-    "profileImage",
-    "profilePicture",
-    "avatarUrl",
-    "language",
-    "languages",
-  ];
+  // Use the shared schedule checker. This keeps the directory and
+  // matching rules aligned.
+  const { isWithinHostSchedule } = await import(
+    "./hostAvailabilityService.js"
+  );
 
-  for (const field of publicFields) {
-    const value = host[field];
+  if (!isWithinHostSchedule(host, date)) return false;
 
-    if (
-      typeof value === "string" ||
-      (
-        Array.isArray(value) &&
-        value.every((item) => typeof item === "string")
-      )
-    ) {
-      safeHost[field] = value;
-    }
+  if (!host.activeGroupRoomId) {
+    // Legacy one-to-one reservation blocks new assignments.
+    return !host.activeCallId;
   }
 
-  return safeHost;
+  const roomSnapshot = await callRoomsCollection
+    .doc(host.activeGroupRoomId)
+    .get();
+
+  if (!roomSnapshot.exists) return false;
+
+  const room = {
+    id: roomSnapshot.id,
+    ...roomSnapshot.data(),
+  };
+
+  if (!roomHasCapacity(room, host.id)) return false;
+
+  // An active group room may coexist with a legacy activeCallId
+  // pointer. The group service will still validate the room and host.
+  return true;
 }
 
-/*
- * MATCH CUSTOMER TO HOST GROUP ROOM
+/**
+ * Match a customer to an available host or a group room with capacity.
  *
- * groupRoomService remains responsible for the authoritative matching
- * transaction, host reservation, room capacity, and call creation.
+ * Returns the same match object produced by matchCustomerToGroupRoom.
  */
 export async function matchUserToHost(userId) {
-  const normalizedUserId = validateId(userId, "user ID");
+  await validateUserForMatching(userId);
 
-  // Check and, where safe, repair the customer's existing call pointer.
-  await validateUserForMatching(normalizedUserId);
-
-  const hostSnapshot = await hostsCollection
+  const hostsSnapshot = await hostsCollection
     .where("status", "==", "active")
     .get();
 
-  if (hostSnapshot.empty) {
-    return {
-      matched: false,
-      host: null,
-      call: null,
-      retry: true,
-      reason: "no_host_available",
-      message:
-        "No available host was found. Please try again shortly.",
-    };
-  }
-
-  const candidates = hostSnapshot.docs
+  const candidates = hostsSnapshot.docs
     .map((doc) => ({
       id: doc.id,
       ...doc.data(),
     }))
-    .filter(isHostAvailable)
     .sort((a, b) => a.id.localeCompare(b.id));
 
-  if (candidates.length === 0) {
-    return {
-      matched: false,
-      host: null,
-      call: null,
-      retry: true,
-      reason: "no_host_available",
-      message:
-        "No available host was found. Please try again shortly.",
-    };
-  }
+  for (const host of candidates) {
+    const available = await isHostAvailable(host);
 
-  for (const candidate of candidates) {
-    // This service must recheck eligibility and reservations atomically.
+    if (!available) continue;
+
     const result = await matchCustomerToGroupRoom({
-      userId: normalizedUserId,
-      hostId: candidate.id,
+      userId,
+      hostId: host.id,
     });
 
-    if (result?.matched) {
-      return {
-        ...result,
-        host:
-          result.host ||
-          toSafeHost(candidate.id, candidate),
-        retry: false,
-      };
+    if (result.matched) {
+      return result;
     }
   }
 
   return {
     matched: false,
-    host: null,
-    call: null,
-    retry: true,
-    reason: "no_group_room_available",
     message:
-      "No available host or group-room space was found. Please try again shortly.",
+      "No available host or group-room seat was found. Please try again shortly.",
+    retry: true,
   };
 }

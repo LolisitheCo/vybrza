@@ -132,13 +132,17 @@ function validateHostProfile({ firebaseUid, displayName, username }) {
 export function isHostAvailable(host, date = new Date()) {
   if (!host || typeof host !== "object") return false;
   if (host.status !== "active" || !host.firebaseUid) return false;
-  if (host.acceptingCalls !== true || host.activeCallId) return false;
+  if (host.acceptingCalls !== true) return false;
 
   if (!(date instanceof Date) || !Number.isFinite(date.getTime())) {
     return false;
   }
 
   if (!hasRecentHeartbeat(host, date.getTime())) return false;
+
+  // A host with a one-to-one reservation cannot accept another call
+  // unless group-room matching explicitly handles that reservation.
+  if (host.activeCallId) return false;
 
   return isWithinHostSchedule(host, date);
 }

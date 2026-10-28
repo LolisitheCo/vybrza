@@ -378,30 +378,31 @@ export async function endCall(callId, reason = "completed") {
     const now = new Date();
     const groupCall = isGroupCall(call);
 
-    if (call.status === "completed") {
-      // Safe cleanup for older completed calls. A group call never
-      // releases the host's shared reservation here.
-      releaseReservation(
-        transaction,
-        userSnapshot,
-        normalizedCallId,
-        now
-      );
+     if (call.status === "completed") {
+  // Clean up only reservations belonging to this call.
+  // Never release a shared group-room host reservation here.
+  releaseReservation(
+    transaction,
+    userSnapshot,
+    normalizedCallId,
+    now
+  );
 
-      releaseReservation(
-        transaction,
-        hostSnapshot,
-        normalizedCallId,
-        now,
-        { preserveHostReservation: groupCall }
-      );
+  releaseReservation(
+    transaction,
+    hostSnapshot,
+    normalizedCallId,
+    now,
+    { preserveHostReservation: groupCall }
+  );
 
-      return {
-        id: snapshot.id,
-        ...call,
-        alreadyEnded: true,
-      };
-    }
+  return {
+    id: snapshot.id,
+    ...call,
+    alreadyEnded: true,
+    neverStarted: !toDate(call.startedAt),
+  };
+}
 
     if (!ACTIVE_STATUSES.has(call.status)) {
       throw makeError(
@@ -491,10 +492,15 @@ export async function endCall(callId, reason = "completed") {
   });
 
   if (endedCall.neverStarted) {
-    const latestCall = await getCallById(endedCall.id);
+  const latestCall = await getCallById(endedCall.id);
 
-    return latestCall ?? endedCall;
-  }
+  return latestCall ?? endedCall;
+}
+
+// If billing was already finalized, do not charge this call again.
+if (endedCall.billingStatus === "finalized") {
+  return endedCall;
+}
 
   // If a previous attempt ended the call but billing failed,
   // retrying endCall must retry the billing finalization.

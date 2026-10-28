@@ -1,174 +1,48 @@
-
 import { db } from "../config/firebase.js";
 
 const hostsCollection = db.collection("hosts");
+const callRoomsCollection = db.collection("callRooms");
 
-const HOST_TIMEOUT_MS = 45_000;
+export const HOST_TIMEOUT_MS = 45_000;
 const TIME_ZONE = "Africa/Johannesburg";
-
-const DAYS = [
-  "Monday",
-  "Tuesday",
-  "Wednesday",
-  "Thursday",
-  "Friday",
-  "Saturday",
-  "Sunday",
-];
-
-const TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
-
 const MAX_AVAILABILITY_SLOTS = 21;
 
-/*
-|--------------------------------------------------------------------------
-| HELPERS
-|--------------------------------------------------------------------------
-*/
-
-function makeError(message, status = 400) {
+function fail(status, message) {
   const error = new Error(message);
   error.status = status;
-  return error;
+  throw error;
 }
 
-function validateHostId(hostId) {
-  if (
-    typeof hostId !== "string" ||
-    !hostId.trim() ||
-    hostId.trim().length > 150 ||
-    hostId.includes("/")
-  ) {
-    throw makeError("Invalid host account identifier.");
-  }
+function timestampMillis(value) {
+  if (!value) return 0;
 
-  return hostId.trim();
-}
-
-function getMillis(value) {
-  if (value && typeof value.toMillis === "function") {
+  if (typeof value.toMillis === "function") {
     return value.toMillis();
   }
 
-  if (value && typeof value.toDate === "function") {
+  if (typeof value.toDate === "function") {
     return value.toDate().getTime();
   }
 
-  if (value instanceof Date) {
-    return value.getTime();
-  }
-
-  if (typeof value === "string" || typeof value === "number") {
-    const milliseconds = new Date(value).getTime();
-
-    return Number.isFinite(milliseconds)
-      ? milliseconds
-      : NaN;
-  }
-
-  return NaN;
+  const result = new Date(value).getTime();
+  return Number.isFinite(result) ? result : 0;
 }
 
-function validateUsername(value) {
+function normalizeUsername(value) {
   if (typeof value !== "string") {
-    throw makeError("Enter a public username.");
+    fail(400, "A public username is required.");
   }
 
   const username = value.trim();
 
-  if (
-    username.length < 3 ||
-    username.length > 32 ||
-    !/^[a-zA-Z0-9_]+$/.test(username)
-  ) {
-    throw makeError(
-      "Username must be 3–32 characters and contain only letters, numbers, or underscores."
+  if (!/^[a-zA-Z0-9_]{3,32}$/.test(username)) {
+    fail(
+      400,
+      "Username must contain 3–32 letters, numbers, or underscores."
     );
   }
 
   return username;
-}
-
-function validateAvailability(value) {
-  if (
-    !Array.isArray(value) ||
-    value.length > MAX_AVAILABILITY_SLOTS
-  ) {
-    throw makeError("Invalid availability schedule.");
-  }
-
-  const slots = value.map((slot) => {
-    if (
-      !slot ||
-      typeof slot !== "object" ||
-      Array.isArray(slot)
-    ) {
-      throw makeError("Invalid availability entry.");
-    }
-
-    const { day, startTime, endTime } = slot;
-
-    if (!DAYS.includes(day)) {
-      throw makeError("Choose a valid day.");
-    }
-
-    if (
-      typeof startTime !== "string" ||
-      typeof endTime !== "string" ||
-      !TIME_PATTERN.test(startTime) ||
-      !TIME_PATTERN.test(endTime) ||
-      startTime >= endTime
-    ) {
-      throw makeError(
-        "Each time slot must have a valid start and end time on the same day."
-      );
-    }
-
-    return { day, startTime, endTime };
-  });
-
-  // Reject duplicate and overlapping slots on the same day.
-  const slotsByDay = new Map();
-
-  for (const slot of slots) {
-    if (!slotsByDay.has(slot.day)) {
-      slotsByDay.set(slot.day, []);
-    }
-
-    slotsByDay.get(slot.day).push(slot);
-  }
-
-  for (const daySlots of slotsByDay.values()) {
-    daySlots.sort((a, b) =>
-      a.startTime.localeCompare(b.startTime)
-    );
-
-    for (let index = 1; index < daySlots.length; index += 1) {
-      if (
-        daySlots[index].startTime <
-        daySlots[index - 1].endTime
-      ) {
-        throw makeError(
-          "Availability slots on the same day cannot overlap."
-        );
-      }
-    }
-  }
-
-  return slots;
-}
-
-function sanitizeAvailability(value) {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  try {
-    return validateAvailability(value);
-  } catch {
-    // Do not expose malformed stored schedule entries.
-    return [];
-  }
 }
 
 function getSouthAfricanDayAndTime(date = new Date()) {
@@ -185,277 +59,416 @@ function getSouthAfricanDayAndTime(date = new Date()) {
   );
 
   return {
-    day: values.weekday,
+    weekday: values.weekday.toLowerCase(),
     time: `${values.hour}:${values.minute}`,
   };
 }
 
-function isRecentlySeen(host, nowMs) {
-  const lastSeenMs = getMillis(host?.lastSeenAt);
+function normalizeDay(value) {
+  if (typeof value !== "string") return "";
 
-  if (!Number.isFinite(lastSeenMs)) {
-    return false;
-  }
+  const day = value.trim().toLowerCase();
 
-  const age = nowMs - lastSeenMs;
+  const aliases = {
+    mon: "monday",
+    tue: "tuesday",
+    tues: "tuesday",
+    wed: "wednesday",
+    thu: "thursday",
+    thur: "thursday",
+    thurs: "thursday",
+    fri: "friday",
+    sat: "saturday",
+    sun: "sunday",
+  };
 
-  return age >= 0 && age <= HOST_TIMEOUT_MS;
+  return aliases[day] || day;
 }
 
-function isValidSlot(slot) {
-  return Boolean(
-    slot &&
-      typeof slot === "object" &&
-      !Array.isArray(slot) &&
-      DAYS.includes(slot.day) &&
-      typeof slot.startTime === "string" &&
-      typeof slot.endTime === "string" &&
-      TIME_PATTERN.test(slot.startTime) &&
-      TIME_PATTERN.test(slot.endTime) &&
-      slot.startTime < slot.endTime
+function validTime(value) {
+  return (
+    typeof value === "string" &&
+    /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value)
   );
 }
 
-function isHostOnline(host, date = new Date()) {
-  if (
-    !host ||
-    !(date instanceof Date) ||
-    !Number.isFinite(date.getTime())
-  ) {
-    return false;
-  }
-
-  return Boolean(
-    host.status === "active" &&
-      typeof host.firebaseUid === "string" &&
-      host.firebaseUid.trim() &&
-      host.acceptingCalls === true &&
-      !host.activeCallId &&
-      isRecentlySeen(host, date.getTime()) &&
-      isWithinHostSchedule(host, date)
+function getSlotDay(slot) {
+  return normalizeDay(
+    slot?.weekday ??
+      slot?.day ??
+      slot?.dayOfWeek
   );
 }
 
-/*
-|--------------------------------------------------------------------------
-| SHARED SCHEDULE CHECK
-|--------------------------------------------------------------------------
-| Schedule times use Africa/Johannesburg.
-| Start is inclusive; end is exclusive.
-|--------------------------------------------------------------------------
-*/
+function getSlotStart(slot) {
+  return slot?.startTime ?? slot?.start;
+}
 
+function getSlotEnd(slot) {
+  return slot?.endTime ?? slot?.end;
+}
+
+/**
+ * Checks whether the host's configured schedule covers the current
+ * South African day and time.
+ *
+ * Availability slots may use:
+ * { weekday: "monday", startTime: "09:00", endTime: "17:00" }
+ *
+ * The day may also be supplied as "day", and times as "start"/"end".
+ */
 export function isWithinHostSchedule(
   host,
   date = new Date()
 ) {
+  const availability = host?.availability;
+
+  if (!Array.isArray(availability) || availability.length === 0) {
+    return false;
+  }
+
+  const current = getSouthAfricanDayAndTime(date);
+
+  return availability.some((slot) => {
+    if (!slot || typeof slot !== "object") return false;
+
+    const day = getSlotDay(slot);
+    const start = getSlotStart(slot);
+    const end = getSlotEnd(slot);
+
+    if (!day || day !== current.weekday) return false;
+    if (!validTime(start) || !validTime(end)) return false;
+    if (start >= end) return false;
+
+    // Start is inclusive; end is exclusive.
+    return current.time >= start && current.time < end;
+  });
+}
+
+function hasRecentHeartbeat(host, date = new Date()) {
+  const lastSeen = timestampMillis(host?.lastSeenAt);
+  const age = date.getTime() - lastSeen;
+
+  return (
+    lastSeen > 0 &&
+    age >= 0 &&
+    age <= HOST_TIMEOUT_MS
+  );
+}
+
+function roomHasCapacity(room, hostId) {
+  if (!room || room.hostId !== hostId) return false;
+
   if (
-    !host ||
-    !Array.isArray(host.availability) ||
-    !(date instanceof Date) ||
-    !Number.isFinite(date.getTime())
+    typeof room.roomName !== "string" ||
+    !room.roomName.startsWith("salive-group-")
   ) {
     return false;
   }
 
-  const { day, time } = getSouthAfricanDayAndTime(date);
+  if (!["waiting_host", "active"].includes(room.status)) {
+    return false;
+  }
 
-  return host.availability.some((slot) => {
-    if (!isValidSlot(slot) || slot.day !== day) {
+  if (room.endedAt) return false;
+
+  const customerIds = Array.isArray(room.customerIds)
+    ? room.customerIds
+    : [];
+
+  const maxCustomers = Number(room.maxCustomers ?? 3);
+
+  return (
+    Number.isInteger(maxCustomers) &&
+    maxCustomers > 0 &&
+    customerIds.length < Math.min(maxCustomers, 3)
+  );
+}
+
+/**
+ * Determines whether a host should be shown as available.
+ *
+ * A legacy activeCallId blocks availability unless the host also has
+ * a valid group room with an available customer seat.
+ *
+ * When a group room is needed, pass its data as the third argument.
+ * Without that data, this function fails closed for activeCallId.
+ */
+export function isHostOnline(
+  host,
+  date = new Date(),
+  groupRoom = null
+) {
+  if (!host || host.status !== "active") return false;
+  if (!host.firebaseUid) return false;
+  if (host.acceptingCalls !== true) return false;
+  if (!hasRecentHeartbeat(host, date)) return false;
+  if (!isWithinHostSchedule(host, date)) return false;
+
+  if (host.activeCallId) {
+    const hasJoinableGroupRoom =
+      host.activeGroupRoomId &&
+      groupRoom &&
+      groupRoom.id === host.activeGroupRoomId &&
+      roomHasCapacity(groupRoom, host.id);
+
+    if (!hasJoinableGroupRoom) return false;
+  }
+
+  if (host.activeGroupRoomId) {
+    if (
+      !groupRoom ||
+      groupRoom.id !== host.activeGroupRoomId ||
+      !roomHasCapacity(groupRoom, host.id)
+    ) {
       return false;
     }
-
-    return time >= slot.startTime && time < slot.endTime;
-  });
-}
-
-/*
-|--------------------------------------------------------------------------
-| GET HOST AVAILABILITY PROFILE
-|--------------------------------------------------------------------------
-| Intended for the authenticated host's own profile.
-| Route middleware must verify host ownership.
-|--------------------------------------------------------------------------
-*/
-
-export async function getHostAvailabilityProfile(hostId) {
-  const safeHostId = validateHostId(hostId);
-
-  const snapshot = await hostsCollection
-    .doc(safeHostId)
-    .get();
-
-  if (!snapshot.exists) {
-    throw makeError("Host account not found.", 404);
   }
 
-  const host = snapshot.data();
-
-  return {
-    id: snapshot.id,
-    publicUsername: host.publicUsername || "",
-    acceptingCalls: host.acceptingCalls === true,
-    availability: sanitizeAvailability(host.availability),
-    accountStatus: host.status || "unknown",
-  };
+  return true;
 }
 
-/*
-|--------------------------------------------------------------------------
-| UPDATE HOST AVAILABILITY PROFILE
-|--------------------------------------------------------------------------
-| Only public username, schedule and acceptingCalls are editable here.
-| Account status, Firebase UID, earnings, and activeCallId cannot be
-| changed through this function.
-|--------------------------------------------------------------------------
-*/
-
-export async function updateHostAvailabilityProfile(
-  hostId,
-  input
-) {
-  const safeHostId = validateHostId(hostId);
-
-  if (
-    !input ||
-    typeof input !== "object" ||
-    Array.isArray(input)
-  ) {
-    throw makeError("Invalid profile details.");
-  }
-
-  const publicUsername = validateUsername(
-    input.publicUsername
-  );
-
-  const usernameLower = publicUsername.toLowerCase();
-
-  const availability = validateAvailability(
-    input.availability
-  );
-
-  if (typeof input.acceptingCalls !== "boolean") {
-    throw makeError(
-      "Choose whether you want to accept calls."
-    );
-  }
-
-  const hostRef = hostsCollection.doc(safeHostId);
-
-  await db.runTransaction(async (transaction) => {
-    const hostSnapshot = await transaction.get(hostRef);
-
-    if (!hostSnapshot.exists) {
-      throw makeError("Host account not found.", 404);
-    }
-
-    const host = hostSnapshot.data();
-
-    if (
-      host.status !== "active" ||
-      typeof host.firebaseUid !== "string" ||
-      !host.firebaseUid.trim()
-    ) {
-      throw makeError(
-        "An active, linked host account is required.",
-        403
-      );
-    }
-
-    // Check both fields to remain compatible with older host records.
-    const usernameQuery = hostsCollection
-      .where("usernameLower", "==", usernameLower)
-      .limit(10);
-
-    const publicUsernameQuery = hostsCollection
-      .where("publicUsernameLower", "==", usernameLower)
-      .limit(10);
-
-    const [
-      usernameMatches,
-      publicUsernameMatches,
-    ] = await Promise.all([
-      transaction.get(usernameQuery),
-      transaction.get(publicUsernameQuery),
-    ]);
-
-    const conflictingIds = new Set([
-      ...usernameMatches.docs.map((doc) => doc.id),
-      ...publicUsernameMatches.docs.map((doc) => doc.id),
-    ]);
-
-    for (const conflictingId of conflictingIds) {
-      if (conflictingId !== hostSnapshot.id) {
-        throw makeError(
-          "That host username is already in use.",
-          409
-        );
-      }
-    }
-
-    transaction.update(hostRef, {
-      username: publicUsername,
-      usernameLower,
-      publicUsername,
-      publicUsernameLower: usernameLower,
-      availability,
-      acceptingCalls: input.acceptingCalls,
-      updatedAt: new Date(),
-    });
-  });
-
-  return getHostAvailabilityProfile(safeHostId);
-}
-
-/*
-|--------------------------------------------------------------------------
-| PUBLIC HOST DIRECTORY
-|--------------------------------------------------------------------------
-| Return an allowlist of public fields only.
-| Do not return Firebase UIDs, email addresses, financial details,
-| internal call IDs, or raw Firestore documents.
-|--------------------------------------------------------------------------
-*/
-
+/**
+ * Public directory.
+ *
+ * Only safe public profile fields are returned. Firebase UIDs,
+ * email addresses, Telegram IDs, and private account data are omitted.
+ */
 export async function getPublicHostDirectory() {
   const snapshot = await hostsCollection
     .where("status", "==", "active")
     .get();
 
-  const now = new Date();
+  const hosts = snapshot.docs.map((doc) => ({
+    id: doc.id,
+    ...doc.data(),
+  }));
 
-  return snapshot.docs
-    .map((doc) => {
-      const host = doc.data();
-
-      if (
-        typeof host.firebaseUid !== "string" ||
-        !host.firebaseUid.trim() ||
-        typeof host.publicUsername !== "string" ||
-        !host.publicUsername.trim()
-      ) {
-        return null;
+  // Read room documents for hosts that currently reference a group room.
+  const roomResults = await Promise.all(
+    hosts.map(async (host) => {
+      if (!host.activeGroupRoomId) {
+        return [host.id, null];
       }
 
-      const username = host.publicUsername.trim();
-      const online = isHostOnline(host, now);
+      try {
+        const roomSnapshot = await callRoomsCollection
+          .doc(host.activeGroupRoomId)
+          .get();
+
+        if (!roomSnapshot.exists) {
+          return [host.id, null];
+        }
+
+        return [
+          host.id,
+          {
+            id: roomSnapshot.id,
+            ...roomSnapshot.data(),
+          },
+        ];
+      } catch {
+        // Fail closed: if room status cannot be verified,
+        // do not advertise the host as available.
+        return [host.id, null];
+      }
+    })
+  );
+
+  const roomByHostId = new Map(roomResults);
+
+  return hosts
+    .map((host) => {
+      const room = roomByHostId.get(host.id) ?? null;
+      const online = isHostOnline(host, new Date(), room);
+
+      const username =
+        host.publicUsername ||
+        host.username ||
+        "";
 
       return {
-        // Public display identifier, not an authorization identifier.
-        id: username.toLowerCase(),
+        id: host.id,
         username,
         displayName:
-          typeof host.displayName === "string" &&
-          host.displayName.trim()
-            ? host.displayName.trim()
-            : username,
+          host.displayName ||
+          host.name ||
+          "SA LIVE Host",
+        photoURL:
+          host.photoURL ||
+          host.profilePicture ||
+          null,
+        bio: host.bio || "",
+        languages: Array.isArray(host.languages)
+          ? host.languages
+          : [],
         online,
         status: online ? "online" : "offline",
-        availability: sanitizeAvailability(host.availability),
+        acceptingCalls: host.acceptingCalls === true,
+        availability: Array.isArray(host.availability)
+          ? host.availability
+          : [],
+        groupRoomAvailable: Boolean(
+          room && roomHasCapacity(room, host.id)
+        ),
+        groupCustomerCount: room
+          ? (
+              Array.isArray(room.customerIds)
+                ? room.customerIds.length
+                : 0
+            )
+          : 0,
+        maxGroupCustomers: 3,
       };
     })
-    .filter(Boolean)
     .sort((a, b) =>
-      a.username.localeCompare(b.username)
+      Number(b.online) - Number(a.online)
     );
+}
+
+/**
+ * Updates a host's public username, availability schedule,
+ * and call-acceptance preference.
+ *
+ * Expected input:
+ * { hostId, firebaseUid, username, availability, acceptingCalls }
+ *
+ * The caller must already authenticate the user. This service also
+ * verifies that the host document belongs to the supplied Firebase UID.
+ */
+export async function updateHostAvailabilityProfile({
+  hostId,
+  firebaseUid,
+  username,
+  availability,
+  acceptingCalls,
+}) {
+  if (
+    typeof hostId !== "string" ||
+    !hostId.trim() ||
+    typeof firebaseUid !== "string" ||
+    !firebaseUid.trim()
+  ) {
+    fail(400, "A valid host ID and Firebase UID are required.");
+  }
+
+  if (!Array.isArray(availability)) {
+    fail(400, "Availability must be a list of schedule slots.");
+  }
+
+  if (availability.length > MAX_AVAILABILITY_SLOTS) {
+    fail(
+      400,
+      `You can configure up to ${MAX_AVAILABILITY_SLOTS} availability slots.`
+    );
+  }
+
+  if (typeof acceptingCalls !== "boolean") {
+    fail(400, "acceptingCalls must be true or false.");
+  }
+
+  const normalizedUsername = normalizeUsername(username);
+
+  const normalizedAvailability = availability.map((slot) => {
+    if (!slot || typeof slot !== "object") {
+      fail(400, "Each availability slot must be an object.");
+    }
+
+    const weekday = getSlotDay(slot);
+    const startTime = getSlotStart(slot);
+    const endTime = getSlotEnd(slot);
+
+    const validDays = [
+      "monday",
+      "tuesday",
+      "wednesday",
+      "thursday",
+      "friday",
+      "saturday",
+      "sunday",
+    ];
+
+    if (!validDays.includes(weekday)) {
+      fail(400, "Each schedule slot needs a valid weekday.");
+    }
+
+    if (
+      !validTime(startTime) ||
+      !validTime(endTime) ||
+      startTime >= endTime
+    ) {
+      fail(
+        400,
+        "Each schedule slot needs valid start and end times, with the end after the start."
+      );
+    }
+
+    return {
+      weekday,
+      startTime,
+      endTime,
+    };
+  });
+
+  const usernameLower = normalizedUsername.toLowerCase();
+  const hostRef = hostsCollection.doc(hostId);
+
+  // Check username uniqueness across other active host records.
+  const [usernameMatches, publicUsernameMatches] = await Promise.all([
+    hostsCollection
+      .where("usernameLower", "==", usernameLower)
+      .limit(20)
+      .get(),
+    hostsCollection
+      .where("publicUsernameLower", "==", usernameLower)
+      .limit(20)
+      .get(),
+  ]);
+
+  const conflict = [
+    ...usernameMatches.docs,
+    ...publicUsernameMatches.docs,
+  ].some((doc) => doc.id !== hostId);
+
+  if (conflict) {
+    fail(409, "That username is already in use.");
+  }
+
+  return db.runTransaction(async (transaction) => {
+    const hostSnapshot = await transaction.get(hostRef);
+
+    if (!hostSnapshot.exists) {
+      fail(404, "Host account not found.");
+    }
+
+    const host = hostSnapshot.data();
+
+    if (host.firebaseUid !== firebaseUid) {
+      fail(403, "You are not authorized to update this host profile.");
+    }
+
+    if (host.status !== "active") {
+      fail(403, "Only active hosts can update availability.");
+    }
+
+    const now = new Date();
+
+    transaction.update(hostRef, {
+      username: normalizedUsername,
+      usernameLower,
+      publicUsername: normalizedUsername,
+      publicUsernameLower: usernameLower,
+      availability: normalizedAvailability,
+      acceptingCalls,
+      updatedAt: now,
+    });
+
+    return {
+      id: hostId,
+      username: normalizedUsername,
+      availability: normalizedAvailability,
+      acceptingCalls,
+      updatedAt: now,
+    };
+  });
 }
