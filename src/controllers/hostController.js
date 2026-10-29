@@ -188,6 +188,7 @@ export async function getMyHostProfile(req, res) {
 |--------------------------------------------------------------------------
 */
 
+
 export async function updateMyHostProfile(req, res) {
   const hostId = req.hostAccount?.id;
   const firebaseUid = getAuthenticatedUid(req);
@@ -206,8 +207,8 @@ export async function updateMyHostProfile(req, res) {
     });
   }
 
-  // Explicitly whitelist the fields accepted from the browser.
   const {
+    publicUsername,
     username,
     availability,
     acceptingCalls,
@@ -217,7 +218,10 @@ export async function updateMyHostProfile(req, res) {
     const profile = await updateHostAvailabilityProfile({
       hostId,
       firebaseUid,
-      username,
+
+      // Support the existing frontend field name.
+      username: publicUsername ?? username,
+
       availability,
       acceptingCalls,
     });
@@ -236,6 +240,7 @@ export async function updateMyHostProfile(req, res) {
     );
   }
 }
+
 
 /*
 |--------------------------------------------------------------------------

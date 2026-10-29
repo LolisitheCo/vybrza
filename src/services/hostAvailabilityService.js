@@ -354,7 +354,8 @@ export async function getPublicHostDirectory() {
 
       return {
         id: host.id,
-        username: host.publicUsername || host.username || "",
+       publicUsername: host.publicUsername || host.username || "",
+       username: host.publicUsername || host.username || "",
         displayName:
           host.displayName || host.name || "SA LIVE Host",
         photoURL:
