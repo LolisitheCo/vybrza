@@ -17,6 +17,8 @@ const callSessions = db.collection("callSessions");
 const hosts = db.collection("hosts");
 const callRooms = db.collection("callRooms");
 
+const MAX_GROUP_PARTICIPANTS = 4;
+
 function getLiveKitConfig() {
   const url = process.env.LIVEKIT_URL?.trim();
   const apiKey = process.env.LIVEKIT_API_KEY?.trim();
@@ -40,8 +42,6 @@ function getRoomService(url, apiKey, apiSecret) {
 
   if (parsedUrl.protocol === "wss:") {
     parsedUrl.protocol = "https:";
-  } else if (parsedUrl.protocol === "ws:") {
-    parsedUrl.protocol = "http:";
   }
 
   return new RoomServiceClient(
@@ -51,17 +51,8 @@ function getRoomService(url, apiKey, apiSecret) {
   );
 }
 
-function getLegacyCallIdFromRoomName(roomName) {
-  if (typeof roomName !== "string") return null;
-
-  const match = /^salive-([A-Za-z0-9_-]{1,150})$/.exec(roomName);
-
-  if (!match) return null;
-
-  // A group room must never be mistaken for a legacy call ID.
-  if (match[1].startsWith("group-")) return null;
-
-  return match[1];
+function timestampNow() {
+  return new Date();
 }
 
 function isGroupRoomName(roomName) {
@@ -71,21 +62,50 @@ function isGroupRoomName(roomName) {
   );
 }
 
-function timestampNow() {
-  return new Date();
+function getLegacyCallIdFromRoomName(roomName) {
+  if (typeof roomName !== "string") {
+    return null;
+  }
+
+  const match = /^salive-([A-Za-z0-9_-]{1,150})$/.exec(roomName);
+
+  if (!match) {
+    return null;
+  }
+
+  // Never interpret a group room as a legacy call.
+  if (match[1].startsWith("group-")) {
+    return null;
+  }
+
+  return match[1];
+}
+
+function normalizeIds(values) {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+
+  return [
+    ...new Set(
+      values.filter(
+        (value) =>
+          typeof value === "string" &&
+          value.trim().length > 0 &&
+          value.length <= 150
+      )
+    ),
+  ];
+}
+
+function isActiveCallStatus(status) {
+  return ["matching", "matched", "active"].includes(status);
 }
 
 async function getCallIdsForGroup(groupRoomId, roomData) {
-  const callIds = new Set(
-    Array.isArray(roomData?.callIds)
-      ? roomData.callIds.filter(
-          (id) => typeof id === "string" && id.length > 0
-        )
-      : []
-  );
+  const callIds = new Set(normalizeIds(roomData?.callIds));
 
-  // Include sessions linked to the group in case the room's
-  // callIds array was not updated correctly.
+  // Recover sessions even if callIds was not updated correctly.
   const snapshot = await callSessions
     .where("groupRoomId", "==", groupRoomId)
     .get();
@@ -97,30 +117,87 @@ async function getCallIdsForGroup(groupRoomId, roomData) {
   return [...callIds];
 }
 
-async function startEligibleGroupCalls(roomData, roomName, url, roomService) {
-  if (!roomData?.id || !roomData.hostId) return;
-
-  if (roomData.status === "ended" || roomData.endedAt) return;
+async function getGroupHostIdentity(roomData) {
+  if (!roomData?.hostId) {
+    return null;
+  }
 
   const hostSnapshot = await hosts.doc(roomData.hostId).get();
+
+  if (!hostSnapshot.exists) {
+    return null;
+  }
+
   const hostUid = hostSnapshot.data()?.firebaseUid;
 
-  if (!hostUid) return;
+  return typeof hostUid === "string" && hostUid.length > 0
+    ? hostUid
+    : null;
+}
 
+async function getRoomIdentities(roomService, roomName) {
   const participants = await roomService.listParticipants(roomName);
-  const identities = new Set(
-    participants.map((participant) => participant.identity)
+
+  return new Set(
+    participants
+      .map((participant) => participant.identity)
+      .filter(
+        (identity) =>
+          typeof identity === "string" && identity.length > 0
+      )
+  );
+}
+
+/**
+ * Starts individual customer sessions only when:
+ * - the group room is still active;
+ * - the host is in the LiveKit room;
+ * - the specific customer is in the LiveKit room;
+ * - the customer's call is still matched.
+ *
+ * Each customer has their own callSession and billing timer.
+ */
+async function startEligibleGroupCalls(
+  roomData,
+  roomName,
+  url,
+  roomService
+) {
+  if (!roomData?.id || !roomData.hostId) {
+    return;
+  }
+
+  if (roomData.status === "ended" || roomData.endedAt) {
+    return;
+  }
+
+  const hostUid = await getGroupHostIdentity(roomData);
+
+  if (!hostUid) {
+    return;
+  }
+
+  const identities = await getRoomIdentities(
+    roomService,
+    roomName
   );
 
-  // A host must be in the room before any customer timer starts.
-  if (!identities.has(hostUid)) return;
+  // Do not start any customer timer before the host joins.
+  if (!identities.has(hostUid)) {
+    return;
+  }
 
-  const callIds = await getCallIdsForGroup(roomData.id, roomData);
+  const callIds = await getCallIdsForGroup(
+    roomData.id,
+    roomData
+  );
 
   for (const callId of callIds) {
     const callSnapshot = await callSessions.doc(callId).get();
 
-    if (!callSnapshot.exists) continue;
+    if (!callSnapshot.exists) {
+      continue;
+    }
 
     const call = callSnapshot.data();
 
@@ -133,62 +210,176 @@ async function startEligibleGroupCalls(roomData, roomName, url, roomService) {
       continue;
     }
 
-    // Each customer has their own call session and billing timer.
+    // startCall must be idempotent because webhooks can be retried.
     await startCall(callId, roomName, url);
   }
 
-  await callRooms.doc(roomData.id).update({
-    status: "active",
-    startedAt: roomData.startedAt || timestampNow(),
-    updatedAt: timestampNow(),
+  // Only mark the room active if it has not been ended meanwhile.
+  const roomRef = callRooms.doc(roomData.id);
+
+  await db.runTransaction(async (transaction) => {
+    const roomSnapshot = await transaction.get(roomRef);
+
+    if (!roomSnapshot.exists) {
+      return;
+    }
+
+    const latestRoom = roomSnapshot.data();
+
+    if (
+      latestRoom.status === "ended" ||
+      latestRoom.endedAt
+    ) {
+      return;
+    }
+
+    transaction.update(roomRef, {
+      status: "active",
+      startedAt: latestRoom.startedAt || timestampNow(),
+      updatedAt: timestampNow(),
+    });
   });
 }
 
-async function endUnfinishedGroupCalls(groupRoomId, roomData) {
-  const callIds = await getCallIdsForGroup(groupRoomId, roomData);
+/**
+ * Ends one customer's call without ending the shared group room.
+ */
+async function endCustomerGroupCall(
+  callId,
+  groupRoomId,
+  reason = "connection_lost"
+) {
+  const callRef = callSessions.doc(callId);
+  const callSnapshot = await callRef.get();
 
-  for (const callId of callIds) {
-    const callSnapshot = await callSessions.doc(callId).get();
-
-    if (!callSnapshot.exists) continue;
-
-    const call = callSnapshot.data();
-
-    if (
-      call.groupRoomId !== groupRoomId ||
-      !["matching", "matched", "active"].includes(call.status)
-    ) {
-      continue;
-    }
-
-    // Do not end an unrelated customer's call session.
-    await endCall(callId, "connection_lost");
+  if (!callSnapshot.exists) {
+    return;
   }
 
+  const call = callSnapshot.data();
+
+  if (call.groupRoomId !== groupRoomId) {
+    return;
+  }
+
+  if (!isActiveCallStatus(call.status)) {
+    return;
+  }
+
+  await endCall(callId, reason);
+
+  // Remove only this customer from the room membership list.
+  // Keep callIds so history and recovery remain possible.
   const roomRef = callRooms.doc(groupRoomId);
 
   await db.runTransaction(async (transaction) => {
     const roomSnapshot = await transaction.get(roomRef);
 
-    if (!roomSnapshot.exists) return;
-
-    const latestRoom = roomSnapshot.data();
-
-    if (latestRoom.status === "ended" && latestRoom.endedAt) {
+    if (!roomSnapshot.exists) {
       return;
     }
 
+    const latestRoom = roomSnapshot.data();
+
+    if (latestRoom.status === "ended" || latestRoom.endedAt) {
+      return;
+    }
+
+    const customerIds = normalizeIds(latestRoom.customerIds)
+      .filter((id) => id !== call.userId);
+
     transaction.update(roomRef, {
-      status: "ended",
-      endedAt: timestampNow(),
+      customerIds,
       updatedAt: timestampNow(),
     });
+  });
+}
 
-    const hostRef = hosts.doc(latestRoom.hostId);
-    const hostSnapshot = await transaction.get(hostRef);
+/**
+ * Ends every unfinished customer session in a group.
+ * Used when the host leaves or the room finishes.
+ */
+async function endUnfinishedGroupCalls(
+  groupRoomId,
+  roomData,
+  reason = "connection_lost"
+) {
+  const callIds = await getCallIdsForGroup(
+    groupRoomId,
+    roomData
+  );
+
+  const billingFailures = [];
+
+  for (const callId of callIds) {
+    try {
+      const callSnapshot = await callSessions.doc(callId).get();
+
+      if (!callSnapshot.exists) {
+        continue;
+      }
+
+      const call = callSnapshot.data();
+
+      if (call.groupRoomId !== groupRoomId) {
+        continue;
+      }
+
+      if (!isActiveCallStatus(call.status)) {
+        continue;
+      }
+
+      await endCall(callId, reason);
+    } catch (error) {
+      billingFailures.push({
+        callId,
+        message: error?.message || "Unable to end call.",
+      });
+
+      console.error("SA LIVE group call ending failed:", {
+        callId,
+        message: error?.message || "Unknown error",
+      });
+    }
+  }
+
+  // Firestore transactions must complete all reads before writes.
+  const roomRef = callRooms.doc(groupRoomId);
+
+  await db.runTransaction(async (transaction) => {
+    const roomSnapshot = await transaction.get(roomRef);
+
+    if (!roomSnapshot.exists) {
+      return;
+    }
+
+    const latestRoom = roomSnapshot.data();
+
+    const hostRef = latestRoom.hostId
+      ? hosts.doc(latestRoom.hostId)
+      : null;
+
+    const hostSnapshot = hostRef
+      ? await transaction.get(hostRef)
+      : null;
 
     if (
-      hostSnapshot.exists &&
+      latestRoom.status !== "ended" ||
+      !latestRoom.endedAt
+    ) {
+      transaction.update(roomRef, {
+        status: "ended",
+        endedAt: timestampNow(),
+        updatedAt: timestampNow(),
+        billingFailures: billingFailures.map((failure) => ({
+          callId: failure.callId,
+          message: failure.message.slice(0, 300),
+        })),
+      });
+    }
+
+    if (
+      hostSnapshot?.exists &&
       hostSnapshot.data()?.activeGroupRoomId === groupRoomId
     ) {
       transaction.update(hostRef, {
@@ -197,14 +388,140 @@ async function endUnfinishedGroupCalls(groupRoomId, roomData) {
       });
     }
   });
+
+  return billingFailures;
 }
 
-/*
+/**
+ * Finds a customer session from a participant identity.
+ */
+async function findGroupCallForCustomer(
+  groupRoomId,
+  customerUid,
+  roomData
+) {
+  const callIds = await getCallIdsForGroup(
+    groupRoomId,
+    roomData
+  );
+
+  for (const callId of callIds) {
+    const snapshot = await callSessions.doc(callId).get();
+
+    if (!snapshot.exists) {
+      continue;
+    }
+
+    const call = snapshot.data();
+
+    if (
+      call.groupRoomId === groupRoomId &&
+      call.userId === customerUid &&
+      isActiveCallStatus(call.status)
+    ) {
+      return {
+        id: callId,
+        ...call,
+      };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Handles a participant leaving a group room.
+ *
+ * Customer departure:
+ *   Ends only that customer's call.
+ *
+ * Host departure:
+ *   Ends all calls in the group.
+ */
+async function handleGroupParticipantLeft(
+  event,
+  groupRoomId,
+  roomData,
+  roomService
+) {
+  const participantUid = event.participant?.identity;
+
+  if (
+    typeof participantUid !== "string" ||
+    !participantUid
+  ) {
+    return;
+  }
+
+  const hostUid = await getGroupHostIdentity(roomData);
+
+  if (!hostUid) {
+    return;
+  }
+
+  if (participantUid === hostUid) {
+    await endUnfinishedGroupCalls(
+      groupRoomId,
+      roomData,
+      "connection_lost"
+    );
+
+    // The host has left. Close the shared LiveKit room.
+    try {
+      await roomService.deleteRoom(roomData.roomName);
+    } catch (error) {
+      console.error("SA LIVE group room deletion failed:", {
+        roomName: roomData.roomName,
+        message: error?.message || "Unknown error",
+      });
+    }
+
+    return;
+  }
+
+  const customerCall = await findGroupCallForCustomer(
+    groupRoomId,
+    participantUid,
+    roomData
+  );
+
+  if (!customerCall) {
+    return;
+  }
+
+  await endCustomerGroupCall(
+    customerCall.id,
+    groupRoomId,
+    "connection_lost"
+  );
+}
+
+/**
+ * Ends legacy one-to-one calls when their room finishes.
+ */
+async function handleLegacyRoomFinished(callId) {
+  const callSnapshot = await callSessions.doc(callId).get();
+
+  if (!callSnapshot.exists) {
+    return;
+  }
+
+  const call = callSnapshot.data();
+
+  if (call.groupRoomId) {
+    return;
+  }
+
+  if (isActiveCallStatus(call.status)) {
+    await endCall(callId, "connection_lost");
+  }
+}
+
+/**
  * POST /api/livekit/webhook
  *
- * IMPORTANT:
- * Keep this route using the raw request body.
- * LiveKit validates its webhook signature using the original body.
+ * This endpoint MUST receive the original raw body.
+ * Do not move express.json() ahead of this route for this path.
  */
 router.post(
   "/webhook",
@@ -223,7 +540,10 @@ router.post(
 
       const { url, apiKey, apiSecret } = getLiveKitConfig();
 
-      const receiver = new WebhookReceiver(apiKey, apiSecret);
+      const receiver = new WebhookReceiver(
+        apiKey,
+        apiSecret
+      );
 
       const event = await receiver.receive(
         req.body.toString("utf8"),
@@ -232,14 +552,23 @@ router.post(
 
       const roomName = event.room?.name;
 
-      if (typeof roomName !== "string" || !roomName) {
+      if (
+        typeof roomName !== "string" ||
+        roomName.length === 0
+      ) {
         return res.status(200).json({
           success: true,
           ignored: true,
         });
       }
 
-      /*
+      const roomService = getRoomService(
+        url,
+        apiKey,
+        apiSecret
+      );
+
+      /**
        * GROUP ROOM EVENTS
        */
       if (isGroupRoomName(roomName)) {
@@ -257,45 +586,69 @@ router.post(
 
         const roomDocument = roomSnapshot.docs[0];
         const groupRoomId = roomDocument.id;
+
         const roomData = {
-          id: roomDocument.id,
+          id: groupRoomId,
           ...roomDocument.data(),
         };
 
         if (
-          event.event === "participant_joined" ||
-          event.event === "participant_left"
+          roomData.status === "ended" ||
+          roomData.endedAt
         ) {
-          if (
-            roomData.status !== "ended" &&
-            !roomData.endedAt
-          ) {
-            const roomService = getRoomService(
-              url,
-              apiKey,
-              apiSecret
-            );
+          return res.status(200).json({
+            success: true,
+            ignored: true,
+          });
+        }
 
-            await startEligibleGroupCalls(
-              roomData,
-              roomName,
-              url,
-              roomService
-            );
-          }
+        if (event.event === "participant_joined") {
+          await startEligibleGroupCalls(
+            roomData,
+            roomName,
+            url,
+            roomService
+          );
+
+          return res.status(200).json({
+            success: true,
+          });
+        }
+
+        if (event.event === "participant_left") {
+          await handleGroupParticipantLeft(
+            event,
+            groupRoomId,
+            roomData,
+            roomService
+          );
+
+          return res.status(200).json({
+            success: true,
+          });
         }
 
         if (event.event === "room_finished") {
-          await endUnfinishedGroupCalls(
-            groupRoomId,
-            roomData
-          );
+          const billingFailures =
+            await endUnfinishedGroupCalls(
+              groupRoomId,
+              roomData,
+              "connection_lost"
+            );
+
+          return res.status(200).json({
+            success: true,
+            billingFailures: billingFailures.length,
+          });
         }
 
-        return res.status(200).json({ success: true });
+        return res.status(200).json({
+          success: true,
+          ignored: true,
+        });
       }
 
-      /*
+      /**
        * LEGACY ONE-TO-ONE ROOM EVENTS
        */
       const callId = getLegacyCallIdFromRoomName(roomName);
@@ -319,7 +672,7 @@ router.post(
 
       const call = callSnapshot.data();
 
-      // A legacy room should not be used to control a group session.
+      // A legacy room must never control a group call.
       if (call.groupRoomId) {
         return res.status(200).json({
           success: true,
@@ -329,14 +682,10 @@ router.post(
 
       if (event.event === "participant_joined") {
         if (call.status !== "matched") {
-          return res.status(200).json({ success: true });
+          return res.status(200).json({
+            success: true,
+          });
         }
-
-        const roomService = getRoomService(
-          url,
-          apiKey,
-          apiSecret
-        );
 
         const participants = await roomService.listParticipants(
           roomName
@@ -356,15 +705,24 @@ router.post(
         ) {
           await startCall(callId, roomName, url);
         }
+
+        return res.status(200).json({
+          success: true,
+        });
       }
 
       if (event.event === "room_finished") {
-        if (["matching", "matched", "active"].includes(call.status)) {
-          await endCall(callId, "connection_lost");
-        }
+        await handleLegacyRoomFinished(callId);
+
+        return res.status(200).json({
+          success: true,
+        });
       }
 
-      return res.status(200).json({ success: true });
+      return res.status(200).json({
+        success: true,
+        ignored: true,
+      });
     } catch (error) {
       console.error("SA LIVE webhook processing failed:", {
         message: error?.message || "Unknown error",

@@ -6,49 +6,27 @@ import {
   requireVerifiedEmail,
 } from "../middleware/authMiddleware.js";
 
-import { matchUserToHost } from "../services/matchingService.js";
+import {
+  requestCustomerCall,
+  getCurrentCustomerCall,
+  cancelCustomerCall,
+} from "../controllers/customerCallController.js";
 
 const router = express.Router();
 
-// Every customer call request requires Firebase authentication.
+// All customer call operations require authentication.
 router.use(verifyFirebaseToken);
 
-/*
- * POST /api/customer-calls/match
- *
- * Requires:
- * 1. A valid Firebase ID token.
- * 2. A verified Firebase Authentication email.
- *
- * Customer identity comes exclusively from the verified token.
- */
-router.post("/match", requireVerifiedEmail, async (req, res, next) => {
-  try {
-    const userId = req.user.uid;
+// All customer call operations require a verified email.
+router.use(requireVerifiedEmail);
 
-    const result = await matchUserToHost(userId);
+// Create a new customer call request.
+router.post("/match", requestCustomerCall);
 
-    res.setHeader("Cache-Control", "no-store");
+// Get the customer's current request or call.
+router.get("/current", getCurrentCustomerCall);
 
-    if (!result?.matched) {
-      return res.status(409).json({
-        success: false,
-        message:
-          result?.message ||
-          "No available host was found. Please try again shortly.",
-        retry: Boolean(result?.retry),
-      });
-    }
-
-    return res.status(200).json({
-      success: true,
-      message: "A host has been matched.",
-      call: result.call,
-      host: result.host,
-    });
-  } catch (error) {
-    return next(error);
-  }
-});
+// Cancel a request that has not yet been accepted.
+router.post("/cancel", cancelCustomerCall);
 
 export default router;
