@@ -1,11 +1,24 @@
+
 import { db } from "../config/firebase.js";
 
 const hostsCollection = db.collection("hosts");
 const callRoomsCollection = db.collection("callRooms");
 
 export const HOST_TIMEOUT_MS = 45_000;
+
 const TIME_ZONE = "Africa/Johannesburg";
 const MAX_AVAILABILITY_SLOTS = 21;
+const MAX_GROUP_CUSTOMERS = 2;
+
+const VALID_DAYS = new Set([
+  "monday",
+  "tuesday",
+  "wednesday",
+  "thursday",
+  "friday",
+  "saturday",
+  "sunday",
+]);
 
 function fail(status, message) {
   const error = new Error(message);
@@ -25,12 +38,13 @@ function timestampMillis(value) {
   }
 
   const result = new Date(value).getTime();
+
   return Number.isFinite(result) ? result : 0;
 }
 
 function normalizeUsername(value) {
   if (typeof value !== "string") {
-    fail(400, "A public username is required.");
+    fail(400, "Enter a public username.");
   }
 
   const username = value.trim();
@@ -38,30 +52,11 @@ function normalizeUsername(value) {
   if (!/^[a-zA-Z0-9_]{3,32}$/.test(username)) {
     fail(
       400,
-      "Username must contain 3–32 letters, numbers, or underscores."
+      "Username must be 3–32 characters and contain only letters, numbers, or underscores."
     );
   }
 
   return username;
-}
-
-function getSouthAfricanDayAndTime(date = new Date()) {
-  const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: TIME_ZONE,
-    weekday: "long",
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-  }).formatToParts(date);
-
-  const values = Object.fromEntries(
-    parts.map((part) => [part.type, part.value])
-  );
-
-  return {
-    weekday: values.weekday.toLowerCase(),
-    time: `${values.hour}:${values.minute}`,
-  };
 }
 
 function normalizeDay(value) {
@@ -94,9 +89,7 @@ function validTime(value) {
 
 function getSlotDay(slot) {
   return normalizeDay(
-    slot?.weekday ??
-      slot?.day ??
-      slot?.dayOfWeek
+    slot?.weekday ?? slot?.day ?? slot?.dayOfWeek
   );
 }
 
@@ -108,15 +101,69 @@ function getSlotEnd(slot) {
   return slot?.endTime ?? slot?.end;
 }
 
-/**
- * Checks whether the host's configured schedule covers the current
- * South African day and time.
- *
- * Availability slots may use:
- * { weekday: "monday", startTime: "09:00", endTime: "17:00" }
- *
- * The day may also be supplied as "day", and times as "start"/"end".
- */
+function getSouthAfricanDayAndTime(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: TIME_ZONE,
+    weekday: "long",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+
+  const values = Object.fromEntries(
+    parts.map((part) => [part.type, part.value])
+  );
+
+  return {
+    weekday: values.weekday.toLowerCase(),
+    time: `${values.hour}:${values.minute}`,
+  };
+}
+
+function normalizeAvailability(availability) {
+  if (!Array.isArray(availability)) {
+    fail(400, "Invalid availability schedule.");
+  }
+
+  if (availability.length > MAX_AVAILABILITY_SLOTS) {
+    fail(
+      400,
+      `You can configure up to ${MAX_AVAILABILITY_SLOTS} availability slots.`
+    );
+  }
+
+  return availability.map((slot) => {
+    if (!slot || typeof slot !== "object" || Array.isArray(slot)) {
+      fail(400, "Invalid availability entry.");
+    }
+
+    const weekday = getSlotDay(slot);
+    const startTime = getSlotStart(slot);
+    const endTime = getSlotEnd(slot);
+
+    if (!VALID_DAYS.has(weekday)) {
+      fail(400, "Choose a valid day.");
+    }
+
+    if (
+      !validTime(startTime) ||
+      !validTime(endTime) ||
+      startTime >= endTime
+    ) {
+      fail(
+        400,
+        "Each time slot must have a valid start and end time on the same day."
+      );
+    }
+
+    return {
+      weekday,
+      startTime,
+      endTime,
+    };
+  });
+}
+
 export function isWithinHostSchedule(
   host,
   date = new Date()
@@ -136,11 +183,10 @@ export function isWithinHostSchedule(
     const start = getSlotStart(slot);
     const end = getSlotEnd(slot);
 
-    if (!day || day !== current.weekday) return false;
+    if (day !== current.weekday) return false;
     if (!validTime(start) || !validTime(end)) return false;
     if (start >= end) return false;
 
-    // Start is inclusive; end is exclusive.
     return current.time >= start && current.time < end;
   });
 }
@@ -176,23 +222,23 @@ function roomHasCapacity(room, hostId) {
     ? room.customerIds
     : [];
 
-  const maxCustomers = Number(room.maxCustomers ?? 3);
+  const configuredLimit = Number(room.maxCustomers ?? MAX_GROUP_CUSTOMERS);
 
-  return (
-    Number.isInteger(maxCustomers) &&
-    maxCustomers > 0 &&
-    customerIds.length < Math.min(maxCustomers, 3)
+  if (!Number.isInteger(configuredLimit) || configuredLimit < 1) {
+    return false;
+  }
+
+  return customerIds.length < Math.min(
+    configuredLimit,
+    MAX_GROUP_CUSTOMERS
   );
 }
 
 /**
- * Determines whether a host should be shown as available.
+ * Determines whether a host is available.
  *
- * A legacy activeCallId blocks availability unless the host also has
- * a valid group room with an available customer seat.
- *
- * When a group room is needed, pass its data as the third argument.
- * Without that data, this function fails closed for activeCallId.
+ * A group room is only considered joinable when its ownership,
+ * status and remaining capacity can be verified.
  */
 export function isHostOnline(
   host,
@@ -205,18 +251,9 @@ export function isHostOnline(
   if (!hasRecentHeartbeat(host, date)) return false;
   if (!isWithinHostSchedule(host, date)) return false;
 
-  if (host.activeCallId) {
-    const hasJoinableGroupRoom =
-      host.activeGroupRoomId &&
-      groupRoom &&
-      groupRoom.id === host.activeGroupRoomId &&
-      roomHasCapacity(groupRoom, host.id);
-
-    if (!hasJoinableGroupRoom) return false;
-  }
-
-  if (host.activeGroupRoomId) {
+  if (host.activeCallId || host.activeGroupRoomId) {
     if (
+      !host.activeGroupRoomId ||
       !groupRoom ||
       groupRoom.id !== host.activeGroupRoomId ||
       !roomHasCapacity(groupRoom, host.id)
@@ -229,10 +266,39 @@ export function isHostOnline(
 }
 
 /**
- * Public directory.
- *
- * Only safe public profile fields are returned. Firebase UIDs,
- * email addresses, Telegram IDs, and private account data are omitted.
+ * Returns the authenticated host's editable public profile.
+ * Private account fields are deliberately excluded.
+ */
+export async function getHostAvailabilityProfile(hostId) {
+  if (typeof hostId !== "string" || !hostId.trim()) {
+    fail(400, "A valid host ID is required.");
+  }
+
+  const snapshot = await hostsCollection.doc(hostId).get();
+
+  if (!snapshot.exists) {
+    fail(404, "Host profile not found.");
+  }
+
+  const host = snapshot.data();
+
+  return {
+    id: snapshot.id,
+    username: host.publicUsername || host.username || "",
+    displayName: host.displayName || host.name || "",
+    photoURL: host.photoURL || host.profilePicture || null,
+    bio: host.bio || "",
+    languages: Array.isArray(host.languages) ? host.languages : [],
+    availability: Array.isArray(host.availability)
+      ? host.availability
+      : [],
+    acceptingCalls: host.acceptingCalls === true,
+    status: host.status || "inactive",
+  };
+}
+
+/**
+ * Returns only safe public host directory information.
  */
 export async function getPublicHostDirectory() {
   const snapshot = await hostsCollection
@@ -244,7 +310,6 @@ export async function getPublicHostDirectory() {
     ...doc.data(),
   }));
 
-  // Read room documents for hosts that currently reference a group room.
   const roomResults = await Promise.all(
     hosts.map(async (host) => {
       if (!host.activeGroupRoomId) {
@@ -267,37 +332,33 @@ export async function getPublicHostDirectory() {
             ...roomSnapshot.data(),
           },
         ];
-      } catch {
-        // Fail closed: if room status cannot be verified,
-        // do not advertise the host as available.
+      } catch (error) {
+        console.error(
+          "Unable to verify host group room:",
+          host.id,
+          error.message
+        );
+
         return [host.id, null];
       }
     })
   );
 
   const roomByHostId = new Map(roomResults);
+  const now = new Date();
 
   return hosts
     .map((host) => {
       const room = roomByHostId.get(host.id) ?? null;
-      const online = isHostOnline(host, new Date(), room);
-
-      const username =
-        host.publicUsername ||
-        host.username ||
-        "";
+      const online = isHostOnline(host, now, room);
 
       return {
         id: host.id,
-        username,
+        username: host.publicUsername || host.username || "",
         displayName:
-          host.displayName ||
-          host.name ||
-          "SA LIVE Host",
+          host.displayName || host.name || "SA LIVE Host",
         photoURL:
-          host.photoURL ||
-          host.profilePicture ||
-          null,
+          host.photoURL || host.profilePicture || null,
         bio: host.bio || "",
         languages: Array.isArray(host.languages)
           ? host.languages
@@ -318,23 +379,23 @@ export async function getPublicHostDirectory() {
                 : 0
             )
           : 0,
-        maxGroupCustomers: 3,
+        maxGroupCustomers: MAX_GROUP_CUSTOMERS,
       };
     })
-    .sort((a, b) =>
-      Number(b.online) - Number(a.online)
-    );
+    .sort((a, b) => Number(b.online) - Number(a.online));
 }
 
 /**
- * Updates a host's public username, availability schedule,
- * and call-acceptance preference.
+ * Updates an authenticated host's username and availability.
  *
- * Expected input:
- * { hostId, firebaseUid, username, availability, acceptingCalls }
- *
- * The caller must already authenticate the user. This service also
- * verifies that the host document belongs to the supplied Firebase UID.
+ * Expected arguments:
+ * {
+ *   hostId,
+ *   firebaseUid,
+ *   username,
+ *   availability,
+ *   acceptingCalls
+ * }
  */
 export async function updateHostAvailabilityProfile({
   hostId,
@@ -352,89 +413,18 @@ export async function updateHostAvailabilityProfile({
     fail(400, "A valid host ID and Firebase UID are required.");
   }
 
-  if (!Array.isArray(availability)) {
-    fail(400, "Availability must be a list of schedule slots.");
-  }
-
-  if (availability.length > MAX_AVAILABILITY_SLOTS) {
-    fail(
-      400,
-      `You can configure up to ${MAX_AVAILABILITY_SLOTS} availability slots.`
-    );
-  }
+  const normalizedUsername = normalizeUsername(username);
+  const normalizedAvailability = normalizeAvailability(availability);
 
   if (typeof acceptingCalls !== "boolean") {
-    fail(400, "acceptingCalls must be true or false.");
+    fail(400, "Choose whether you want to accept calls.");
   }
-
-  const normalizedUsername = normalizeUsername(username);
-
-  const normalizedAvailability = availability.map((slot) => {
-    if (!slot || typeof slot !== "object") {
-      fail(400, "Each availability slot must be an object.");
-    }
-
-    const weekday = getSlotDay(slot);
-    const startTime = getSlotStart(slot);
-    const endTime = getSlotEnd(slot);
-
-    const validDays = [
-      "monday",
-      "tuesday",
-      "wednesday",
-      "thursday",
-      "friday",
-      "saturday",
-      "sunday",
-    ];
-
-    if (!validDays.includes(weekday)) {
-      fail(400, "Each schedule slot needs a valid weekday.");
-    }
-
-    if (
-      !validTime(startTime) ||
-      !validTime(endTime) ||
-      startTime >= endTime
-    ) {
-      fail(
-        400,
-        "Each schedule slot needs valid start and end times, with the end after the start."
-      );
-    }
-
-    return {
-      weekday,
-      startTime,
-      endTime,
-    };
-  });
 
   const usernameLower = normalizedUsername.toLowerCase();
   const hostRef = hostsCollection.doc(hostId);
 
-  // Check username uniqueness across other active host records.
-  const [usernameMatches, publicUsernameMatches] = await Promise.all([
-    hostsCollection
-      .where("usernameLower", "==", usernameLower)
-      .limit(20)
-      .get(),
-    hostsCollection
-      .where("publicUsernameLower", "==", usernameLower)
-      .limit(20)
-      .get(),
-  ]);
-
-  const conflict = [
-    ...usernameMatches.docs,
-    ...publicUsernameMatches.docs,
-  ].some((doc) => doc.id !== hostId);
-
-  if (conflict) {
-    fail(409, "That username is already in use.");
-  }
-
   return db.runTransaction(async (transaction) => {
+    // All reads must happen before transaction writes.
     const hostSnapshot = await transaction.get(hostRef);
 
     if (!hostSnapshot.exists) {
@@ -448,7 +438,32 @@ export async function updateHostAvailabilityProfile({
     }
 
     if (host.status !== "active") {
-      fail(403, "Only active hosts can update availability.");
+      fail(403, "Host account is not active.");
+    }
+
+    const usernameQuery = hostsCollection
+      .where("usernameLower", "==", usernameLower)
+      .limit(20);
+
+    const publicUsernameQuery = hostsCollection
+      .where("publicUsernameLower", "==", usernameLower)
+      .limit(20);
+
+    const [usernameMatches, publicUsernameMatches] =
+      await Promise.all([
+        transaction.get(usernameQuery),
+        transaction.get(publicUsernameQuery),
+      ]);
+
+    const matchingIds = new Set([
+      ...usernameMatches.docs.map((doc) => doc.id),
+      ...publicUsernameMatches.docs.map((doc) => doc.id),
+    ]);
+
+    for (const matchingId of matchingIds) {
+      if (matchingId !== hostId) {
+        fail(409, "That host username is already in use.");
+      }
     }
 
     const now = new Date();

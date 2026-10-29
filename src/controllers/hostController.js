@@ -57,7 +57,9 @@ function sendError(
   knownClientErrors = new Set()
 ) {
   const message =
-    typeof error?.message === "string" ? error.message : "";
+    typeof error?.message === "string"
+      ? error.message
+      : "";
 
   if (knownClientErrors.has(message)) {
     return res.status(400).json({
@@ -118,9 +120,6 @@ function isPlainObject(value) {
 |--------------------------------------------------------------------------
 | HOST HEARTBEAT
 |--------------------------------------------------------------------------
-| The host identity comes from Firebase authentication and req.hostAccount,
-| which is populated by requireHost middleware.
-|--------------------------------------------------------------------------
 */
 
 export async function heartbeat(req, res) {
@@ -170,13 +169,6 @@ export async function getMyHostProfile(req, res) {
   try {
     const profile = await getHostAvailabilityProfile(hostId);
 
-    if (!profile) {
-      return res.status(404).json({
-        success: false,
-        message: "Host profile not found.",
-      });
-    }
-
     return res.status(200).json({
       success: true,
       host: profile,
@@ -194,16 +186,13 @@ export async function getMyHostProfile(req, res) {
 |--------------------------------------------------------------------------
 | UPDATE MY HOST PROFILE AND AVAILABILITY
 |--------------------------------------------------------------------------
-| Only explicitly supported profile fields should be accepted by the
-| service. The client must never be allowed to set its own role, status,
-| Firebase UID, earnings, or active call ID.
-|--------------------------------------------------------------------------
 */
 
 export async function updateMyHostProfile(req, res) {
   const hostId = req.hostAccount?.id;
+  const firebaseUid = getAuthenticatedUid(req);
 
-  if (!hostId) {
+  if (!hostId || !firebaseUid) {
     return res.status(401).json({
       success: false,
       message: "Authenticated host account required.",
@@ -217,11 +206,21 @@ export async function updateMyHostProfile(req, res) {
     });
   }
 
+  // Explicitly whitelist the fields accepted from the browser.
+  const {
+    username,
+    availability,
+    acceptingCalls,
+  } = req.body;
+
   try {
-    const profile = await updateHostAvailabilityProfile(
+    const profile = await updateHostAvailabilityProfile({
       hostId,
-      req.body
-    );
+      firebaseUid,
+      username,
+      availability,
+      acceptingCalls,
+    });
 
     return res.status(200).json({
       success: true,
@@ -241,9 +240,6 @@ export async function updateMyHostProfile(req, res) {
 /*
 |--------------------------------------------------------------------------
 | PUBLIC HOST DIRECTORY
-|--------------------------------------------------------------------------
-| The service must return public fields only. Never expose Firebase UIDs,
-| private contact information, payment information, or internal secrets.
 |--------------------------------------------------------------------------
 */
 
@@ -267,9 +263,6 @@ export async function publicHostDirectory(req, res) {
 /*
 |--------------------------------------------------------------------------
 | SUBMIT HOST APPLICATION
-|--------------------------------------------------------------------------
-| UID and email are taken from the verified Firebase token, not the body.
-| This endpoint intentionally does not require requireHost middleware.
 |--------------------------------------------------------------------------
 */
 
