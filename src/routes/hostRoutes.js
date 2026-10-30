@@ -1,5 +1,6 @@
 
 import express from "express";
+import { rateLimit } from "express-rate-limit";
 
 import {
   heartbeat,
@@ -23,50 +24,110 @@ import {
 
 const router = express.Router();
 
-/*
-|--------------------------------------------------------------------------
-| PUBLIC ROUTES
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// RATE LIMITERS
+// ============================================================
 
-// Public directory returns sanitized host information only.
-router.get("/public", publicHostDirectory);
+const publicDirectoryLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 60,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: "Too many directory requests. Please try again shortly.",
+  },
+});
 
-/*
-|--------------------------------------------------------------------------
-| WEBSITE-ACCOUNT ROUTES
-|--------------------------------------------------------------------------
-| A signed-in user may apply to become a host before being approved.
-| These routes must NOT require the host role.
-|--------------------------------------------------------------------------
-*/
+const applicationLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 5,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: "Too many application attempts. Please try again later.",
+  },
+});
 
+const heartbeatLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 12,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: "Heartbeat rate limit reached.",
+  },
+});
+
+const withdrawalLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 5,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: "Too many withdrawal requests. Please try again later.",
+  },
+});
+
+// ============================================================
+// PUBLIC ROUTES
+// ============================================================
+
+// Only sanitized, public host information may be returned.
+router.get(
+  "/public",
+  publicDirectoryLimiter,
+  publicHostDirectory
+);
+
+// ============================================================
+// AUTHENTICATED WEBSITE-ACCOUNT ROUTES
+// ============================================================
+
+// Applicants do not need to be approved hosts.
 router.use(verifyFirebaseToken);
 
-router.post("/applications", applyToBecomeHost);
-router.get("/applications/me", getMyHostApplicationStatus);
+router.post(
+  "/applications",
+  applicationLimiter,
+  applyToBecomeHost
+);
 
-/*
-|--------------------------------------------------------------------------
-| APPROVED HOST ROUTES
-|--------------------------------------------------------------------------
-| Everything below requires a valid Firebase session and an active
-| host record linked to the authenticated Firebase UID.
-|--------------------------------------------------------------------------
-*/
+router.get(
+  "/applications/me",
+  getMyHostApplicationStatus
+);
+
+// ============================================================
+// APPROVED HOST ROUTES
+// ============================================================
 
 router.use(requireHost);
 
-// Host profile and availability
+// Profile
 router.get("/me", getMyHostProfile);
 router.put("/me", updateMyHostProfile);
-router.post("/heartbeat", heartbeat);
+
+// Presence
+router.post(
+  "/heartbeat",
+  heartbeatLimiter,
+  heartbeat
+);
 
 // Earnings
 router.get("/earnings", getMyEarnings);
 
 // Withdrawals
 router.get("/withdrawals", getMyWithdrawals);
-router.post("/withdrawals", createMyWithdrawal);
+
+router.post(
+  "/withdrawals",
+  withdrawalLimiter,
+  createMyWithdrawal
+);
 
 export default router;

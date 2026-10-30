@@ -1,14 +1,18 @@
 
 import { db } from "../config/firebase.js";
-import { isWithinHostSchedule } from "./hostAvailabilityService.js";
+
+import {
+  isHostOnline,
+  isHostAvailableForCalls,
+  isWithinHostSchedule,
+} from "./hostAvailabilityService.js";
 
 const hostsCollection = db.collection("hosts");
 
-const HOST_TIMEOUT_MS = 45_000;
 const MAX_ID_LENGTH = 256;
 
 /* -------------------------------------------------------------------------- */
-/* VALIDATION HELPERS                                                         */
+/* ERRORS                                                                     */
 /* -------------------------------------------------------------------------- */
 
 function makeError(message, status = 400) {
@@ -16,6 +20,10 @@ function makeError(message, status = 400) {
   error.status = status;
   return error;
 }
+
+/* -------------------------------------------------------------------------- */
+/* VALIDATION                                                                 */
+/* -------------------------------------------------------------------------- */
 
 function normalizeId(value, fieldName) {
   if (
@@ -38,65 +46,21 @@ function normalizeId(value, fieldName) {
   return normalized;
 }
 
-function toHost(doc) {
-  if (!doc?.exists) return null;
-
-  const data = doc.data();
-
-  // Exclude internal identifiers and credentials from returned host objects.
-  const {
-    linkCodeHash,
-    telegramId,
-    ...safeData
-  } = data;
-
-  return {
-    id: doc.id,
-    ...safeData,
-  };
-}
-
-function getTimestampMilliseconds(value) {
-  if (!value) return NaN;
-
-  try {
-    if (typeof value.toMillis === "function") {
-      return value.toMillis();
-    }
-
-    if (typeof value.toDate === "function") {
-      return value.toDate().getTime();
-    }
-
-    if (value instanceof Date) {
-      return value.getTime();
-    }
-
-    if (typeof value === "string" || typeof value === "number") {
-      const result = new Date(value).getTime();
-      return Number.isFinite(result) ? result : NaN;
-    }
-  } catch {
-    return NaN;
-  }
-
-  return NaN;
-}
-
-function hasRecentHeartbeat(host, nowMs = Date.now()) {
-  const lastSeenMs = getTimestampMilliseconds(host?.lastSeenAt);
-
-  if (!Number.isFinite(lastSeenMs)) return false;
-
-  const ageMs = nowMs - lastSeenMs;
-  return ageMs >= 0 && ageMs <= HOST_TIMEOUT_MS;
-}
-
-function validateHostProfile({ firebaseUid, displayName, username }) {
+function validateHostProfile({
+  firebaseUid,
+  displayName,
+  username,
+}) {
   const uid = normalizeId(firebaseUid, "Firebase UID");
 
-  if (typeof displayName !== "string" || !displayName.trim()) {
-    throw makeError("Host display name is required.", 400);
+  if (
+    typeof displayName !== "string" ||
+    !displayName.trim()
+  ) {
+    throw makeError(
+      "Host display name is required.",
+      400
+    );
   }
 
   const normalizedDisplayName = displayName.trim();
@@ -118,33 +82,88 @@ function validateHostProfile({ firebaseUid, displayName, username }) {
     );
   }
 
+  const normalizedUsername = username.trim();
+
   return {
     firebaseUid: uid,
     displayName: normalizedDisplayName,
-    username: username.trim(),
+    username: normalizedUsername,
+    usernameLower: normalizedUsername.toLowerCase(),
   };
 }
 
 /* -------------------------------------------------------------------------- */
-/* SHARED HOST AVAILABILITY                                                   */
+/* HOST DOCUMENT SANITIZATION                                                 */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Internal backend host representation.
+ *
+ * This is NOT a public API response. Public endpoints must use
+ * getPublicHostDirectory() from hostAvailabilityService.js.
+ */
+function toHost(doc) {
+  if (!doc?.exists) return null;
+
+  const data = doc.data();
+
+  const {
+    linkCodeHash,
+    telegramId,
+    ...safeData
+  } = data;
+
+  return {
+    id: doc.id,
+    ...safeData,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* SHARED AVAILABILITY                                                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Synchronous availability check for legacy one-to-one callers.
+ *
+ * Group-room availability is checked asynchronously by
+ * isHostAvailableForCalls() and must be used by group matching.
+ */
 export function isHostAvailable(host, date = new Date()) {
-  if (!host || typeof host !== "object") return false;
-  if (host.status !== "active" || !host.firebaseUid) return false;
-  if (host.acceptingCalls !== true) return false;
+  if (!host || typeof host !== "object") {
+    return false;
+  }
 
   if (!(date instanceof Date) || !Number.isFinite(date.getTime())) {
     return false;
   }
 
-  if (!hasRecentHeartbeat(host, date.getTime())) return false;
+  if (!isHostOnline(host, date)) {
+    return false;
+  }
 
-  // A host with a one-to-one reservation cannot accept another call
-  // unless group-room matching explicitly handles that reservation.
-  if (host.activeCallId) return false;
+  if (host.acceptingCalls !== true) {
+    return false;
+  }
+
+  if (host.activeCallId || host.activeGroupRoomId) {
+    return false;
+  }
 
   return isWithinHostSchedule(host, date);
+}
+
+/**
+ * Full asynchronous availability check.
+ *
+ * This supports a host who is already in a group room with
+ * available customer capacity.
+ */
+export async function isHostAvailableForMatching(
+  host,
+  date = new Date()
+) {
+  return isHostAvailableForCalls(host, date);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -152,10 +171,12 @@ export function isHostAvailable(host, date = new Date()) {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Call from a trusted, authenticated and authorized host-approval workflow.
+ * Call only from a trusted host-approval workflow.
  *
- * This function does not itself prove that the caller is an administrator.
  * The route/controller must enforce administrator authorization.
+ *
+ * Host records are keyed by Firebase UID:
+ * hosts/{firebaseUid}
  */
 export async function createHost({
   firebaseUid,
@@ -170,11 +191,16 @@ export async function createHost({
   });
 
   if (!["pending", "active"].includes(status)) {
-    throw makeError("Invalid initial host status.", 400);
+    throw makeError(
+      "Invalid initial host status.",
+      400
+    );
   }
 
-  const usernameLower = profile.username.toLowerCase();
-  const hostRef = hostsCollection.doc(profile.firebaseUid);
+  const hostRef = hostsCollection.doc(
+    profile.firebaseUid
+  );
+
   const now = new Date();
 
   return db.runTransaction(async (transaction) => {
@@ -183,11 +209,11 @@ export async function createHost({
       .limit(2);
 
     const usernameQuery = hostsCollection
-      .where("usernameLower", "==", usernameLower)
+      .where("usernameLower", "==", profile.usernameLower)
       .limit(2);
 
     const publicUsernameQuery = hostsCollection
-      .where("publicUsernameLower", "==", usernameLower)
+      .where("publicUsernameLower", "==", profile.usernameLower)
       .limit(2);
 
     const [
@@ -202,9 +228,10 @@ export async function createHost({
       transaction.get(hostRef),
     ]);
 
-    const duplicateAccount = existingHostSnapshot.docs.some(
-      (doc) => doc.id !== hostRef.id
-    );
+    const duplicateAccount =
+      existingHostSnapshot.docs.some(
+        (doc) => doc.id !== hostRef.id
+      );
 
     if (duplicateAccount) {
       throw makeError(
@@ -213,13 +240,24 @@ export async function createHost({
       );
     }
 
-    const usernameConflict = [
+    const matchingUsernameDocs = new Map();
+
+    for (const doc of [
       ...usernameSnapshot.docs,
       ...publicUsernameSnapshot.docs,
-    ].some((doc) => doc.id !== hostRef.id);
+    ]) {
+      matchingUsernameDocs.set(doc.id, doc);
+    }
+
+    const usernameConflict = [
+      ...matchingUsernameDocs.keys(),
+    ].some((id) => id !== hostRef.id);
 
     if (usernameConflict) {
-      throw makeError("That host username is already in use.", 409);
+      throw makeError(
+        "That host username is already in use.",
+        409
+      );
     }
 
     if (hostSnapshot.exists) {
@@ -233,20 +271,22 @@ export async function createHost({
       }
 
       const existingUsername = String(
-        existing.usernameLower || existing.username || ""
+        existing.usernameLower ||
+        existing.username ||
+        ""
       ).toLowerCase();
 
       const existingPublicUsername = String(
         existing.publicUsernameLower ||
-          existing.publicUsername ||
-          existing.usernameLower ||
-          existing.username ||
-          ""
+        existing.publicUsername ||
+        existing.usernameLower ||
+        existing.username ||
+        ""
       ).toLowerCase();
 
       if (
-        existingUsername !== usernameLower ||
-        existingPublicUsername !== usernameLower
+        existingUsername !== profile.usernameLower ||
+        existingPublicUsername !== profile.usernameLower
       ) {
         throw makeError(
           "The existing host username does not match the application. Administrator review is required.",
@@ -254,14 +294,19 @@ export async function createHost({
         );
       }
 
-      if (status === "pending" && existing.status !== "pending") {
+      if (
+        status === "pending" &&
+        existing.status !== "pending"
+      ) {
         throw makeError(
           "An existing host record is not pending. Administrator review is required.",
           409
         );
       }
 
-      if (!["pending", "active"].includes(existing.status)) {
+      if (
+        !["pending", "active"].includes(existing.status)
+      ) {
         throw makeError(
           "The existing host account is restricted and requires administrator review.",
           409
@@ -278,18 +323,23 @@ export async function createHost({
       firebaseUid: profile.firebaseUid,
 
       username: profile.username,
-      usernameLower,
+      usernameLower: profile.usernameLower,
+
       publicUsername: profile.username,
-      publicUsernameLower: usernameLower,
+      publicUsernameLower: profile.usernameLower,
 
       displayName: profile.displayName,
+
       role: "host",
       status,
 
       acceptingCalls: false,
       availability: [],
+
       lastSeenAt: null,
+
       activeCallId: null,
+      activeGroupRoomId: null,
 
       availableHostEarningsCents: 0,
       lifetimeHostEarningsCents: 0,
@@ -313,18 +363,23 @@ export async function createHost({
 /* -------------------------------------------------------------------------- */
 
 export async function getHostByFirebaseUid(firebaseUid) {
-  const uid = normalizeId(firebaseUid, "Firebase UID");
+  const uid = normalizeId(
+    firebaseUid,
+    "Firebase UID"
+  );
 
   const snapshot = await hostsCollection
     .where("firebaseUid", "==", uid)
     .limit(2)
     .get();
 
-  if (snapshot.empty) return null;
+  if (snapshot.empty) {
+    return null;
+  }
 
   if (snapshot.size > 1) {
     throw makeError(
-      "Multiple host records use the same Firebase account.",
+      "Multiple host records use the same Firebase account. Administrator review is required.",
       500
     );
   }
@@ -338,7 +393,10 @@ export async function getHostByFirebaseUid(firebaseUid) {
 
 export async function getHostById(hostId) {
   const id = normalizeId(hostId, "Host ID");
-  const snapshot = await hostsCollection.doc(id).get();
+
+  const snapshot = await hostsCollection
+    .doc(id)
+    .get();
 
   return toHost(snapshot);
 }
@@ -348,12 +406,17 @@ export async function getHostById(hostId) {
 /* -------------------------------------------------------------------------- */
 
 /**
- * The route must authenticate the Firebase token and derive firebaseUid
- * from that verified token, not from an untrusted request body.
+ * The route must:
+ * 1. Verify the Firebase ID token.
+ * 2. Derive firebaseUid from req.user.uid.
+ * 3. Derive hostId from req.hostAccount.id.
+ *
+ * Never accept either identity from an untrusted request body.
  */
 export async function hostHeartbeat(hostId, firebaseUid) {
   const id = normalizeId(hostId, "Host ID");
   const uid = normalizeId(firebaseUid, "Firebase UID");
+
   const hostRef = hostsCollection.doc(id);
 
   return db.runTransaction(async (transaction) => {
@@ -366,7 +429,10 @@ export async function hostHeartbeat(hostId, firebaseUid) {
     const host = snapshot.data();
 
     if (host.status !== "active") {
-      throw makeError("Host account is not active.", 403);
+      throw makeError(
+        "Host account is not active.",
+        403
+      );
     }
 
     if (host.firebaseUid !== uid) {
@@ -384,8 +450,11 @@ export async function hostHeartbeat(hostId, firebaseUid) {
     });
 
     return {
+      success: true,
+      online: true,
       lastSeenAt: now,
       activeCallId: host.activeCallId || null,
+      activeGroupRoomId: host.activeGroupRoomId || null,
     };
   });
 }
@@ -395,8 +464,14 @@ export async function hostHeartbeat(hostId, firebaseUid) {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Backend-only host records. Do not return these full records directly
- * from a public endpoint.
+ * Backend-only host records.
+ *
+ * Includes:
+ * - available hosts without an active room;
+ * - available hosts with a group room that has a free seat.
+ *
+ * Does not return public-safe profiles. Do not send these records
+ * directly to customers.
  */
 export async function getAvailableHosts() {
   const snapshot = await hostsCollection
@@ -405,9 +480,30 @@ export async function getAvailableHosts() {
 
   const now = new Date();
 
-  return snapshot.docs
+  const candidates = snapshot.docs
     .map(toHost)
-    .filter((host) => isHostAvailable(host, now));
+    .filter(Boolean);
+
+  const availabilityResults = await Promise.all(
+    candidates.map(async (host) => {
+      try {
+        const available =
+          await isHostAvailableForMatching(host, now);
+
+        return available ? host : null;
+      } catch (error) {
+        console.error(
+          "Host availability check failed:",
+          host.id,
+          error?.code || "UNKNOWN_ERROR"
+        );
+
+        return null;
+      }
+    })
+  );
+
+  return availabilityResults.filter(Boolean);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -417,27 +513,37 @@ export async function getAvailableHosts() {
 export async function findAvailableHost() {
   const availableHosts = await getAvailableHosts();
 
-  if (availableHosts.length === 0) return null;
+  if (availableHosts.length === 0) {
+    return null;
+  }
 
-  availableHosts.sort((a, b) => a.id.localeCompare(b.id));
+  availableHosts.sort((a, b) =>
+    a.id.localeCompare(b.id)
+  );
 
   return availableHosts[0];
 }
 
 /* -------------------------------------------------------------------------- */
-/* RESERVE HOST FOR A CALL                                                    */
+/* RESERVE HOST FOR LEGACY ONE-TO-ONE CALL                                    */
 /* -------------------------------------------------------------------------- */
 
 /**
- * Atomically reserves an available host.
+ * This function is ONLY for legacy one-to-one reservations.
  *
- * The caller must also reserve the customer and create/update the call
- * session in a coordinated transaction. This function alone does not
- * reserve the customer or create a call.
+ * Do not use it for group calls.
+ * Group calls must reserve a customer seat in callRooms and
+ * update the host's activeGroupRoomId atomically.
+ *
+ * The group matching service must enforce the room capacity.
  */
 export async function reserveHost(hostId, callId) {
   const id = normalizeId(hostId, "Host ID");
-  const normalizedCallId = normalizeId(callId, "Call ID");
+  const normalizedCallId = normalizeId(
+    callId,
+    "Call ID"
+  );
+
   const hostRef = hostsCollection.doc(id);
 
   return db.runTransaction(async (transaction) => {
@@ -449,24 +555,52 @@ export async function reserveHost(hostId, callId) {
 
     const host = snapshot.data();
 
-    if (host.status !== "active" || !host.firebaseUid) {
-      throw makeError("Host is not active or linked to a website account.", 409);
-    }
-
-    if (host.activeCallId) {
-      throw makeError("Host is already in a call.", 409);
-    }
-
-    if (!isHostAvailable(host, new Date())) {
+    if (
+      host.status !== "active" ||
+      !host.firebaseUid
+    ) {
       throw makeError(
-        "Host is no longer available. Check their schedule and call status.",
+        "Host is not active or linked to a website account.",
+        409
+      );
+    }
+
+    if (
+      host.activeCallId ||
+      host.activeGroupRoomId
+    ) {
+      throw makeError(
+        "Host already has an active call or group room.",
+        409
+      );
+    }
+
+    const now = new Date();
+
+    if (!isHostOnline(host, now)) {
+      throw makeError(
+        "Host is offline.",
+        409
+      );
+    }
+
+    if (host.acceptingCalls !== true) {
+      throw makeError(
+        "Host is not accepting calls.",
+        409
+      );
+    }
+
+    if (!isWithinHostSchedule(host, now)) {
+      throw makeError(
+        "Host is outside their availability schedule.",
         409
       );
     }
 
     transaction.update(hostRef, {
       activeCallId: normalizedCallId,
-      updatedAt: new Date(),
+      updatedAt: now,
     });
 
     return true;
@@ -478,12 +612,18 @@ export async function reserveHost(hostId, callId) {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Requires the call ID to match the current reservation.
- * An old call cannot release a host assigned to a newer call.
+ * Releases only the matching legacy one-to-one reservation.
+ *
+ * A stale call cannot clear a newer reservation.
+ * This function does not release group-room reservations.
  */
 export async function releaseHost(hostId, callId) {
   const id = normalizeId(hostId, "Host ID");
-  const normalizedCallId = normalizeId(callId, "Call ID");
+  const normalizedCallId = normalizeId(
+    callId,
+    "Call ID"
+  );
+
   const hostRef = hostsCollection.doc(id);
 
   return db.runTransaction(async (transaction) => {
@@ -496,8 +636,9 @@ export async function releaseHost(hostId, callId) {
     const host = snapshot.data();
 
     if (host.activeCallId !== normalizedCallId) {
-      // Idempotent if already released; do not affect another call.
-      if (!host.activeCallId) return true;
+      if (!host.activeCallId) {
+        return true;
+      }
 
       throw makeError(
         "Call ID does not match the host's active call.",
@@ -505,9 +646,11 @@ export async function releaseHost(hostId, callId) {
       );
     }
 
+    const now = new Date();
+
     transaction.update(hostRef, {
       activeCallId: null,
-      updatedAt: new Date(),
+      updatedAt: now,
     });
 
     return true;

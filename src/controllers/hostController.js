@@ -12,6 +12,10 @@ import {
   getHostApplicationStatus,
 } from "../services/hostApplicationService.js";
 
+// ============================================================
+// SA LIVE HOST CONTROLLER
+// ============================================================
+
 const HOST_CONTRACT_VERSION = "1.0";
 
 const APPLICATION_CLIENT_ERRORS = new Set([
@@ -50,6 +54,28 @@ const PROFILE_CLIENT_ERRORS = new Set([
   "That host username is already in use.",
 ]);
 
+// ============================================================
+// RESPONSE HELPERS
+// ============================================================
+
+function noStore(res) {
+  res.set("Cache-Control", "no-store, private");
+}
+
+function sendSuccess(res, status, data) {
+  return res.status(status).json({
+    success: true,
+    ...data,
+  });
+}
+
+function sendClientError(res, status, message) {
+  return res.status(status).json({
+    success: false,
+    message,
+  });
+}
+
 function sendError(
   res,
   error,
@@ -61,51 +87,64 @@ function sendError(
       ? error.message
       : "";
 
+  // Explicitly recognised validation errors.
   if (knownClientErrors.has(message)) {
-    return res.status(400).json({
-      success: false,
-      message,
-    });
+    return sendClientError(res, 400, message);
   }
 
+  // Service errors with an intentional HTTP status.
   const status = Number(error?.status);
 
-  if (status >= 400 && status < 500) {
-    return res.status(status).json({
-      success: false,
-      message: message || fallbackMessage,
-    });
+  if (Number.isInteger(status) && status >= 400 && status < 500) {
+    return sendClientError(
+      res,
+      status,
+      message || fallbackMessage
+    );
   }
 
+  // Known host access errors.
   if (
     message === "Host not found." ||
     message === "Host account not found." ||
     message === "An active, linked host account is required." ||
     message === "Host account is not active."
   ) {
-    return res.status(403).json({
-      success: false,
-      message,
-    });
+    return sendClientError(res, 403, message);
   }
 
-  console.error(
-    fallbackMessage,
-    error?.code || message || "UNKNOWN_ERROR"
-  );
-
-  return res.status(500).json({
-    success: false,
+  // Do not send internal database or server errors to clients.
+  console.error("[SA LIVE HOST CONTROLLER]", {
     message: fallbackMessage,
+    code: error?.code || "UNKNOWN_ERROR",
+    error: message || "No error message",
   });
+
+  return sendClientError(res, 500, fallbackMessage);
 }
+
+// ============================================================
+// AUTHENTICATION HELPERS
+// ============================================================
 
 function getAuthenticatedUid(req) {
   const uid = req.user?.uid;
 
-  return typeof uid === "string" && uid.trim()
-    ? uid.trim()
-    : null;
+  if (typeof uid !== "string" || !uid.trim()) {
+    return null;
+  }
+
+  return uid.trim();
+}
+
+function getAuthenticatedHostId(req) {
+  const hostId = req.hostAccount?.id;
+
+  if (typeof hostId !== "string" || !hostId.trim()) {
+    return null;
+  }
+
+  return hostId.trim();
 }
 
 function isPlainObject(value) {
@@ -116,28 +155,38 @@ function isPlainObject(value) {
   );
 }
 
-/*
-|--------------------------------------------------------------------------
-| HOST HEARTBEAT
-|--------------------------------------------------------------------------
-*/
+function hasOwn(object, property) {
+  return Object.prototype.hasOwnProperty.call(
+    object,
+    property
+  );
+}
+
+// ============================================================
+// HOST HEARTBEAT
+// ============================================================
 
 export async function heartbeat(req, res) {
-  const hostId = req.hostAccount?.id;
+  noStore(res);
+
+  const hostId = getAuthenticatedHostId(req);
   const firebaseUid = getAuthenticatedUid(req);
 
   if (!hostId || !firebaseUid) {
-    return res.status(401).json({
-      success: false,
-      message: "Authenticated host account required.",
-    });
+    return sendClientError(
+      res,
+      401,
+      "Authenticated host account required."
+    );
   }
 
   try {
-    const result = await hostHeartbeat(hostId, firebaseUid);
+    const result = await hostHeartbeat(
+      hostId,
+      firebaseUid
+    );
 
-    return res.status(200).json({
-      success: true,
+    return sendSuccess(res, 200, {
       message: "Host heartbeat received.",
       host: result,
     });
@@ -150,27 +199,37 @@ export async function heartbeat(req, res) {
   }
 }
 
-/*
-|--------------------------------------------------------------------------
-| GET MY HOST PROFILE
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// GET MY HOST PROFILE
+// ============================================================
 
 export async function getMyHostProfile(req, res) {
-  const hostId = req.hostAccount?.id;
+  noStore(res);
+
+  const hostId = getAuthenticatedHostId(req);
 
   if (!hostId) {
-    return res.status(401).json({
-      success: false,
-      message: "Authenticated host account required.",
-    });
+    return sendClientError(
+      res,
+      401,
+      "Authenticated host account required."
+    );
   }
 
   try {
-    const profile = await getHostAvailabilityProfile(hostId);
+    const profile = await getHostAvailabilityProfile(
+      hostId
+    );
 
-    return res.status(200).json({
-      success: true,
+    if (!profile) {
+      return sendClientError(
+        res,
+        404,
+        "Host profile not found."
+      );
+    }
+
+    return sendSuccess(res, 200, {
       host: profile,
     });
   } catch (error) {
@@ -182,52 +241,79 @@ export async function getMyHostProfile(req, res) {
   }
 }
 
-/*
-|--------------------------------------------------------------------------
-| UPDATE MY HOST PROFILE AND AVAILABILITY
-|--------------------------------------------------------------------------
-*/
-
+// ============================================================
+// UPDATE MY HOST PROFILE AND AVAILABILITY
+// ============================================================
 
 export async function updateMyHostProfile(req, res) {
-  const hostId = req.hostAccount?.id;
+  noStore(res);
+
+  const hostId = getAuthenticatedHostId(req);
   const firebaseUid = getAuthenticatedUid(req);
 
   if (!hostId || !firebaseUid) {
-    return res.status(401).json({
-      success: false,
-      message: "Authenticated host account required.",
-    });
+    return sendClientError(
+      res,
+      401,
+      "Authenticated host account required."
+    );
   }
 
   if (!isPlainObject(req.body)) {
-    return res.status(400).json({
-      success: false,
-      message: "Invalid profile details.",
-    });
+    return sendClientError(
+      res,
+      400,
+      "Invalid profile details."
+    );
   }
 
-  const {
-    publicUsername,
-    username,
-    availability,
-    acceptingCalls,
-  } = req.body;
+  const body = req.body;
+
+  // Do not allow callers to omit fields accidentally.
+  // The service remains responsible for detailed validation.
+  if (
+    !hasOwn(body, "publicUsername") &&
+    !hasOwn(body, "username")
+  ) {
+    return sendClientError(
+      res,
+      400,
+      "Enter a public username."
+    );
+  }
+
+  if (
+    !hasOwn(body, "availability") ||
+    !hasOwn(body, "acceptingCalls")
+  ) {
+    return sendClientError(
+      res,
+      400,
+      "Invalid profile details."
+    );
+  }
+
+  if (typeof body.acceptingCalls !== "boolean") {
+    return sendClientError(
+      res,
+      400,
+      "Choose whether you want to accept calls."
+    );
+  }
+
+  const username =
+    body.publicUsername ?? body.username;
 
   try {
     const profile = await updateHostAvailabilityProfile({
       hostId,
       firebaseUid,
-
-      // Support the existing frontend field name.
-      username: publicUsername ?? username,
-
-      availability,
-      acceptingCalls,
+      username,
+      availability: body.availability,
+      acceptingCalls: body.acceptingCalls,
     });
 
-    return res.status(200).json({
-      success: true,
+    return sendSuccess(res, 200, {
       message: "Host availability saved.",
       host: profile,
     });
@@ -241,20 +327,22 @@ export async function updateMyHostProfile(req, res) {
   }
 }
 
-
-/*
-|--------------------------------------------------------------------------
-| PUBLIC HOST DIRECTORY
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// PUBLIC HOST DIRECTORY
+// ============================================================
 
 export async function publicHostDirectory(req, res) {
-  try {
-    const hosts = await getPublicHostDirectory();
+  // Availability changes frequently. Avoid serving stale
+  // online/offline information from an intermediary cache.
+  res.set("Cache-Control", "no-store");
 
-    return res.status(200).json({
-      success: true,
-      hosts: Array.isArray(hosts) ? hosts : [],
+  try {
+    const directory = await getPublicHostDirectory();
+
+    return sendSuccess(res, 200, {
+      hosts: Array.isArray(directory)
+        ? directory
+        : [],
     });
   } catch (error) {
     return sendError(
@@ -265,43 +353,57 @@ export async function publicHostDirectory(req, res) {
   }
 }
 
-/*
-|--------------------------------------------------------------------------
-| SUBMIT HOST APPLICATION
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// SUBMIT HOST APPLICATION
+// ============================================================
 
 export async function applyToBecomeHost(req, res) {
+  noStore(res);
+
   const firebaseUid = getAuthenticatedUid(req);
 
   if (!firebaseUid) {
-    return res.status(401).json({
-      success: false,
-      message: "Please sign in to apply as a host.",
-    });
+    return sendClientError(
+      res,
+      401,
+      "Please sign in to apply as a host."
+    );
   }
 
   if (req.user?.emailVerified !== true) {
-    return res.status(403).json({
-      success: false,
-      message:
-        "Please verify your website account email before applying.",
-    });
+    return sendClientError(
+      res,
+      403,
+      "Please verify your website account email before applying."
+    );
+  }
+
+  if (
+    typeof req.user?.email !== "string" ||
+    !req.user.email.trim()
+  ) {
+    return sendClientError(
+      res,
+      400,
+      "A verified website account email is required."
+    );
   }
 
   if (!isPlainObject(req.body)) {
-    return res.status(400).json({
-      success: false,
-      message: "Invalid host application details.",
-    });
+    return sendClientError(
+      res,
+      400,
+      "Invalid host application details."
+    );
   }
 
-  try {
-    const body = req.body;
+  const body = req.body;
 
+  try {
     const application = await startHostApplication({
       firebaseUid,
-      email: req.user.email,
+      email: req.user.email.trim(),
+
       fullName: body.fullName,
       username: body.username,
       phoneNumber: body.phoneNumber,
@@ -310,12 +412,12 @@ export async function applyToBecomeHost(req, res) {
       bio: body.bio,
       languages: body.languages,
       applicationReason: body.applicationReason,
+
       contractAccepted: body.contractAccepted,
       contractVersion: HOST_CONTRACT_VERSION,
     });
 
-    return res.status(201).json({
-      success: true,
+    return sendSuccess(res, 201, {
       message: "Host application submitted for review.",
       application,
     });
@@ -329,28 +431,32 @@ export async function applyToBecomeHost(req, res) {
   }
 }
 
-/*
-|--------------------------------------------------------------------------
-| GET MY HOST APPLICATION STATUS
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// GET MY HOST APPLICATION STATUS
+// ============================================================
 
-export async function getMyHostApplicationStatus(req, res) {
+export async function getMyHostApplicationStatus(
+  req,
+  res
+) {
+  noStore(res);
+
   const firebaseUid = getAuthenticatedUid(req);
 
   if (!firebaseUid) {
-    return res.status(401).json({
-      success: false,
-      message: "Please sign in to view your application.",
-    });
+    return sendClientError(
+      res,
+      401,
+      "Please sign in to view your application."
+    );
   }
 
   try {
-    const application =
-      await getHostApplicationStatus(firebaseUid);
+    const application = await getHostApplicationStatus(
+      firebaseUid
+    );
 
-    return res.status(200).json({
-      success: true,
+    return sendSuccess(res, 200, {
       application: application ?? null,
     });
   } catch (error) {

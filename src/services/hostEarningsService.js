@@ -9,6 +9,12 @@ const withdrawalsCollection = db.collection("hostWithdrawals");
 const HOST_RATE_CENTS = 200;
 const TIME_ZONE = "Africa/Johannesburg";
 
+const VALID_WITHDRAWAL_STATUSES = new Set([
+  "pending",
+  "paid",
+  "rejected",
+]);
+
 function makeError(message, status = 400) {
   const error = new Error(message);
   error.status = status;
@@ -19,8 +25,8 @@ function normalizeId(value, label) {
   if (
     typeof value !== "string" ||
     !value.trim() ||
-    value.length > 256 ||
-    value.includes("/")
+    value.trim().length > 256 ||
+    value.trim().includes("/")
   ) {
     throw makeError(`Invalid ${label}.`, 400);
   }
@@ -34,27 +40,33 @@ function toNumber(value) {
 }
 
 function validCents(value, label = "Amount") {
-  if (
-    !Number.isSafeInteger(value) ||
-    value < 0
-  ) {
-    throw makeError(`${label} must be a valid non-negative amount in cents.`, 500);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw makeError(
+      `${label} must be a valid non-negative amount in cents.`,
+      500
+    );
   }
 
   return value;
 }
 
 function toZAR(cents) {
-  return Number((validCents(Math.round(toNumber(cents))) / 100).toFixed(2));
+  return Number(
+    (validCents(cents) / 100).toFixed(2)
+  );
 }
 
 function toDate(value) {
   if (!value) return null;
 
   try {
-    if (typeof value.toDate === "function") return value.toDate();
+    if (typeof value.toDate === "function") {
+      return value.toDate();
+    }
 
-    const date = value instanceof Date ? value : new Date(value);
+    const date =
+      value instanceof Date ? value : new Date(value);
+
     return Number.isFinite(date.getTime()) ? date : null;
   } catch {
     return null;
@@ -78,6 +90,7 @@ function getSouthAfricanDateParts(date) {
 
 function getDateKey(date) {
   const parts = getSouthAfricanDateParts(date);
+
   return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
@@ -100,35 +113,98 @@ function getMondayDateKey(date) {
       Number(parts.month) - 1,
       Number(parts.day) - daysSinceMonday
     )
-  ).toISOString().slice(0, 10);
+  )
+    .toISOString()
+    .slice(0, 10);
 }
 
 function getMonthKey(date) {
   const parts = getSouthAfricanDateParts(date);
+
   return `${parts.year}-${parts.month}`;
 }
 
+function parseRandToCents(value) {
+  if (
+    typeof value !== "number" &&
+    typeof value !== "string"
+  ) {
+    throw makeError("Enter a valid withdrawal amount.", 400);
+  }
+
+  const text = String(value).trim();
+
+  if (!/^\d{1,10}(?:\.\d{1,2})?$/.test(text)) {
+    throw makeError(
+      "Enter a valid amount in rand and cents.",
+      400
+    );
+  }
+
+  const [rand, cents = ""] = text.split(".");
+  const amountCents =
+    Number(rand) * 100 +
+    Number(cents.padEnd(2, "0"));
+
+  if (
+    !Number.isSafeInteger(amountCents) ||
+    amountCents <= 0
+  ) {
+    throw makeError(
+      "Enter a valid withdrawal amount.",
+      400
+    );
+  }
+
+  return amountCents;
+}
+
 function validateBankDetails(input) {
-  if (!input || typeof input !== "object" || Array.isArray(input)) {
+  if (
+    !input ||
+    typeof input !== "object" ||
+    Array.isArray(input)
+  ) {
     throw makeError("Bank details are required.", 400);
   }
 
   const details = {
-    accountHolder: String(input.accountHolder ?? "").trim(),
-    bankName: String(input.bankName ?? "").trim(),
-    accountNumber: String(input.accountNumber ?? "").trim(),
-    accountType: String(input.accountType ?? "").trim().toLowerCase(),
-    branchCode: String(input.branchCode ?? "").trim(),
+    accountHolder:
+      typeof input.accountHolder === "string"
+        ? input.accountHolder.trim()
+        : "",
+    bankName:
+      typeof input.bankName === "string"
+        ? input.bankName.trim()
+        : "",
+    accountNumber:
+      typeof input.accountNumber === "string"
+        ? input.accountNumber.trim()
+        : "",
+    accountType:
+      typeof input.accountType === "string"
+        ? input.accountType.trim().toLowerCase()
+        : "",
+    branchCode:
+      typeof input.branchCode === "string"
+        ? input.branchCode.trim()
+        : "",
   };
 
   if (
     details.accountHolder.length < 2 ||
     details.accountHolder.length > 100
   ) {
-    throw makeError("Enter a valid account holder name.", 400);
+    throw makeError(
+      "Enter a valid account holder name.",
+      400
+    );
   }
 
-  if (details.bankName.length < 2 || details.bankName.length > 100) {
+  if (
+    details.bankName.length < 2 ||
+    details.bankName.length > 100
+  ) {
     throw makeError("Enter a valid bank name.", 400);
   }
 
@@ -152,16 +228,25 @@ function validateBankDetails(input) {
 
   if (
     details.branchCode.length > 20 ||
-    (details.branchCode && !/^[a-zA-Z0-9 -]+$/.test(details.branchCode))
+    (
+      details.branchCode &&
+      !/^[a-zA-Z0-9 -]+$/.test(details.branchCode)
+    )
   ) {
-    throw makeError("Enter a valid branch code.", 400);
+    throw makeError(
+      "Enter a valid branch code.",
+      400
+    );
   }
 
   return details;
 }
 
 function getEarningAmountCents(earning) {
-  if (Number.isSafeInteger(earning.amountCents) && earning.amountCents >= 0) {
+  if (
+    Number.isSafeInteger(earning.amountCents) &&
+    earning.amountCents >= 0
+  ) {
     return earning.amountCents;
   }
 
@@ -173,37 +258,45 @@ function getEarningAmountCents(earning) {
     return Math.round(Number(earning.amount) * 100);
   }
 
-  const minutes = Number(earning.completedMinutes ?? 0);
+  const minutes = Number(
+    earning.completedMinutes ?? 0
+  );
 
-  if (!Number.isSafeInteger(minutes) || minutes < 0) {
+  if (
+    !Number.isSafeInteger(minutes) ||
+    minutes < 0
+  ) {
     return 0;
   }
 
   return minutes * HOST_RATE_CENTS;
 }
 
-/*
- * HOST EARNINGS SUMMARY
- *
- * The host's available balance is authoritative for withdrawal requests.
- * The earnings collection is used for historical reporting.
- */
+// ============================================================
+// HOST EARNINGS SUMMARY
+// ============================================================
+
 export async function getHostEarningsSummary(hostId) {
   const id = normalizeId(hostId, "host ID");
+
   const hostSnapshot = await hostsCollection.doc(id).get();
 
   if (!hostSnapshot.exists) {
     throw makeError("Host account not found.", 404);
   }
 
-  const [earningsSnapshot, callsSnapshot, withdrawalsSnapshot] =
-    await Promise.all([
-      earningsCollection.where("hostId", "==", id).get(),
-      callsCollection.where("hostId", "==", id).get(),
-      withdrawalsCollection.where("hostId", "==", id).get(),
-    ]);
+  const [
+    earningsSnapshot,
+    callsSnapshot,
+    withdrawalsSnapshot,
+  ] = await Promise.all([
+    earningsCollection.where("hostId", "==", id).get(),
+    callsCollection.where("hostId", "==", id).get(),
+    withdrawalsCollection.where("hostId", "==", id).get(),
+  ]);
 
   const host = hostSnapshot.data();
+
   const now = new Date();
   const todayKey = getDateKey(now);
   const weekStartKey = getMondayDateKey(now);
@@ -218,15 +311,24 @@ export async function getHostEarningsSummary(hostId) {
 
   for (const document of earningsSnapshot.docs) {
     const earning = document.data();
-    const amountCents = getEarningAmountCents(earning);
-    const minutes = Number(earning.completedMinutes ?? 0);
 
-    if (!Number.isSafeInteger(minutes) || minutes < 0) continue;
+    const amountCents = getEarningAmountCents(earning);
+    const minutes = Number(
+      earning.completedMinutes ?? 0
+    );
+
+    if (
+      !Number.isSafeInteger(minutes) ||
+      minutes < 0
+    ) {
+      continue;
+    }
 
     summary.allTime.earningsCents += amountCents;
     summary.allTime.billableMinutes += minutes;
 
     const createdAt = toDate(earning.createdAt);
+
     if (!createdAt) continue;
 
     const dateKey = getDateKey(createdAt);
@@ -237,7 +339,10 @@ export async function getHostEarningsSummary(hostId) {
       summary.today.billableMinutes += minutes;
     }
 
-    if (dateKey >= weekStartKey && dateKey <= todayKey) {
+    if (
+      dateKey >= weekStartKey &&
+      dateKey <= todayKey
+    ) {
       summary.week.earningsCents += amountCents;
       summary.week.billableMinutes += minutes;
     }
@@ -257,6 +362,7 @@ export async function getHostEarningsSummary(hostId) {
     if (call.status !== "completed") continue;
 
     completedCallCount += 1;
+
     completedCallSeconds += Math.max(
       0,
       Math.floor(toNumber(call.durationSeconds))
@@ -271,9 +377,10 @@ export async function getHostEarningsSummary(hostId) {
 
   for (const document of withdrawalsSnapshot.docs) {
     const withdrawal = document.data();
-    const amountCents = Math.max(
-      0,
-      Math.floor(toNumber(withdrawal.amountCents))
+
+    const amountCents = validCents(
+      Math.floor(toNumber(withdrawal.amountCents)),
+      "Withdrawal amount"
     );
 
     if (withdrawal.status === "pending") {
@@ -329,8 +436,12 @@ export async function getHostEarningsSummary(hostId) {
     calls: {
       completed: completedCallCount,
       totalSeconds: completedCallSeconds,
-      totalMinutes: Math.floor(completedCallSeconds / 60),
-      totalHours: Number((completedCallSeconds / 3600).toFixed(2)),
+      totalMinutes: Math.floor(
+        completedCallSeconds / 60
+      ),
+      totalHours: Number(
+        (completedCallSeconds / 3600).toFixed(2)
+      ),
     },
 
     withdrawals: {
@@ -344,12 +455,10 @@ export async function getHostEarningsSummary(hostId) {
   };
 }
 
-/*
- * REQUEST WITHDRAWAL
- *
- * The route must authenticate the user and verify that the Firebase UID
- * matches the host record before invoking this function.
- */
+// ============================================================
+// REQUEST HOST WITHDRAWAL
+// ============================================================
+
 export async function requestHostWithdrawal(
   hostId,
   amountRand,
@@ -365,42 +474,38 @@ export async function requestHostWithdrawal(
     );
   }
 
-  const amount = Number(amountRand);
+  const amountCents = parseRandToCents(amountRand);
+  const validatedBankDetails =
+    validateBankDetails(bankDetails);
 
-  if (!Number.isFinite(amount) || amount <= 0) {
-    throw makeError("Enter a valid withdrawal amount.", 400);
-  }
-
-  const amountCents = Math.round(amount * 100);
-
-  if (
-    !Number.isSafeInteger(amountCents) ||
-    amountCents <= 0 ||
-    Math.abs(amount * 100 - amountCents) > 0.000001
-  ) {
-    throw makeError("Enter a valid amount in rand and cents.", 400);
-  }
-
-  const validatedBankDetails = validateBankDetails(bankDetails);
   const hostRef = hostsCollection.doc(id);
   const withdrawalRef = withdrawalsCollection.doc();
+
   const now = new Date();
 
   await db.runTransaction(async (transaction) => {
     const hostSnapshot = await transaction.get(hostRef);
 
     if (!hostSnapshot.exists) {
-      throw makeError("Host account not found.", 404);
+      throw makeError(
+        "Host account not found.",
+        404
+      );
     }
 
     const host = hostSnapshot.data();
 
     if (host.status !== "active") {
-      throw makeError("Only active hosts can request withdrawals.", 403);
+      throw makeError(
+        "Only active hosts can request withdrawals.",
+        403
+      );
     }
 
     const availableCents = validCents(
-      Math.floor(toNumber(host.availableHostEarningsCents)),
+      Math.floor(
+        toNumber(host.availableHostEarningsCents)
+      ),
       "Available balance"
     );
 
@@ -411,15 +516,20 @@ export async function requestHostWithdrawal(
       );
     }
 
+    // Reserve the money and create the request atomically.
     transaction.update(hostRef, {
-      availableHostEarningsCents: availableCents - amountCents,
+      availableHostEarningsCents:
+        availableCents - amountCents,
       updatedAt: now,
     });
 
     transaction.create(withdrawalRef, {
       hostId: id,
       hostFirebaseUid: host.firebaseUid ?? null,
-      hostUsername: host.publicUsername ?? host.username ?? null,
+      hostUsername:
+        host.publicUsername ??
+        host.username ??
+        null,
 
       amountCents,
       amount: toZAR(amountCents),
@@ -451,11 +561,10 @@ export async function requestHostWithdrawal(
   };
 }
 
-/*
- * WITHDRAWAL HISTORY
- *
- * Never return bank details to the dashboard history response.
- */
+// ============================================================
+// HOST WITHDRAWAL HISTORY
+// ============================================================
+
 export async function getHostWithdrawalHistory(hostId) {
   const id = normalizeId(hostId, "host ID");
 
@@ -465,9 +574,10 @@ export async function getHostWithdrawalHistory(hostId) {
 
   const withdrawals = snapshot.docs.map((document) => {
     const data = document.data();
-    const amountCents = Math.max(
-      0,
-      Math.floor(toNumber(data.amountCents))
+
+    const amountCents = validCents(
+      Math.floor(toNumber(data.amountCents)),
+      "Withdrawal amount"
     );
 
     return {
@@ -475,13 +585,19 @@ export async function getHostWithdrawalHistory(hostId) {
       amountCents,
       amount: toZAR(amountCents),
       currency: data.currency ?? "ZAR",
-      status: data.status ?? "pending",
+      status: VALID_WITHDRAWAL_STATUSES.has(data.status)
+        ? data.status
+        : "pending",
       payoutMethod: data.payoutMethod ?? "manual",
       payoutNote: data.payoutNote ?? "",
-      requestedAt: toDate(data.requestedAt)?.toISOString() ?? null,
-      updatedAt: toDate(data.updatedAt)?.toISOString() ?? null,
-      paidAt: toDate(data.paidAt)?.toISOString() ?? null,
-      rejectedAt: toDate(data.rejectedAt)?.toISOString() ?? null,
+      requestedAt:
+        toDate(data.requestedAt)?.toISOString() ?? null,
+      updatedAt:
+        toDate(data.updatedAt)?.toISOString() ?? null,
+      paidAt:
+        toDate(data.paidAt)?.toISOString() ?? null,
+      rejectedAt:
+        toDate(data.rejectedAt)?.toISOString() ?? null,
     };
   });
 
