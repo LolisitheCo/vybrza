@@ -136,6 +136,14 @@ app.use(
 );
 
 // ------------------------------------------------------------
+// LIVEKIT WEBHOOK — MUST RECEIVE RAW BODY
+// ------------------------------------------------------------
+
+// Mount before express.json() so LiveKit signature
+// verification receives the original request body.
+app.use("/api/livekit", livekitWebhookRoutes);
+
+// ------------------------------------------------------------
 // REQUEST PARSING
 // ------------------------------------------------------------
 
@@ -180,7 +188,6 @@ app.use("/api/admin", adminManagementRoutes);
 app.use("/api/admin/withdrawals", adminWithdrawalRoutes);
 app.use("/api/calls", callRoutes);
 app.use("/api/livekit", livekitRoutes);
-app.use("/api/livekit", livekitWebhookRoutes);
 
 // ------------------------------------------------------------
 // UNKNOWN ENDPOINTS

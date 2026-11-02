@@ -148,6 +148,7 @@ async function getRoomIdentities(roomService, roomName) {
   );
 }
 
+
 /**
  * Starts individual customer sessions only when:
  * - the group room is still active;
@@ -182,7 +183,7 @@ async function startEligibleGroupCalls(
     roomName
   );
 
-  // Do not start any customer timer before the host joins.
+  // The host must be present before any customer timer starts.
   if (!identities.has(hostUid)) {
     return;
   }
@@ -191,6 +192,8 @@ async function startEligibleGroupCalls(
     roomData.id,
     roomData
   );
+
+  let activeCustomerSessions = 0;
 
   for (const callId of callIds) {
     const callSnapshot = await callSessions.doc(callId).get();
@@ -204,17 +207,60 @@ async function startEligibleGroupCalls(
     if (
       call.groupRoomId !== roomData.id ||
       call.hostId !== roomData.hostId ||
-      !identities.has(call.userId) ||
-      call.status !== "matched"
+      !identities.has(call.userId)
     ) {
       continue;
     }
 
-    // startCall must be idempotent because webhooks can be retried.
-    await startCall(callId, roomName, url);
+    // Count an already-active session only if it belongs
+    // to this exact LiveKit room.
+    if (call.status === "active") {
+      if (call.roomId === roomName) {
+        activeCustomerSessions += 1;
+      }
+
+      continue;
+    }
+
+    if (call.status !== "matched") {
+      continue;
+    }
+
+    try {
+      // startCall is transactional and idempotent.
+      const startedCall = await startCall(
+        callId,
+        roomName,
+        url
+      );
+
+      if (
+        startedCall?.status === "active" &&
+        startedCall.roomId === roomName
+      ) {
+        activeCustomerSessions += 1;
+      }
+    } catch (error) {
+      // A customer may cancel or end their call between
+      // the webhook read and the startCall transaction.
+      if (error?.status === 409) {
+        console.warn(
+          "SA LIVE skipped a customer session that changed state.",
+          { callId }
+        );
+
+        continue;
+      }
+
+      throw error;
+    }
   }
 
-  // Only mark the room active if it has not been ended meanwhile.
+  // Do not mark an empty or waiting-only room as active.
+  if (activeCustomerSessions === 0) {
+    return;
+  }
+
   const roomRef = callRooms.doc(roomData.id);
 
   await db.runTransaction(async (transaction) => {
@@ -241,8 +287,10 @@ async function startEligibleGroupCalls(
   });
 }
 
+
 /**
  * Ends one customer's call without ending the shared group room.
+ * callService.endCall() handles billing and room membership cleanup.
  */
 async function endCustomerGroupCall(
   callId,
@@ -267,32 +315,6 @@ async function endCustomerGroupCall(
   }
 
   await endCall(callId, reason);
-
-  // Remove only this customer from the room membership list.
-  // Keep callIds so history and recovery remain possible.
-  const roomRef = callRooms.doc(groupRoomId);
-
-  await db.runTransaction(async (transaction) => {
-    const roomSnapshot = await transaction.get(roomRef);
-
-    if (!roomSnapshot.exists) {
-      return;
-    }
-
-    const latestRoom = roomSnapshot.data();
-
-    if (latestRoom.status === "ended" || latestRoom.endedAt) {
-      return;
-    }
-
-    const customerIds = normalizeIds(latestRoom.customerIds)
-      .filter((id) => id !== call.userId);
-
-    transaction.update(roomRef, {
-      customerIds,
-      updatedAt: timestampNow(),
-    });
-  });
 }
 
 /**

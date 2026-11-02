@@ -1,10 +1,14 @@
 
 import { db } from "../config/firebase.js";
 import { finalizeCallBilling } from "./billingService.js";
+import {
+  removeCallFromGroupRoom,
+} from "./groupRoomService.js";
 
 const callsCollection = db.collection("callSessions");
 const usersCollection = db.collection("users");
 const hostsCollection = db.collection("hosts");
+const callRoomsCollection = db.collection("callRooms");
 
 const ALLOWED_END_REASONS = new Set([
   "completed",
@@ -262,6 +266,7 @@ export async function getCallById(callId) {
 |--------------------------------------------------------------------------
 */
 
+
 export async function startCall(callId, roomId, roomUrl) {
   const normalizedCallId = validateId(callId, "call ID");
   const normalizedRoomId = validateRoomId(roomId);
@@ -278,22 +283,70 @@ export async function startCall(callId, roomId, roomUrl) {
 
     const call = snapshot.data();
 
-    // An identical retry must never reset the timer.
-    if (call.status === "active") {
-      if (
-        call.roomId === normalizedRoomId &&
-        call.roomUrl === normalizedRoomUrl
-      ) {
-        return {
-          ...call,
-          id: snapshot.id,
-        };
+    let groupRoomRef = null;
+    let groupRoom = null;
+
+    // Read and validate the shared room when this is a group call.
+    if (call.groupRoomId) {
+      groupRoomRef = callRoomsCollection.doc(call.groupRoomId);
+
+      const groupRoomSnapshot = await transaction.get(
+        groupRoomRef
+      );
+
+      if (!groupRoomSnapshot.exists) {
+        throw makeError(
+          "The assigned group room no longer exists.",
+          409
+        );
       }
 
-      throw makeError(
-        "This call is already active in a different room.",
-        409
-      );
+      groupRoom = groupRoomSnapshot.data();
+
+      if (
+        !["waiting_host", "active"].includes(groupRoom.status) ||
+        groupRoom.endedAt ||
+        groupRoom.roomName !== normalizedRoomId ||
+        groupRoom.hostId !== call.hostId ||
+        !Array.isArray(groupRoom.callIds) ||
+        !groupRoom.callIds.includes(normalizedCallId) ||
+        !Array.isArray(groupRoom.customerIds) ||
+        !groupRoom.customerIds.includes(call.userId)
+      ) {
+        throw makeError(
+          "This customer is no longer eligible to start in this group room.",
+          409
+        );
+      }
+    }
+
+    // Identical retries must never reset the timer or balance snapshot.
+    if (call.status === "active") {
+      if (
+        call.roomId !== normalizedRoomId ||
+        call.roomUrl !== normalizedRoomUrl
+      ) {
+        throw makeError(
+          "This call is already active in a different room.",
+          409
+        );
+      }
+
+      // Repair the room status if an earlier operation left it waiting.
+      if (groupRoomRef && groupRoom.status !== "active") {
+        const now = new Date();
+
+        transaction.update(groupRoomRef, {
+          status: "active",
+          startedAt: groupRoom.startedAt || now,
+          updatedAt: now,
+        });
+      }
+
+      return {
+        ...call,
+        id: snapshot.id,
+      };
     }
 
     if (call.status !== "matched") {
@@ -310,17 +363,63 @@ export async function startCall(callId, roomId, roomUrl) {
       );
     }
 
+    // Read the customer's balance before making any transaction writes.
+    const userId = call.userId || call.customerUid;
+
+    if (
+      typeof userId !== "string" ||
+      !userId.trim()
+    ) {
+      throw makeError(
+        "Customer ID is missing from this call.",
+        409
+      );
+    }
+
+    const userRef = usersCollection.doc(userId);
+    const userSnapshot = await transaction.get(userRef);
+
+    if (!userSnapshot.exists) {
+      throw makeError(
+        "Customer account was not found.",
+        404
+      );
+    }
+
+    const customerMinutes = userSnapshot.data().minutes;
+
+    if (
+      !Number.isSafeInteger(customerMinutes) ||
+      customerMinutes <= 0
+    ) {
+      throw makeError(
+        "Customer has no available minutes.",
+        409
+      );
+    }
+
     const now = new Date();
 
     const update = {
       status: "active",
+      minutesAtStart: customerMinutes,
       roomId: normalizedRoomId,
       roomUrl: normalizedRoomUrl,
       startedAt: now,
       updatedAt: now,
     };
 
+    // Update the customer's individual session.
     transaction.update(callRef, update);
+
+    // Update the shared room in the SAME transaction.
+    if (groupRoomRef) {
+      transaction.update(groupRoomRef, {
+        status: "active",
+        startedAt: groupRoom.startedAt || now,
+        updatedAt: now,
+      });
+    }
 
     return {
       ...call,
@@ -329,6 +428,7 @@ export async function startCall(callId, roomId, roomUrl) {
     };
   });
 }
+
 
 /*
 |--------------------------------------------------------------------------
@@ -507,6 +607,30 @@ export async function endCall(callId, reason = "completed") {
       neverStarted,
     };
   });
+
+    /*
+   * Remove this customer's membership from the shared room.
+   * Do this before billing so a billing error cannot leave
+   * a completed customer occupying a room slot.
+   */
+  if (isGroupCall(endedCall)) {
+    try {
+      await removeCallFromGroupRoom({
+        callId: endedCall.id,
+      });
+    } catch (error) {
+      console.error(
+        "SA LIVE group-room cleanup failed.",
+        {
+          callId: endedCall.id,
+          message:
+            typeof error?.message === "string"
+              ? error.message.slice(0, 300)
+              : "Unknown cleanup error",
+        }
+      );
+    }
+  }
 
   /*
    * Calls that never started must not be billed.

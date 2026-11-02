@@ -13,6 +13,7 @@ import {
 } from "../services/callService.js";
 import {
   getGroupRoomForCall,
+  removeCallFromGroupRoom,
 } from "../services/groupRoomService.js";
 
 const router = express.Router();
@@ -546,6 +547,7 @@ router.post("/token", async (req, res, next) => {
 |--------------------------------------------------------------------------
 */
 
+
 router.post("/start", async (req, res, next) => {
   try {
     const callId = getCallId(req);
@@ -557,18 +559,10 @@ router.post("/start", async (req, res, next) => {
       hostData,
     } = await getAuthorizedCall(callId, req.user.uid);
 
-    if (call.status === "active") {
-      return res.status(200).json({
-        success: true,
-        message: "Call is already active.",
-        call,
-      });
-    }
-
-    if (call.status !== "matched") {
+    if (!["matched", "active"].includes(call.status)) {
       throw httpError(
         409,
-        "Only a matched call can be started."
+        "This call is not ready to start."
       );
     }
 
@@ -581,6 +575,7 @@ router.post("/start", async (req, res, next) => {
 
     const roomName = getRoomName(call);
 
+    // Verify the customer and host still belong to this room.
     if (call.groupRoomId) {
       await verifyGroupRoomMembership({
         callId,
@@ -592,6 +587,8 @@ router.post("/start", async (req, res, next) => {
       });
     }
 
+    // Confirm actual LiveKit presence before starting or
+    // confirming an already-active customer session.
     const participants = await getRoomParticipants(roomName);
 
     const identities = new Set(
@@ -606,15 +603,17 @@ router.post("/start", async (req, res, next) => {
     ) {
       throw httpError(
         409,
-        "Both this customer and the assigned host must join the room before the timer starts."
+        "Both this customer and the assigned host must be present in the room."
       );
     }
 
     const { url } = getLiveKitConfig();
 
     /*
-     * startCall is idempotent. If the webhook already started this
-     * session, the existing start timestamp is returned unchanged.
+     * startCall handles both cases:
+     * - matched: starts this customer's individual timer;
+     * - active: returns the existing session without resetting
+     *   its start time or minutesAtStart.
      */
     const startedCall = await startCall(
       callId,
@@ -622,10 +621,8 @@ router.post("/start", async (req, res, next) => {
       url
     );
 
-    /*
-     * Update the shared room after starting the individual call.
-     * All Firestore reads happen before the room write.
-     */
+    // Mark the shared room active after the individual
+    // customer session has successfully started.
     if (call.groupRoomId) {
       const roomRef = callRooms.doc(call.groupRoomId);
 
@@ -661,13 +658,17 @@ router.post("/start", async (req, res, next) => {
 
     return res.status(200).json({
       success: true,
-      message: "Call started.",
+      message:
+        startedCall.status === "active"
+          ? "Call is active."
+          : "Call started.",
       call: startedCall,
     });
   } catch (error) {
     return next(error);
   }
 });
+
 
 /*
 |--------------------------------------------------------------------------
@@ -682,34 +683,50 @@ async function endCustomerSession(call, callId, reason) {
   try {
     result = await endCall(callId, reason);
   } catch (error) {
-    /*
-     * endCall may have marked the call completed before billing
-     * failed. Still remove the customer from room membership.
-     */
     endError = error;
   }
 
+  /*
+   * callService.endCall() performs group-room cleanup.
+   * This fallback handles cases where ending the call failed
+   * before the cleanup step could run.
+   */
   if (call.groupRoomId) {
-    const roomRef = callRooms.doc(call.groupRoomId);
+    try {
+      const latestCallSnapshot = await callSessions
+        .doc(callId)
+        .get();
 
-    await db.runTransaction(async (transaction) => {
-      const roomSnapshot = await transaction.get(roomRef);
+      const latestCall = latestCallSnapshot.exists
+        ? latestCallSnapshot.data()
+        : null;
 
-      if (!roomSnapshot.exists) return;
+      const stillInRoom = latestCall?.groupRoomId === call.groupRoomId;
 
-      const roomData = roomSnapshot.data();
-      const customerIds = normalizeIds(roomData.customerIds);
+      if (stillInRoom) {
+        await removeCallFromGroupRoom({ callId });
+      }
+    } catch (cleanupError) {
+      console.error(
+        "SA LIVE customer group-room cleanup failed:",
+        {
+          callId,
+          message:
+            typeof cleanupError?.message === "string"
+              ? cleanupError.message.slice(0, 250)
+              : "Unknown cleanup error",
+        }
+      );
 
-      transaction.update(roomRef, {
-        customerIds: customerIds.filter(
-          (customerId) => customerId !== call.userId
-        ),
-        updatedAt: new Date(),
-      });
-    });
+      if (!endError) {
+        endError = cleanupError;
+      }
+    }
   }
 
-  if (endError) throw endError;
+  if (endError) {
+    throw endError;
+  }
 
   return result;
 }

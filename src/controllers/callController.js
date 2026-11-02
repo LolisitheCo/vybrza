@@ -9,7 +9,12 @@ import {
   attachExistingCallToGroupRoom,
 } from "../services/groupRoomService.js";
 
+// ============================================================
+// SA LIVE — HOST CALL CONTROLLER
+// ============================================================
+
 const callSessions = db.collection("callSessions");
+const users = db.collection("users");
 
 const ACTIVE_REQUEST_STATUSES = new Set([
   "matching",
@@ -17,15 +22,22 @@ const ACTIVE_REQUEST_STATUSES = new Set([
   "active",
 ]);
 
+const TERMINAL_STATUSES = new Set([
+  "ended",
+  "completed",
+  "cancelled",
+  "canceled",
+  "failed",
+  "expired",
+]);
+
 const REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_CALL_ID_LENGTH = 128;
 const VALID_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
-/*
-|--------------------------------------------------------------------------
-| RESPONSE HELPERS
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// RESPONSE HELPERS
+// ============================================================
 
 function sendError(res, status, message, extra = {}) {
   return res.status(status).json({
@@ -75,15 +87,30 @@ function validCallId(value) {
   );
 }
 
-/*
-|--------------------------------------------------------------------------
-| SAFE CALL RESPONSE
-|--------------------------------------------------------------------------
-|
-| Only return fields needed by the host dashboard.
-| Never return private customer account or payment information.
-|
-*/
+function isTerminal(call) {
+  return (
+    !call ||
+    Boolean(call.endedAt) ||
+    TERMINAL_STATUSES.has(
+      String(call.status || "").toLowerCase()
+    )
+  );
+}
+
+function isExpiredPendingRequest(call, now = Date.now()) {
+  if (!call || call.status !== "matching") {
+    return false;
+  }
+
+  const createdAt = getTimestampMs(call.createdAt);
+
+  // Do not expire records with missing timestamps automatically.
+  if (!createdAt) {
+    return false;
+  }
+
+  return now - createdAt >= REQUEST_TIMEOUT_MS;
+}
 
 function safeCallResponse(id, data = {}) {
   return {
@@ -119,17 +146,92 @@ function safeCallList(calls) {
   );
 }
 
-/*
-|--------------------------------------------------------------------------
-| GET MY CALL REQUESTS
-|--------------------------------------------------------------------------
-|
-| GET /api/calls/requests
-|
-| Returns requests belonging only to the authenticated host.
-|
-*/
+function noStore(res) {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  res.setHeader("Pragma", "no-cache");
+}
 
+// ============================================================
+// EXPIRE ONE PENDING REQUEST
+// ============================================================
+
+/**
+ * Expires an unaccepted matching request.
+ *
+ * This is transactional so a simultaneous host acceptance
+ * cannot also successfully attach the same request.
+ */
+async function expirePendingRequest(callId, expectedHostId) {
+  const callRef = callSessions.doc(callId);
+
+  return db.runTransaction(async (transaction) => {
+    const callSnapshot = await transaction.get(callRef);
+
+    if (!callSnapshot.exists) {
+      return false;
+    }
+
+    const call = callSnapshot.data();
+
+    if (call.hostId !== expectedHostId) {
+      return false;
+    }
+
+    if (!isExpiredPendingRequest(call)) {
+      return false;
+    }
+
+    const userId = call.userId || call.customerUid;
+
+    let userRef = null;
+    let userSnapshot = null;
+
+    if (
+      typeof userId === "string" &&
+      userId.trim()
+    ) {
+      userRef = users.doc(userId);
+      userSnapshot = await transaction.get(userRef);
+    }
+
+    const now = new Date();
+
+    transaction.update(callRef, {
+      status: "expired",
+      endedAt: now,
+      updatedAt: now,
+      endReason: "request_timeout",
+      durationSeconds: 0,
+      minutesUsed: 0,
+      billableMinutes: 0,
+      billingStatus: "not_required",
+    });
+
+    if (
+      userRef &&
+      userSnapshot?.exists &&
+      userSnapshot.data().activeCallId === callId
+    ) {
+      transaction.update(userRef, {
+        activeCallId: null,
+        updatedAt: now,
+      });
+    }
+
+    return true;
+  });
+}
+
+// ============================================================
+// GET MY CALL REQUESTS
+// ============================================================
+
+/**
+ * GET /api/calls/requests
+ *
+ * Returns requests assigned to the authenticated host.
+ * Old matching requests are expired and cleaned up first.
+ */
 export async function getMyCallRequests(req, res, next) {
   try {
     const hostId = getAuthenticatedHostId(req);
@@ -142,13 +244,33 @@ export async function getMyCallRequests(req, res, next) {
       );
     }
 
-    const snapshot = await callSessions
+    const initialSnapshot = await callSessions
       .where("hostId", "==", hostId)
       .get();
 
-    const now = Date.now();
+    // Expire old pending requests before building the response.
+    for (const document of initialSnapshot.docs) {
+      const call = document.data();
 
-    const calls = snapshot.docs
+      if (isExpiredPendingRequest(call)) {
+        try {
+          await expirePendingRequest(document.id, hostId);
+        } catch (error) {
+          console.error(
+            "[SA LIVE] Could not expire pending request:",
+            document.id,
+            error.message
+          );
+        }
+      }
+    }
+
+    // Refetch because the expiry transactions may have changed status.
+    const refreshedSnapshot = await callSessions
+      .where("hostId", "==", hostId)
+      .get();
+
+    const calls = refreshedSnapshot.docs
       .map((document) =>
         safeCallResponse(
           document.id,
@@ -157,6 +279,10 @@ export async function getMyCallRequests(req, res, next) {
       )
       .filter((call) => {
         if (call.endedAt) {
+          return false;
+        }
+
+        if (isTerminal(call)) {
           return false;
         }
 
@@ -172,19 +298,18 @@ export async function getMyCallRequests(req, res, next) {
           return true;
         }
 
-        const createdMs = getTimestampMs(
-          call.createdAt
-        );
+        // Only show unaccepted requests that have not expired.
+        if (call.status === "matching") {
+          const createdMs = getTimestampMs(call.createdAt);
 
-        // Keep records without timestamps visible for investigation.
-        if (!createdMs) {
-          return true;
+          return (
+            createdMs > 0 &&
+            Date.now() - createdMs < REQUEST_TIMEOUT_MS
+          );
         }
 
-        // Hide old, unstarted requests from the dashboard.
-        return (
-          now - createdMs <= REQUEST_TIMEOUT_MS
-        );
+        // Matched calls remain visible while the call is being joined.
+        return call.status === "matched";
       })
       .sort((a, b) => {
         return (
@@ -193,29 +318,32 @@ export async function getMyCallRequests(req, res, next) {
         );
       });
 
-    res.setHeader("Cache-Control", "no-store");
+    noStore(res);
 
     return res.status(200).json({
       success: true,
       calls,
     });
   } catch (error) {
+    console.error(
+      "[SA LIVE] Host call request retrieval failed:",
+      error
+    );
+
     return next(error);
   }
 }
 
-/*
-|--------------------------------------------------------------------------
-| GET MY CALL HISTORY
-|--------------------------------------------------------------------------
-|
-| GET /api/calls/history
-|
-| Each customer session remains a separate history entry,
-| even when several customers shared one group room.
-|
-*/
+// ============================================================
+// GET MY CALL HISTORY
+// ============================================================
 
+/**
+ * GET /api/calls/history
+ *
+ * Each customer's call remains a separate history entry,
+ * even when multiple customers shared a group room.
+ */
 export async function getMyCallHistory(req, res, next) {
   try {
     const hostId = getAuthenticatedHostId(req);
@@ -230,37 +358,42 @@ export async function getMyCallHistory(req, res, next) {
 
     const calls = await getHostCallHistory(hostId);
 
-    res.setHeader("Cache-Control", "no-store");
+    noStore(res);
 
     return res.status(200).json({
       success: true,
       calls: safeCallList(calls),
     });
   } catch (error) {
+    console.error(
+      "[SA LIVE] Host call history retrieval failed:",
+      error
+    );
+
     return next(error);
   }
 }
 
-/*
-|--------------------------------------------------------------------------
-| ACCEPT CALL REQUEST
-|--------------------------------------------------------------------------
-|
-| POST /api/calls/:callId/accept
-|
-| The existing call request is attached to the host's group room.
-|
-| This operation:
-| - Does not create a duplicate call session.
-| - Preserves the original call ID.
-| - Checks customer balance.
-| - Checks host availability and schedule.
-| - Checks the host's group-room capacity.
-| - Reuses the existing group room where possible.
-| - Reserves the customer's activeCallId.
-|
-*/
+// ============================================================
+// ACCEPT CALL REQUEST
+// ============================================================
 
+/**
+ * POST /api/calls/:callId/accept
+ *
+ * The groupRoomService performs the transaction that:
+ * - Confirms this request belongs to the host.
+ * - Confirms the request is still matching.
+ * - Rechecks customer balance.
+ * - Rechecks host availability.
+ * - Rechecks room capacity.
+ * - Attaches the existing request to the group room.
+ * - Changes matching -> matched.
+ * - Reserves the customer.
+ *
+ * Host acceptance and customer cancellation both update the
+ * same call document transactionally. Only one should succeed.
+ */
 export async function acceptCallRequest(req, res, next) {
   try {
     const hostId = getAuthenticatedHostId(req);
@@ -286,29 +419,19 @@ export async function acceptCallRequest(req, res, next) {
       );
     }
 
-    /*
-     * The service performs the complete Firestore transaction.
-     *
-     * Do not change the call status separately here.
-     * The service attaches the existing request and updates
-     * the call, customer, host and group-room records together.
-     */
     const result = await attachExistingCallToGroupRoom({
       callId,
       hostId,
     });
 
-    res.setHeader("Cache-Control", "no-store");
+    noStore(res);
 
     if (!result?.matched) {
-      const message =
-        result?.message ||
-        "The call request could not be accepted.";
-
       return sendError(
         res,
         409,
-        message,
+        result?.message ||
+          "The call request could not be accepted.",
         {
           retry: Boolean(result?.retry),
         }
@@ -322,9 +445,7 @@ export async function acceptCallRequest(req, res, next) {
         result.message ||
         "Call accepted successfully.",
 
-      alreadyAttached: Boolean(
-        result.alreadyAttached
-      ),
+      alreadyAttached: Boolean(result.alreadyAttached),
 
       call: safeCallResponse(
         result.call?.id || callId,
@@ -351,9 +472,10 @@ export async function acceptCallRequest(req, res, next) {
         : null,
     });
   } catch (error) {
-    console.error("SA LIVE accept call request failed:", {
-      message: error?.message || "Unknown error",
-    });
+    console.error(
+      "[SA LIVE] Accept call request failed:",
+      error?.message || error
+    );
 
     if (
       Number.isInteger(error?.status) &&
