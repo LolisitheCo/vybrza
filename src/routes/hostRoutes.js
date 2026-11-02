@@ -73,10 +73,10 @@ const withdrawalLimiter = rateLimit({
 });
 
 // ============================================================
-// PUBLIC ROUTES
+// PUBLIC HOST DIRECTORY
+// No authentication required.
 // ============================================================
 
-// Only sanitized, public host information may be returned.
 router.get(
   "/public",
   publicDirectoryLimiter,
@@ -84,48 +84,84 @@ router.get(
 );
 
 // ============================================================
-// AUTHENTICATED WEBSITE-ACCOUNT ROUTES
+// HOST APPLICATIONS
+// Firebase authentication required.
+// Host approval is NOT required.
 // ============================================================
-
-// Applicants do not need to be approved hosts.
-router.use(verifyFirebaseToken);
 
 router.post(
   "/applications",
+  verifyFirebaseToken,
   applicationLimiter,
   applyToBecomeHost
 );
 
 router.get(
   "/applications/me",
+  verifyFirebaseToken,
   getMyHostApplicationStatus
 );
 
 // ============================================================
-// APPROVED HOST ROUTES
+// APPROVED HOST PROFILE
+// Firebase authentication + approved host required.
 // ============================================================
 
-router.use(requireHost);
+router.get(
+  "/me",
+  verifyFirebaseToken,
+  requireHost,
+  getMyHostProfile
+);
 
-// Profile
-router.get("/me", getMyHostProfile);
-router.put("/me", updateMyHostProfile);
+router.put(
+  "/me",
+  verifyFirebaseToken,
+  requireHost,
+  updateMyHostProfile
+);
 
-// Presence
+// ============================================================
+// HOST HEARTBEAT
+// Firebase authentication + approved host required.
+// ============================================================
+
 router.post(
   "/heartbeat",
+  verifyFirebaseToken,
+  requireHost,
   heartbeatLimiter,
   heartbeat
 );
 
-// Earnings
-router.get("/earnings", getMyEarnings);
+// ============================================================
+// HOST EARNINGS
+// Firebase authentication + approved host required.
+// ============================================================
 
-// Withdrawals
-router.get("/withdrawals", getMyWithdrawals);
+router.get(
+  "/earnings",
+  verifyFirebaseToken,
+  requireHost,
+  getMyEarnings
+);
+
+// ============================================================
+// HOST WITHDRAWALS
+// Firebase authentication + approved host required.
+// ============================================================
+
+router.get(
+  "/withdrawals",
+  verifyFirebaseToken,
+  requireHost,
+  getMyWithdrawals
+);
 
 router.post(
   "/withdrawals",
+  verifyFirebaseToken,
+  requireHost,
   withdrawalLimiter,
   createMyWithdrawal
 );

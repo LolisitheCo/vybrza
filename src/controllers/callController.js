@@ -307,7 +307,7 @@ export async function acceptCallRequest(req, res, next) {
 
       return sendError(
         res,
-        result?.retry ? 409 : 409,
+        409,
         message,
         {
           retry: Boolean(result?.retry),

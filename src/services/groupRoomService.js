@@ -437,6 +437,8 @@ export async function matchCustomerToGroupRoom({
     const callData = {
       userId: normalizedUserId,
       hostId: normalizedHostId,
+      customerUid: normalizedUserId,
+
 
       groupRoomId: roomRef.id,
       roomId: roomName,

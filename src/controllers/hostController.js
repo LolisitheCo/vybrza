@@ -17,6 +17,17 @@ import {
 // ============================================================
 
 const HOST_CONTRACT_VERSION = "1.0";
+const TIME_ZONE = "Africa/Johannesburg";
+
+const DAY_NAMES = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+];
 
 const APPLICATION_CLIENT_ERRORS = new Set([
   "Please use a valid email address.",
@@ -87,15 +98,17 @@ function sendError(
       ? error.message
       : "";
 
-  // Explicitly recognised validation errors.
   if (knownClientErrors.has(message)) {
     return sendClientError(res, 400, message);
   }
 
-  // Service errors with an intentional HTTP status.
   const status = Number(error?.status);
 
-  if (Number.isInteger(status) && status >= 400 && status < 500) {
+  if (
+    Number.isInteger(status) &&
+    status >= 400 &&
+    status < 500
+  ) {
     return sendClientError(
       res,
       status,
@@ -103,7 +116,6 @@ function sendError(
     );
   }
 
-  // Known host access errors.
   if (
     message === "Host not found." ||
     message === "Host account not found." ||
@@ -113,7 +125,6 @@ function sendError(
     return sendClientError(res, 403, message);
   }
 
-  // Do not send internal database or server errors to clients.
   console.error("[SA LIVE HOST CONTROLLER]", {
     message: fallbackMessage,
     code: error?.code || "UNKNOWN_ERROR",
@@ -160,6 +171,186 @@ function hasOwn(object, property) {
     object,
     property
   );
+}
+
+// ============================================================
+// AVAILABILITY DISPLAY HELPERS
+// ============================================================
+
+function normalizeDay(value) {
+  if (Number.isInteger(value) && value >= 0 && value <= 6) {
+    return {
+      dayIndex: value,
+      day: DAY_NAMES[value],
+    };
+  }
+
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+
+  const index = DAY_NAMES.findIndex(
+    (day) => day.toLowerCase() === normalized
+  );
+
+  if (index !== -1) {
+    return {
+      dayIndex: index,
+      day: DAY_NAMES[index],
+    };
+  }
+
+  const shortIndex = DAY_NAMES.findIndex(
+    (day) => day.slice(0, 3).toLowerCase() === normalized
+  );
+
+  if (shortIndex !== -1) {
+    return {
+      dayIndex: shortIndex,
+      day: DAY_NAMES[shortIndex],
+    };
+  }
+
+  return null;
+}
+
+function isValidTime(value) {
+  if (typeof value !== "string") return false;
+
+  return /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+}
+
+function getScheduleSource(host) {
+  if (Array.isArray(host?.availability)) {
+    return host.availability;
+  }
+
+  if (Array.isArray(host?.schedule)) {
+    return host.schedule;
+  }
+
+  return [];
+}
+
+/**
+ * Convert the saved weekly schedule into a predictable,
+ * public-facing structure.
+ *
+ * The schedule is expressed in South African local time.
+ * This does not claim that the host is online right now.
+ */
+function buildAvailableTimes(host) {
+  const schedule = getScheduleSource(host);
+
+  return schedule
+    .filter((entry) => isPlainObject(entry))
+    .map((entry) => {
+      const dayInfo = normalizeDay(
+        entry.day ?? entry.dayOfWeek
+      );
+
+      const startTime =
+        entry.startTime ?? entry.start;
+
+      const endTime =
+        entry.endTime ?? entry.end;
+
+      const enabled =
+        entry.enabled !== false &&
+        entry.available !== false;
+
+      if (
+        !dayInfo ||
+        !isValidTime(startTime) ||
+        !isValidTime(endTime) ||
+        !enabled
+      ) {
+        return null;
+      }
+
+      return {
+        day: dayInfo.day,
+        dayIndex: dayInfo.dayIndex,
+        startTime,
+        endTime,
+        label: `${dayInfo.day}, ${startTime}–${endTime}`,
+        timeZone: TIME_ZONE,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => {
+      if (a.dayIndex !== b.dayIndex) {
+        return a.dayIndex - b.dayIndex;
+      }
+
+      return a.startTime.localeCompare(b.startTime);
+    });
+}
+
+/**
+ * Only expose fields intended for the public host directory.
+ * Never return Firebase identifiers, private account data,
+ * payment details, bank details, or internal room reservations.
+ */
+function toPublicHost(host) {
+  if (!isPlainObject(host)) return null;
+
+  const availability = getScheduleSource(host);
+
+  return {
+    id:
+      typeof host.id === "string"
+        ? host.id
+        : null,
+
+    username:
+      typeof host.username === "string"
+        ? host.username
+        : "",
+
+    displayName:
+      typeof host.displayName === "string"
+        ? host.displayName
+        : typeof host.name === "string"
+          ? host.name
+          : "SA LIVE Host",
+
+    bio:
+      typeof host.bio === "string"
+        ? host.bio
+        : "",
+
+    photoURL:
+      typeof host.photoURL === "string"
+        ? host.photoURL
+        : "",
+
+    languages: Array.isArray(host.languages)
+      ? host.languages.filter(
+          (language) => typeof language === "string"
+        )
+      : typeof host.language === "string"
+        ? [host.language]
+        : [],
+
+    // Account approval and live presence are different things.
+    online: host.online === true,
+
+    // This is the service's call-availability result.
+    available: host.available === true,
+
+    acceptingCalls: host.acceptingCalls === true,
+
+    // Keep the saved schedule available to clients that need it.
+    availability,
+
+    // Use this field to display readable times on the website.
+    availableTimes: buildAvailableTimes(host),
+
+    timeZone: TIME_ZONE,
+  };
 }
 
 // ============================================================
@@ -217,9 +408,7 @@ export async function getMyHostProfile(req, res) {
   }
 
   try {
-    const profile = await getHostAvailabilityProfile(
-      hostId
-    );
+    const profile = await getHostAvailabilityProfile(hostId);
 
     if (!profile) {
       return sendClientError(
@@ -230,7 +419,11 @@ export async function getMyHostProfile(req, res) {
     }
 
     return sendSuccess(res, 200, {
-      host: profile,
+      host: {
+        ...profile,
+        availableTimes: buildAvailableTimes(profile),
+        timeZone: TIME_ZONE,
+      },
     });
   } catch (error) {
     return sendError(
@@ -269,8 +462,6 @@ export async function updateMyHostProfile(req, res) {
 
   const body = req.body;
 
-  // Do not allow callers to omit fields accidentally.
-  // The service remains responsible for detailed validation.
   if (
     !hasOwn(body, "publicUsername") &&
     !hasOwn(body, "username")
@@ -315,7 +506,11 @@ export async function updateMyHostProfile(req, res) {
 
     return sendSuccess(res, 200, {
       message: "Host availability saved.",
-      host: profile,
+      host: {
+        ...profile,
+        availableTimes: buildAvailableTimes(profile),
+        timeZone: TIME_ZONE,
+      },
     });
   } catch (error) {
     return sendError(
@@ -332,17 +527,20 @@ export async function updateMyHostProfile(req, res) {
 // ============================================================
 
 export async function publicHostDirectory(req, res) {
-  // Availability changes frequently. Avoid serving stale
-  // online/offline information from an intermediary cache.
-  res.set("Cache-Control", "no-store");
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
 
   try {
     const directory = await getPublicHostDirectory();
 
+    const hosts = Array.isArray(directory)
+      ? directory.map(toPublicHost).filter(Boolean)
+      : [];
+
     return sendSuccess(res, 200, {
-      hosts: Array.isArray(directory)
-        ? directory
-        : [],
+      hosts,
+      timeZone: TIME_ZONE,
     });
   } catch (error) {
     return sendError(
@@ -435,10 +633,7 @@ export async function applyToBecomeHost(req, res) {
 // GET MY HOST APPLICATION STATUS
 // ============================================================
 
-export async function getMyHostApplicationStatus(
-  req,
-  res
-) {
+export async function getMyHostApplicationStatus(req, res) {
   noStore(res);
 
   const firebaseUid = getAuthenticatedUid(req);

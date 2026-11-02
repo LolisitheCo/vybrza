@@ -5,7 +5,7 @@ const hostsCollection = db.collection("hosts");
 const callRoomsCollection = db.collection("callRooms");
 
 export const HOST_TIMEOUT_MS = 45_000;
-export const MAX_GROUP_CUSTOMERS = 2;
+export const MAX_GROUP_CUSTOMERS = 3;
 
 const TIME_ZONE = "Africa/Johannesburg";
 const MAX_AVAILABILITY_SLOTS = 21;
@@ -417,6 +417,21 @@ export async function getHostAvailabilityProfile(hostId) {
  */
 function getPublicHostProfile(host, online, available) {
   return {
+    availability: Array.isArray(host.availability)
+  ? host.availability
+      .filter(
+        (slot) =>
+          slot &&
+          typeof slot.weekday === "string" &&
+          typeof slot.startTime === "string" &&
+          typeof slot.endTime === "string"
+      )
+      .map((slot) => ({
+        weekday: slot.weekday,
+        startTime: slot.startTime,
+        endTime: slot.endTime,
+      }))
+  : [],
     id: host.id,
     displayName:
       host.displayName ||

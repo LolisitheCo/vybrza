@@ -10,6 +10,16 @@ import {
 const hostsCollection = db.collection("hosts");
 
 const MAX_ID_LENGTH = 256;
+const MAX_DISPLAY_NAME_LENGTH = 100;
+const MAX_USERNAME_LENGTH = 32;
+
+const VALID_STATUSES = new Set(["pending", "active"]);
+const RESTRICTED_STATUSES = new Set([
+  "suspended",
+  "rejected",
+  "disabled",
+  "banned",
+]);
 
 /* -------------------------------------------------------------------------- */
 /* ERRORS                                                                     */
@@ -38,12 +48,54 @@ function normalizeId(value, fieldName) {
   if (
     normalized.length > MAX_ID_LENGTH ||
     normalized.includes("/") ||
-    normalized.includes("\0")
+    normalized.includes("\0") ||
+    /[\u0000-\u001F\u007F]/.test(normalized)
   ) {
     throw makeError(`Invalid ${fieldName}.`, 400);
   }
 
   return normalized;
+}
+
+function normalizeUsername(value) {
+  if (typeof value !== "string") {
+    throw makeError("A valid username is required.", 400);
+  }
+
+  const username = value.trim();
+
+  if (
+    username.length < 3 ||
+    username.length > MAX_USERNAME_LENGTH ||
+    !/^[a-zA-Z0-9_]+$/.test(username)
+  ) {
+    throw makeError(
+      "Username must contain 3–32 letters, numbers, or underscores.",
+      400
+    );
+  }
+
+  return username;
+}
+
+function normalizeDisplayName(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw makeError("Host display name is required.", 400);
+  }
+
+  const displayName = value.trim();
+
+  if (
+    displayName.length > MAX_DISPLAY_NAME_LENGTH ||
+    /[\u0000-\u001F\u007F]/.test(displayName)
+  ) {
+    throw makeError(
+      "Host display name is invalid or too long.",
+      400
+    );
+  }
+
+  return displayName;
 }
 
 function validateHostProfile({
@@ -52,37 +104,8 @@ function validateHostProfile({
   username,
 }) {
   const uid = normalizeId(firebaseUid, "Firebase UID");
-
-  if (
-    typeof displayName !== "string" ||
-    !displayName.trim()
-  ) {
-    throw makeError(
-      "Host display name is required.",
-      400
-    );
-  }
-
-  const normalizedDisplayName = displayName.trim();
-
-  if (normalizedDisplayName.length > 100) {
-    throw makeError(
-      "Host display name cannot exceed 100 characters.",
-      400
-    );
-  }
-
-  if (
-    typeof username !== "string" ||
-    !/^[a-zA-Z0-9_]{3,32}$/.test(username.trim())
-  ) {
-    throw makeError(
-      "Username must contain 3–32 letters, numbers, or underscores.",
-      400
-    );
-  }
-
-  const normalizedUsername = username.trim();
+  const normalizedDisplayName = normalizeDisplayName(displayName);
+  const normalizedUsername = normalizeUsername(username);
 
   return {
     firebaseUid: uid,
@@ -92,15 +115,28 @@ function validateHostProfile({
   };
 }
 
+function normalizeDate(date) {
+  if (!(date instanceof Date) || !Number.isFinite(date.getTime())) {
+    throw makeError("Invalid availability date.", 400);
+  }
+
+  return date;
+}
+
+function isRestrictedHost(host) {
+  return RESTRICTED_STATUSES.has(
+    String(host?.status || "").toLowerCase()
+  );
+}
+
 /* -------------------------------------------------------------------------- */
 /* HOST DOCUMENT SANITIZATION                                                 */
 /* -------------------------------------------------------------------------- */
 
 /**
- * Internal backend host representation.
+ * Internal backend representation.
  *
- * This is NOT a public API response. Public endpoints must use
- * getPublicHostDirectory() from hostAvailabilityService.js.
+ * Never return this directly from a public API.
  */
 function toHost(doc) {
   if (!doc?.exists) return null;
@@ -109,13 +145,19 @@ function toHost(doc) {
 
   const {
     linkCodeHash,
-    telegramId,
+    password,
+    passwordHash,
+    resetToken,
+    resetTokenHash,
+    verificationToken,
+    verificationTokenHash,
+    privateNotes,
     ...safeData
   } = data;
 
   return {
-    id: doc.id,
     ...safeData,
+    id: doc.id,
   };
 }
 
@@ -124,46 +166,65 @@ function toHost(doc) {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Synchronous availability check for legacy one-to-one callers.
+ * Legacy one-to-one availability.
  *
- * Group-room availability is checked asynchronously by
- * isHostAvailableForCalls() and must be used by group matching.
+ * A host with an active group room is not available for a
+ * separate one-to-one call.
  */
 export function isHostAvailable(host, date = new Date()) {
   if (!host || typeof host !== "object") {
     return false;
   }
 
-  if (!(date instanceof Date) || !Number.isFinite(date.getTime())) {
+  try {
+    const now = normalizeDate(date);
+
+    if (
+      host.status !== "active" ||
+      !host.firebaseUid ||
+      !isHostOnline(host, now) ||
+      host.acceptingCalls !== true ||
+      host.activeCallId ||
+      host.activeGroupRoomId
+    ) {
+      return false;
+    }
+
+    return isWithinHostSchedule(host, now) === true;
+  } catch {
     return false;
   }
-
-  if (!isHostOnline(host, date)) {
-    return false;
-  }
-
-  if (host.acceptingCalls !== true) {
-    return false;
-  }
-
-  if (host.activeCallId || host.activeGroupRoomId) {
-    return false;
-  }
-
-  return isWithinHostSchedule(host, date);
 }
 
 /**
  * Full asynchronous availability check.
  *
- * This supports a host who is already in a group room with
- * available customer capacity.
+ * This is the function group matching should use.
+ * It allows a host to accept additional customers when their
+ * existing group room has capacity.
  */
 export async function isHostAvailableForMatching(
   host,
   date = new Date()
 ) {
-  return isHostAvailableForCalls(host, date);
+  if (!host || typeof host !== "object") {
+    return false;
+  }
+
+  try {
+    return await isHostAvailableForCalls(
+      host,
+      normalizeDate(date)
+    );
+  } catch (error) {
+    console.error(
+      "[SA LIVE] Host availability check failed:",
+      host.id || "unknown",
+      error?.message || "Unknown error"
+    );
+
+    return false;
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -171,12 +232,12 @@ export async function isHostAvailableForMatching(
 /* -------------------------------------------------------------------------- */
 
 /**
- * Call only from a trusted host-approval workflow.
+ * Call only from a trusted administrator approval workflow.
  *
- * The route/controller must enforce administrator authorization.
- *
- * Host records are keyed by Firebase UID:
+ * Host records are created at:
  * hosts/{firebaseUid}
+ *
+ * The caller must already have verified administrator access.
  */
 export async function createHost({
   firebaseUid,
@@ -190,17 +251,11 @@ export async function createHost({
     displayName,
   });
 
-  if (!["pending", "active"].includes(status)) {
-    throw makeError(
-      "Invalid initial host status.",
-      400
-    );
+  if (!VALID_STATUSES.has(status)) {
+    throw makeError("Invalid initial host status.", 400);
   }
 
-  const hostRef = hostsCollection.doc(
-    profile.firebaseUid
-  );
-
+  const hostRef = hostsCollection.doc(profile.firebaseUid);
   const now = new Date();
 
   return db.runTransaction(async (transaction) => {
@@ -228,10 +283,9 @@ export async function createHost({
       transaction.get(hostRef),
     ]);
 
-    const duplicateAccount =
-      existingHostSnapshot.docs.some(
-        (doc) => doc.id !== hostRef.id
-      );
+    const duplicateAccount = existingHostSnapshot.docs.some(
+      (doc) => doc.id !== hostRef.id
+    );
 
     if (duplicateAccount) {
       throw makeError(
@@ -271,17 +325,15 @@ export async function createHost({
       }
 
       const existingUsername = String(
-        existing.usernameLower ||
-        existing.username ||
-        ""
+        existing.usernameLower || existing.username || ""
       ).toLowerCase();
 
       const existingPublicUsername = String(
         existing.publicUsernameLower ||
-        existing.publicUsername ||
-        existing.usernameLower ||
-        existing.username ||
-        ""
+          existing.publicUsername ||
+          existing.usernameLower ||
+          existing.username ||
+          ""
       ).toLowerCase();
 
       if (
@@ -305,7 +357,7 @@ export async function createHost({
       }
 
       if (
-        !["pending", "active"].includes(existing.status)
+        !VALID_STATUSES.has(existing.status)
       ) {
         throw makeError(
           "The existing host account is restricted and requires administrator review.",
@@ -363,10 +415,7 @@ export async function createHost({
 /* -------------------------------------------------------------------------- */
 
 export async function getHostByFirebaseUid(firebaseUid) {
-  const uid = normalizeId(
-    firebaseUid,
-    "Firebase UID"
-  );
+  const uid = normalizeId(firebaseUid, "Firebase UID");
 
   const snapshot = await hostsCollection
     .where("firebaseUid", "==", uid)
@@ -394,9 +443,7 @@ export async function getHostByFirebaseUid(firebaseUid) {
 export async function getHostById(hostId) {
   const id = normalizeId(hostId, "Host ID");
 
-  const snapshot = await hostsCollection
-    .doc(id)
-    .get();
+  const snapshot = await hostsCollection.doc(id).get();
 
   return toHost(snapshot);
 }
@@ -406,12 +453,14 @@ export async function getHostById(hostId) {
 /* -------------------------------------------------------------------------- */
 
 /**
- * The route must:
- * 1. Verify the Firebase ID token.
- * 2. Derive firebaseUid from req.user.uid.
- * 3. Derive hostId from req.hostAccount.id.
+ * The authenticated route must derive:
  *
- * Never accept either identity from an untrusted request body.
+ * hostId     = req.hostAccount.id
+ * firebaseUid = req.user.uid
+ *
+ * Never accept these identity values from req.body.
+ *
+ * This updates the exact host document used by matching.
  */
 export async function hostHeartbeat(hostId, firebaseUid) {
   const id = normalizeId(hostId, "Host ID");
@@ -428,16 +477,16 @@ export async function hostHeartbeat(hostId, firebaseUid) {
 
     const host = snapshot.data();
 
-    if (host.status !== "active") {
+    if (host.firebaseUid !== uid) {
       throw makeError(
-        "Host account is not active.",
+        "Host account does not match the authenticated user.",
         403
       );
     }
 
-    if (host.firebaseUid !== uid) {
+    if (host.status !== "active") {
       throw makeError(
-        "Host account does not match the authenticated user.",
+        "Host account is not active.",
         403
       );
     }
@@ -453,8 +502,6 @@ export async function hostHeartbeat(hostId, firebaseUid) {
       success: true,
       online: true,
       lastSeenAt: now,
-      activeCallId: host.activeCallId || null,
-      activeGroupRoomId: host.activeGroupRoomId || null,
     };
   });
 }
@@ -466,12 +513,8 @@ export async function hostHeartbeat(hostId, firebaseUid) {
 /**
  * Backend-only host records.
  *
- * Includes:
- * - available hosts without an active room;
- * - available hosts with a group room that has a free seat.
- *
- * Does not return public-safe profiles. Do not send these records
- * directly to customers.
+ * Includes hosts with free group-room capacity.
+ * Do not send these internal records directly to customers.
  */
 export async function getAvailableHosts() {
   const snapshot = await hostsCollection
@@ -484,26 +527,18 @@ export async function getAvailableHosts() {
     .map(toHost)
     .filter(Boolean);
 
-  const availabilityResults = await Promise.all(
+  const results = await Promise.all(
     candidates.map(async (host) => {
-      try {
-        const available =
-          await isHostAvailableForMatching(host, now);
+      const available = await isHostAvailableForMatching(
+        host,
+        now
+      );
 
-        return available ? host : null;
-      } catch (error) {
-        console.error(
-          "Host availability check failed:",
-          host.id,
-          error?.code || "UNKNOWN_ERROR"
-        );
-
-        return null;
-      }
+      return available ? host : null;
     })
   );
 
-  return availabilityResults.filter(Boolean);
+  return results.filter(Boolean);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -529,20 +564,13 @@ export async function findAvailableHost() {
 /* -------------------------------------------------------------------------- */
 
 /**
- * This function is ONLY for legacy one-to-one reservations.
+ * ONLY for legacy one-to-one calls.
  *
- * Do not use it for group calls.
- * Group calls must reserve a customer seat in callRooms and
- * update the host's activeGroupRoomId atomically.
- *
- * The group matching service must enforce the room capacity.
+ * Do not use this for group calls.
  */
 export async function reserveHost(hostId, callId) {
   const id = normalizeId(hostId, "Host ID");
-  const normalizedCallId = normalizeId(
-    callId,
-    "Call ID"
-  );
+  const normalizedCallId = normalizeId(callId, "Call ID");
 
   const hostRef = hostsCollection.doc(id);
 
@@ -578,10 +606,7 @@ export async function reserveHost(hostId, callId) {
     const now = new Date();
 
     if (!isHostOnline(host, now)) {
-      throw makeError(
-        "Host is offline.",
-        409
-      );
+      throw makeError("Host is offline.", 409);
     }
 
     if (host.acceptingCalls !== true) {
@@ -615,14 +640,11 @@ export async function reserveHost(hostId, callId) {
  * Releases only the matching legacy one-to-one reservation.
  *
  * A stale call cannot clear a newer reservation.
- * This function does not release group-room reservations.
+ * This never releases a group-room reservation.
  */
 export async function releaseHost(hostId, callId) {
   const id = normalizeId(hostId, "Host ID");
-  const normalizedCallId = normalizeId(
-    callId,
-    "Call ID"
-  );
+  const normalizedCallId = normalizeId(callId, "Call ID");
 
   const hostRef = hostsCollection.doc(id);
 
@@ -646,11 +668,9 @@ export async function releaseHost(hostId, callId) {
       );
     }
 
-    const now = new Date();
-
     transaction.update(hostRef, {
       activeCallId: null,
-      updatedAt: now,
+      updatedAt: new Date(),
     });
 
     return true;
