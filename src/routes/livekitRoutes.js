@@ -231,12 +231,16 @@ async function verifyGroupRoomMembership({
   const groupRoom = await getGroupRoomForCall(callId);
 
   if (
-    !groupRoom ||
-    groupRoom.id !== call.groupRoomId ||
-    groupRoom.room?.roomName !== getRoomName(call) ||
-    groupRoom.room?.status === "ended" ||
-    groupRoom.room?.endedAt
-  ) {
+  !groupRoom ||
+  groupRoom.id !== call.groupRoomId ||
+  !groupRoom.room?.roomName ||
+  (
+    call.roomId &&
+    call.roomId !== groupRoom.room.roomName
+  ) ||
+  groupRoom.room?.status === "ended" ||
+  groupRoom.room?.endedAt
+) {
     throw httpError(
       409,
       "This group room is no longer available."
@@ -464,17 +468,19 @@ router.post("/token", async (req, res, next) => {
     }
 
     const { url, apiKey, apiSecret } = getLiveKitConfig();
-    const roomName = getRoomName(call);
+let roomName = getRoomName(call);
 
-    if (call.groupRoomId) {
-      await verifyGroupRoomMembership({
-        callId,
-        call,
-        firebaseUid: req.user.uid,
-        isCustomer,
-        isAssignedHost,
-        hostData,
-      });
+if (call.groupRoomId) {
+  const groupRoom = await verifyGroupRoomMembership({
+    callId,
+    call,
+    firebaseUid: req.user.uid,
+    isCustomer,
+    isAssignedHost,
+    hostData,
+  });
+
+  roomName = groupRoom.roomName;
 
       await reserveGroupRoomSlot({
         groupRoomId: call.groupRoomId,
@@ -573,19 +579,21 @@ router.post("/start", async (req, res, next) => {
       );
     }
 
-    const roomName = getRoomName(call);
+   let roomName = getRoomName(call);
 
-    // Verify the customer and host still belong to this room.
-    if (call.groupRoomId) {
-      await verifyGroupRoomMembership({
-        callId,
-        call,
-        firebaseUid: req.user.uid,
-        isCustomer,
-        isAssignedHost,
-        hostData,
-      });
-    }
+// Verify the customer and host still belong to this room.
+if (call.groupRoomId) {
+  const groupRoom = await verifyGroupRoomMembership({
+    callId,
+    call,
+    firebaseUid: req.user.uid,
+    isCustomer,
+    isAssignedHost,
+    hostData,
+  });
+
+  roomName = groupRoom.roomName;
+}
 
     // Confirm actual LiveKit presence before starting or
     // confirming an already-active customer session.
