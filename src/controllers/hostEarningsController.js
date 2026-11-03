@@ -3,6 +3,7 @@ import {
   getHostEarningsSummary,
   requestHostWithdrawal,
   getHostWithdrawalHistory,
+  getHostEarningsDiagnostic,
 } from "../services/hostEarningsService.js";
 
 // ============================================================
@@ -245,6 +246,33 @@ export async function getMyWithdrawals(req, res) {
       res,
       error,
       "Unable to load your withdrawal history."
+    );
+  }
+}
+
+// ============================================================
+// GET MY EARNINGS DIAGNOSTIC — READ ONLY
+// ============================================================
+
+export async function getMyEarningsDiagnostic(req, res) {
+  noStore(res);
+
+  const hostId = getHostId(req, res);
+
+  if (!hostId) return;
+
+  try {
+    const diagnostic = await getHostEarningsDiagnostic(hostId);
+
+    return res.status(200).json({
+      success: true,
+      data: diagnostic,
+    });
+  } catch (error) {
+    return sendError(
+      res,
+      error,
+      "Unable to generate your earnings diagnostic."
     );
   }
 }

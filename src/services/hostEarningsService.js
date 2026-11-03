@@ -609,3 +609,113 @@ export async function getHostWithdrawalHistory(hostId) {
 
   return withdrawals;
 }
+
+
+// ============================================================
+// READ-ONLY HOST EARNINGS DIAGNOSTIC
+// Does not modify balances, earnings or withdrawals.
+// ============================================================
+
+export async function getHostEarningsDiagnostic(hostId) {
+  const id = normalizeId(hostId, "host ID");
+
+  const hostRef = hostsCollection.doc(id);
+
+  const [
+    hostSnapshot,
+    earningsSnapshot,
+    hostWithdrawalsSnapshot,
+    legacyWithdrawalsSnapshot,
+  ] = await Promise.all([
+    hostRef.get(),
+    earningsCollection.where("hostId", "==", id).get(),
+    withdrawalsCollection.where("hostId", "==", id).get(),
+    db.collection("withdrawals").where("hostId", "==", id).get(),
+  ]);
+
+  if (!hostSnapshot.exists) {
+    throw makeError("Host account not found.", 404);
+  }
+
+  const host = hostSnapshot.data();
+
+  let ledgerTotalCents = 0;
+
+  const earnings = earningsSnapshot.docs.map((document) => {
+    const data = document.data();
+    const amountCents = getEarningAmountCents(data);
+
+    ledgerTotalCents += amountCents;
+
+    return {
+      recordId: document.id,
+      amountCents,
+      amount: toZAR(amountCents),
+      createdAt:
+        toDate(data.createdAt)?.toISOString() ?? null,
+      callId: data.callId ?? document.id,
+      billingStatus: data.billingStatus ?? null,
+    };
+  });
+
+  function summarizeWithdrawals(snapshot) {
+    const summary = {
+      count: snapshot.size,
+      pendingCents: 0,
+      paidCents: 0,
+      rejectedCents: 0,
+      otherCents: 0,
+    };
+
+    for (const document of snapshot.docs) {
+      const data = document.data();
+      const amount = Math.max(
+        0,
+        Math.floor(toNumber(data.amountCents))
+      );
+
+      if (data.status === "pending") {
+        summary.pendingCents += amount;
+      } else if (data.status === "paid") {
+        summary.paidCents += amount;
+      } else if (data.status === "rejected") {
+        summary.rejectedCents += amount;
+      } else {
+        summary.otherCents += amount;
+      }
+    }
+
+    return summary;
+  }
+
+  return {
+    hostId: id,
+
+    hostBalance: {
+      availableCents: Math.floor(
+        toNumber(host.availableHostEarningsCents)
+      ),
+      lifetimeCents: Math.floor(
+        toNumber(host.lifetimeHostEarningsCents)
+      ),
+    },
+
+    earningsLedger: {
+      recordCount: earnings.length,
+      totalCents: ledgerTotalCents,
+      totalRand: toZAR(ledgerTotalCents),
+      records: earnings,
+    },
+
+    hostWithdrawals: summarizeWithdrawals(
+      hostWithdrawalsSnapshot
+    ),
+
+    legacyWithdrawals: summarizeWithdrawals(
+      legacyWithdrawalsSnapshot
+    ),
+
+    diagnosticGeneratedAt: new Date().toISOString(),
+  };
+}
+

@@ -15,6 +15,7 @@ import {
   getMyEarnings,
   createMyWithdrawal,
   getMyWithdrawals,
+  getMyEarningsDiagnostic,
 } from "../controllers/hostEarningsController.js";
 
 import {
@@ -144,6 +145,13 @@ router.get(
   verifyFirebaseToken,
   requireHost,
   getMyEarnings
+);
+
+router.get(
+  "/earnings/diagnostic",
+  verifyFirebaseToken,
+  requireHost,
+  getMyEarningsDiagnostic
 );
 
 // ============================================================
