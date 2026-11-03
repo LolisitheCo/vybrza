@@ -220,6 +220,7 @@ async function getAuthorizedCall(callId, firebaseUid) {
 |--------------------------------------------------------------------------
 */
 
+
 async function verifyGroupRoomMembership({
   callId,
   call,
@@ -228,31 +229,32 @@ async function verifyGroupRoomMembership({
   isAssignedHost,
   hostData,
 }) {
-  const groupRoom = await getGroupRoomForCall(callId);
+  const result = await getGroupRoomForCall(callId);
+
+  // getGroupRoomForCall returns { callId, call, room }.
+  // The actual room document is inside result.room.
+  const room = result?.room;
 
   if (
-  !groupRoom ||
-  groupRoom.id !== call.groupRoomId ||
-  !groupRoom.room?.roomName ||
-  (
-    call.roomId &&
-    call.roomId !== groupRoom.room.roomName
-  ) ||
-  groupRoom.room?.status === "ended" ||
-  groupRoom.room?.endedAt
-) {
+    !result ||
+    result.callId !== callId ||
+    !room ||
+    room.id !== call.groupRoomId ||
+    !room.roomName ||
+    (call.roomId && call.roomId !== room.roomName) ||
+    room.status === "ended" ||
+    room.endedAt
+  ) {
     throw httpError(
       409,
       "This group room is no longer available."
     );
   }
 
-  const room = groupRoom.room;
-
   if (room.hostId !== call.hostId) {
     throw httpError(
       403,
-      "This call does not belong to the assigned group room."
+      "This group room belongs to another host."
     );
   }
 
@@ -262,30 +264,33 @@ async function verifyGroupRoomMembership({
   if (!callIds.includes(callId)) {
     throw httpError(
       403,
-      "This call is not registered in the group room."
+      "This call is not assigned to the group room."
     );
   }
 
   if (isCustomer && !customerIds.includes(firebaseUid)) {
     throw httpError(
       403,
-      "You are not registered as a customer in this group room."
+      "You are not a member of this group room."
     );
   }
 
   if (
     isAssignedHost &&
-    (!hostData?.firebaseUid ||
-      hostData.firebaseUid !== firebaseUid)
+    (
+      !hostData?.firebaseUid ||
+      hostData.firebaseUid !== firebaseUid
+    )
   ) {
     throw httpError(
       403,
-      "You are not the assigned host for this room."
+      "You are not authorized to join this host room."
     );
   }
 
   return room;
 }
+
 
 /*
 |--------------------------------------------------------------------------
