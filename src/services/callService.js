@@ -30,6 +30,10 @@ const VALID_ID_PATTERN = /^[A-Za-z0-9_-]{1,150}$/;
 const MAX_ROOM_URL_LENGTH = 2048;
 const MAX_ROOM_ID_LENGTH = 256;
 
+/* -------------------------------------------------------------------------- */
+/* HELPERS                                                                    */
+/* -------------------------------------------------------------------------- */
+
 function makeError(message, status = 400) {
   const error = new Error(message);
   error.status = status;
@@ -147,6 +151,37 @@ function isGroupCall(call) {
   );
 }
 
+function readCustomerMinutes(value) {
+  if (
+    !Number.isSafeInteger(value) ||
+    value < 0
+  ) {
+    throw makeError(
+      "Customer minute balance is invalid.",
+      409
+    );
+  }
+
+  return value;
+}
+
+function readSecondsRemainder(value) {
+  const seconds = value ?? 0;
+
+  if (
+    !Number.isSafeInteger(seconds) ||
+    seconds < 0 ||
+    seconds > 59
+  ) {
+    throw makeError(
+      "Customer seconds remainder is invalid.",
+      409
+    );
+  }
+
+  return seconds;
+}
+
 /*
  * Release a reservation only when it still belongs to this call.
  *
@@ -172,11 +207,9 @@ function releaseReservation(
   });
 }
 
-/*
-|--------------------------------------------------------------------------
-| CREATE CALL SESSION
-|--------------------------------------------------------------------------
-*/
+/* -------------------------------------------------------------------------- */
+/* CREATE CALL SESSION                                                        */
+/* -------------------------------------------------------------------------- */
 
 export async function createCallSession({ userId, hostId }) {
   const normalizedUserId = validateId(userId, "user ID");
@@ -207,7 +240,11 @@ export async function createCallSession({ userId, hostId }) {
 
     durationSeconds: 0,
     minutesUsed: 0,
+    billableSeconds: 0,
     billableMinutes: 0,
+
+    minutesAtStart: null,
+    secondsUsedRemainderAtStart: 0,
 
     endReason: null,
 
@@ -237,11 +274,9 @@ export async function createCallSession({ userId, hostId }) {
   };
 }
 
-/*
-|--------------------------------------------------------------------------
-| GET CALL BY ID
-|--------------------------------------------------------------------------
-*/
+/* -------------------------------------------------------------------------- */
+/* GET CALL BY ID                                                             */
+/* -------------------------------------------------------------------------- */
 
 export async function getCallById(callId) {
   const normalizedCallId = validateId(callId, "call ID");
@@ -253,20 +288,20 @@ export async function getCallById(callId) {
   return toCall(snapshot);
 }
 
-/*
-|--------------------------------------------------------------------------
-| START CALL
-|--------------------------------------------------------------------------
-|
-| Trusted backend code must verify that the required participants are
-| present in LiveKit before calling this function.
-|
-| Each customer has an independent call session and timer, even when
-| several customers share the same group room.
-|--------------------------------------------------------------------------
-*/
+/* -------------------------------------------------------------------------- */
+/* START CALL                                                                 */
+/* -------------------------------------------------------------------------- */
 
-
+/**
+ * Trusted backend code must verify that the required participants
+ * are present in LiveKit before calling this function.
+ *
+ * Each customer has an independent timer and billing record,
+ * even when several customers share the same group room.
+ *
+ * The customer's balance snapshot is captured here, when the
+ * actual call timer starts.
+ */
 export async function startCall(callId, roomId, roomUrl) {
   const normalizedCallId = validateId(callId, "call ID");
   const normalizedRoomId = validateRoomId(roomId);
@@ -286,7 +321,7 @@ export async function startCall(callId, roomId, roomUrl) {
     let groupRoomRef = null;
     let groupRoom = null;
 
-    // Read and validate the shared room when this is a group call.
+    // Read and validate the shared room.
     if (call.groupRoomId) {
       groupRoomRef = callRoomsCollection.doc(call.groupRoomId);
 
@@ -320,7 +355,7 @@ export async function startCall(callId, roomId, roomUrl) {
       }
     }
 
-    // Identical retries must never reset the timer or balance snapshot.
+    // An identical retry must never reset the timer or balance snapshot.
     if (call.status === "active") {
       if (
         call.roomId !== normalizedRoomId ||
@@ -332,7 +367,7 @@ export async function startCall(callId, roomId, roomUrl) {
         );
       }
 
-      // Repair the room status if an earlier operation left it waiting.
+      // Repair room status if necessary.
       if (groupRoomRef && groupRoom.status !== "active") {
         const now = new Date();
 
@@ -363,7 +398,6 @@ export async function startCall(callId, roomId, roomUrl) {
       );
     }
 
-    // Read the customer's balance before making any transaction writes.
     const userId = call.userId || call.customerUid;
 
     if (
@@ -386,14 +420,28 @@ export async function startCall(callId, roomId, roomUrl) {
       );
     }
 
-    const customerMinutes = userSnapshot.data().minutes;
+    const user = userSnapshot.data();
+
+    // Keep the existing whole-minute package balance.
+    const customerMinutes = readCustomerMinutes(
+      user.minutes
+    );
+
+    // Read partial-minute usage from the new field.
+    // Existing customers without this field start at zero.
+    const secondsUsedRemainder = readSecondsRemainder(
+      user.secondsUsedRemainder
+    );
+
+    const availableSeconds =
+      customerMinutes * 60 - secondsUsedRemainder;
 
     if (
-      !Number.isSafeInteger(customerMinutes) ||
-      customerMinutes <= 0
+      !Number.isSafeInteger(availableSeconds) ||
+      availableSeconds <= 0
     ) {
       throw makeError(
-        "Customer has no available minutes.",
+        "Customer has no available call time.",
         409
       );
     }
@@ -402,17 +450,23 @@ export async function startCall(callId, roomId, roomUrl) {
 
     const update = {
       status: "active",
+
+      // Existing snapshot retained for compatibility.
       minutesAtStart: customerMinutes,
+
+      // New snapshot for accurate per-second billing.
+      secondsUsedRemainderAtStart: secondsUsedRemainder,
+
       roomId: normalizedRoomId,
       roomUrl: normalizedRoomUrl,
+
       startedAt: now,
       updatedAt: now,
     };
 
-    // Update the customer's individual session.
     transaction.update(callRef, update);
 
-    // Update the shared room in the SAME transaction.
+    // Update the shared room in the same transaction.
     if (groupRoomRef) {
       transaction.update(groupRoomRef, {
         status: "active",
@@ -429,25 +483,23 @@ export async function startCall(callId, roomId, roomUrl) {
   });
 }
 
+/* -------------------------------------------------------------------------- */
+/* END CALL                                                                   */
+/* -------------------------------------------------------------------------- */
 
-/*
-|--------------------------------------------------------------------------
-| END CALL
-|--------------------------------------------------------------------------
-|
-| Every customer call is ended and billed independently.
-|
-| Group call:
-| - releases only this customer's activeCallId;
-| - preserves the host's shared group-room reservation;
-| - finalizes only this customer's billing.
-|
-| Legacy one-to-one call:
-| - releases this customer's reservation;
-| - releases the host's activeCallId if it belongs to this call.
-|--------------------------------------------------------------------------
-*/
-
+/**
+ * Each customer call is ended and billed independently.
+ *
+ * Group call:
+ * - releases only this customer's activeCallId;
+ * - preserves the host's shared group-room reservation;
+ * - removes only this customer from the shared room;
+ * - finalizes only this customer's billing.
+ *
+ * Legacy one-to-one call:
+ * - releases this customer's reservation;
+ * - releases the host's activeCallId if it belongs to this call.
+ */
 export async function endCall(callId, reason = "completed") {
   const normalizedCallId = validateId(callId, "call ID");
   const normalizedReason = validateEndReason(reason);
@@ -479,7 +531,7 @@ export async function endCall(callId, reason = "completed") {
     const userRef = usersCollection.doc(userId);
     const hostRef = hostsCollection.doc(hostId);
 
-    // Firestore requires all transaction reads before writes.
+    // All transaction reads before writes.
     const [userSnapshot, hostSnapshot] = await Promise.all([
       transaction.get(userRef),
       transaction.get(hostRef),
@@ -488,11 +540,7 @@ export async function endCall(callId, reason = "completed") {
     const now = new Date();
     const groupCall = isGroupCall(call);
 
-    /*
-     * A previous request may already have completed this call.
-     * Still clean up stale reservations and allow pending billing
-     * to be retried after the transaction.
-     */
+    // A previous request may already have completed this call.
     if (call.status === "completed") {
       releaseReservation(
         transaction,
@@ -533,6 +581,7 @@ export async function endCall(callId, reason = "completed") {
       );
     }
 
+    // Calculate duration using the trusted backend clock.
     const durationSeconds = startedAt
       ? Math.max(
           0,
@@ -542,8 +591,10 @@ export async function endCall(callId, reason = "completed") {
         )
       : 0;
 
+    // Retained for compatibility with older history displays.
+    // Actual billing uses durationSeconds.
     const minutesUsed =
-      startedAt && durationSeconds > 0
+      durationSeconds > 0
         ? Math.ceil(durationSeconds / 60)
         : 0;
 
@@ -552,10 +603,12 @@ export async function endCall(callId, reason = "completed") {
     const update = {
       status: "completed",
       endedAt: now,
+
       durationSeconds,
       minutesUsed,
 
-      // The billing service calculates the final billable amount.
+      // The billing service calculates final billable seconds.
+      billableSeconds: 0,
       billableMinutes: 0,
 
       endReason: normalizedReason,
@@ -583,7 +636,7 @@ export async function endCall(callId, reason = "completed") {
 
     transaction.update(callRef, update);
 
-    // Always release this customer's own reservation.
+    // Release this customer's own reservation.
     releaseReservation(
       transaction,
       userSnapshot,
@@ -591,7 +644,7 @@ export async function endCall(callId, reason = "completed") {
       now
     );
 
-    // Never release the shared group-room host reservation here.
+    // Preserve the shared group-room host reservation.
     releaseReservation(
       transaction,
       hostSnapshot,
@@ -608,10 +661,10 @@ export async function endCall(callId, reason = "completed") {
     };
   });
 
-    /*
+  /*
    * Remove this customer's membership from the shared room.
-   * Do this before billing so a billing error cannot leave
-   * a completed customer occupying a room slot.
+   * This happens before billing so a completed customer does
+   * not continue occupying a room slot if billing fails.
    */
   if (isGroupCall(endedCall)) {
     try {
@@ -632,57 +685,57 @@ export async function endCall(callId, reason = "completed") {
     }
   }
 
-  /*
-   * Calls that never started must not be billed.
-   */
+  // Calls that never started must not be billed.
   if (endedCall.neverStarted) {
     const latestCall = await getCallById(endedCall.id);
     return latestCall ?? endedCall;
   }
 
-  /*
-   * Already-finalized calls must never be charged again.
-   */
+  // Already-finalized calls must never be charged again.
   if (endedCall.billingStatus === "finalized") {
     return endedCall;
   }
 
   /*
-   * Billing is deliberately performed outside the transaction.
-   * The billing service must be idempotent and transaction-safe.
+   * Billing is performed outside the call-ending transaction.
+   * finalizeCallBilling has its own atomic transaction and
+   * idempotency protection.
    */
   try {
     const billing = await finalizeCallBilling(endedCall.id);
 
     const latestCall = await getCallById(endedCall.id);
 
-    console.info("SA LIVE call billing finalization completed.", {
-      callId: endedCall.id,
-      callStatus: latestCall?.status ?? endedCall.status,
-      billingStatus:
-        latestCall?.billingStatus ??
-        billing?.billingStatus ??
-        "unknown",
-    });
+    console.info(
+      "SA LIVE call billing finalization completed.",
+      {
+        callId: endedCall.id,
+        callStatus: latestCall?.status ?? endedCall.status,
+        billingStatus:
+          latestCall?.billingStatus ??
+          billing?.billingStatus ??
+          "unknown",
+        billableSeconds: billing?.billableSeconds ?? 0,
+      }
+    );
 
     return {
       ...(latestCall ?? endedCall),
       billing,
     };
   } catch (error) {
-    console.error("SA LIVE call billing finalization failed.", {
-      callId: endedCall.id,
-      message:
-        typeof error?.message === "string"
-          ? error.message.slice(0, 300)
-          : "Unknown billing error",
-    });
+    console.error(
+      "SA LIVE call billing finalization failed.",
+      {
+        callId: endedCall.id,
+        message:
+          typeof error?.message === "string"
+            ? error.message.slice(0, 300)
+            : "Unknown billing error",
+      }
+    );
 
-    /*
-     * Record the failure only if billing has not already completed.
-     * This avoids overwriting a successful result if a concurrent
-     * billing attempt finished while this request was failing.
-     */
+    // Record failure only if billing is not already finalized.
     try {
       await db.runTransaction(async (transaction) => {
         const latestSnapshot = await transaction.get(callRef);
@@ -717,16 +770,15 @@ export async function endCall(callId, reason = "completed") {
       );
     }
 
-    // The call stays completed. A trusted backend retry can finalize billing.
+    // The call remains completed.
+    // A trusted backend retry can finalize billing later.
     throw error;
   }
 }
 
-/*
-|--------------------------------------------------------------------------
-| GET USER CALL HISTORY
-|--------------------------------------------------------------------------
-*/
+/* -------------------------------------------------------------------------- */
+/* GET USER CALL HISTORY                                                      */
+/* -------------------------------------------------------------------------- */
 
 export async function getUserCallHistory(userId) {
   const normalizedUserId = validateId(userId, "user ID");
@@ -743,11 +795,9 @@ export async function getUserCallHistory(userId) {
   );
 }
 
-/*
-|--------------------------------------------------------------------------
-| GET HOST CALL HISTORY
-|--------------------------------------------------------------------------
-*/
+/* -------------------------------------------------------------------------- */
+/* GET HOST CALL HISTORY                                                      */
+/* -------------------------------------------------------------------------- */
 
 export async function getHostCallHistory(hostId) {
   const normalizedHostId = validateId(hostId, "host ID");
