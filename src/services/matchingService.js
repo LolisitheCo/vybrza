@@ -11,9 +11,9 @@ const hostsCollection = db.collection("hosts");
 const callSessionsCollection = db.collection("callSessions");
 const callRoomsCollection = db.collection("callRooms");
 
-// One host + a maximum of three customers.
-export const MAX_GROUP_CUSTOMERS = 3;
-export const MAX_GROUP_PARTICIPANTS = 4;
+// One host + a maximum of five customers.
+export const MAX_GROUP_CUSTOMERS = 5;
+export const MAX_GROUP_PARTICIPANTS = 6;
 
 const HOST_TIMEOUT_MS = 45_000;
 const GROUP_ROOM_PREFIX = "salive-group-";
@@ -182,23 +182,10 @@ function roomHasCapacity(room, hostId) {
     return false;
   }
 
-  const configuredMaximum = Number(
-    room.maxCustomers ?? MAX_GROUP_CUSTOMERS
-  );
-
-  if (
-    !Number.isSafeInteger(configuredMaximum) ||
-    configuredMaximum < 1
-  ) {
-    return false;
-  }
-
-  const maximum = Math.min(
-    configuredMaximum,
-    MAX_GROUP_CUSTOMERS
-  );
-
-  return getRoomCustomerIds(room).length < maximum;
+  // Legacy rooms may still store maxCustomers: 3. The current
+  // server policy is authoritative, so existing rooms can grow to
+  // the new five-customer limit without trusting stale client data.
+  return getRoomCustomerIds(room).length < MAX_GROUP_CUSTOMERS;
 }
 
 function getPublicHostProfile(hostId, host) {
@@ -496,89 +483,29 @@ async function createCallRequestForHost(userId, hostId) {
  * The host acceptance service is responsible for rechecking
  * capacity and attaching this existing request transactionally.
  */
-export async function matchUserToHost(userId) {
+export async function matchUserToHost(userId, selectedHostId) {
   userId = requireDocumentId(userId, "Customer ID");
+  selectedHostId = requireDocumentId(selectedHostId, "Host ID");
 
-  // Verify the customer exists and has sufficient minutes.
-  const userSnapshot = await usersCollection.doc(userId).get();
+  // A customer-selected request must never fall back to another host.
+  // The transaction inside createCallRequestForHost rechecks the
+  // customer's account, balance, reservation and the selected host's
+  // approval/availability/schedule/capacity before creating the request.
+  const result = await createCallRequestForHost(
+    userId,
+    selectedHostId
+  );
 
-  if (!userSnapshot.exists) {
-    throw makeError("Customer account not found.", 404);
-  }
-
-  const user = userSnapshot.data();
-
-  if (
-    user.accountStatus &&
-    user.accountStatus !== "active"
-  ) {
-    throw makeError("Your account is not active.", 403);
-  }
-
-  const minutes = normalizeMinutes(user.minutes);
-
-  if (minutes === null || minutes <= 0) {
-    throw makeError(
-      "You need available minutes before starting a call.",
-      403
+  if (!result.matched) {
+    const unavailable = makeError(
+      result.reason === "room_unavailable"
+        ? "This host's call room is currently full. Please choose another host."
+        : "This host is currently unavailable. Please choose another host.",
+      409
     );
+    unavailable.retry = true;
+    throw unavailable;
   }
 
-  // Candidate discovery only. The transaction below performs
-  // the authoritative customer and host checks.
-  const hostsSnapshot = await hostsCollection
-    .where("status", "==", "active")
-    .get();
-
-  const candidates = hostsSnapshot.docs
-    .map((doc) => ({
-      id: doc.id,
-      ...doc.data(),
-    }))
-    .filter((host) => isHostBaseAvailable(host))
-    .sort((a, b) => a.id.localeCompare(b.id));
-
-  for (const host of candidates) {
-    try {
-      const result = await createCallRequestForHost(
-        userId,
-        host.id
-      );
-
-      if (result.matched) {
-        return result;
-      }
-
-      if (
-        result.reason === "host_unavailable" ||
-        result.reason === "room_unavailable"
-      ) {
-        continue;
-      }
-    } catch (error) {
-      // A customer reservation conflict is not a reason to
-      // silently try another host.
-      if (
-        error.message.includes("already have a call") ||
-        error.message.includes("available minutes") ||
-        error.message.includes("account") ||
-        error.message.includes("not active")
-      ) {
-        throw error;
-      }
-
-      console.error(
-        "[SA LIVE] Could not create host request:",
-        host.id,
-        error.message
-      );
-    }
-  }
-
-  return {
-    matched: false,
-    message:
-      "No available host was found. Please try again shortly.",
-    retry: true,
-  };
+  return result;
 }

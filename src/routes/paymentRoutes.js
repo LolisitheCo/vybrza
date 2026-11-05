@@ -7,6 +7,7 @@ import {
   verifyPayment,
   paymentCallback,
   paymentITN,
+  yocoWebhook,
 } from "../controllers/paymentController.js";
 
 import {
@@ -58,8 +59,12 @@ router.get(
 // Browser redirect only. Never credits minutes by itself.
 router.get("/callback", paymentCallback);
 
+// POST /api/payments/yoco/webhook
+// Yoco webhook; server.js preserves rawBody for signature verification.
+router.post("/yoco/webhook", yocoWebhook);
+
 // POST /api/payments/itn
-// PayFast server-to-server Instant Transaction Notification.
+// Legacy PayFast notifications for already-created transactions only.
 router.post(
   "/itn",
   express.urlencoded({

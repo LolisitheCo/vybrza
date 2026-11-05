@@ -146,7 +146,23 @@ export async function requestCustomerCall(req, res, next) {
       );
     }
 
-    const result = await matchUserToHost(userId);
+    const hostId = req.body?.hostId;
+
+    if (
+      typeof hostId !== "string" ||
+      !hostId.trim() ||
+      hostId.trim().length > 200 ||
+      hostId.includes("/") ||
+      hostId.includes("\0")
+    ) {
+      return sendError(
+        res,
+        400,
+        "Select a valid host before requesting a call."
+      );
+    }
+
+    const result = await matchUserToHost(userId, hostId.trim());
 
     noStore(res);
 

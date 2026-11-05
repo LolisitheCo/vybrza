@@ -24,7 +24,7 @@ const callSessions = db.collection("callSessions");
 const hosts = db.collection("hosts");
 const callRooms = db.collection("callRooms");
 
-const MAX_GROUP_PARTICIPANTS = 4;
+const MAX_GROUP_PARTICIPANTS = 6;
 const JOIN_RESERVATION_MS = 120_000;
 const TOKEN_TTL = "90s";
 

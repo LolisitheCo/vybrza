@@ -5,7 +5,7 @@ const hostsCollection = db.collection("hosts");
 const callRoomsCollection = db.collection("callRooms");
 
 export const HOST_TIMEOUT_MS = 45_000;
-export const MAX_GROUP_CUSTOMERS = 3;
+export const MAX_GROUP_CUSTOMERS = 5;
 
 const TIME_ZONE = "Africa/Johannesburg";
 const MAX_AVAILABILITY_SLOTS = 21;
@@ -296,29 +296,15 @@ function roomHasCapacity(room, hostId) {
     ? room.customerIds
     : [];
 
-  const configuredLimit = Number(
-    room.maxCustomers ?? MAX_GROUP_CUSTOMERS
-  );
-
-  if (
-    !Number.isInteger(configuredLimit) ||
-    configuredLimit < 1
-  ) {
-    return false;
-  }
-
-  const limit = Math.min(
-    configuredLimit,
-    MAX_GROUP_CUSTOMERS
-  );
-
+  // Do not let a stale legacy maxCustomers: 3 field reduce the
+  // current server-enforced capacity for an active room.
   const uniqueCustomerIds = new Set(
     customerIds.filter(
       (id) => typeof id === "string" && id.trim()
     )
   );
 
-  return uniqueCustomerIds.size < limit;
+  return uniqueCustomerIds.size < MAX_GROUP_CUSTOMERS;
 }
 
 /**

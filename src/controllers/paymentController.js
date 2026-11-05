@@ -6,11 +6,15 @@ import {
   createPaymentRecord,
   getPaymentByReference,
   creditSuccessfulPayment,
+  attachYocoCheckout,
+  getPaymentByYocoCheckoutId,
+  markYocoPaymentFailed,
 } from "../services/paymentService.js";
 
 import {
   initializePayfastTransaction,
 } from "../services/payfastService.js";
+import { createYocoCheckout } from "../services/yocoService.js";
 
 // ============================================================
 // CONFIGURATION
@@ -521,6 +525,46 @@ if (
 }
 
 
+    if (payment.provider === "yoco") {
+      if (
+        payment.reference !== reference ||
+        payment.currency !== "ZAR" ||
+        payment.status !== "pending" ||
+        payment.credited === true
+      ) {
+        return res.status(409).json({ success: false, message: "This payment is no longer available for checkout." });
+      }
+
+      if (payment.yocoRedirectUrl && payment.yocoCheckoutId) {
+        return res.status(200).json({
+          success: true,
+          redirectUrl: payment.yocoRedirectUrl,
+          reference,
+        });
+      }
+
+      const paymentPackage = getPaymentPackage(payment.packageId);
+      if (!paymentPackage || payment.amountCents !== Math.round(paymentPackage.amount * 100)) {
+        return res.status(409).json({ success: false, message: "The stored payment details could not be verified." });
+      }
+
+      const checkout = await createYocoCheckout({
+        reference,
+        amountCents: payment.amountCents,
+        packageId: payment.packageId,
+        packageName: payment.packageName,
+        userId: authenticatedUserId,
+      });
+      await attachYocoCheckout({
+        reference,
+        checkoutId: checkout.checkoutId,
+        redirectUrl: checkout.redirectUrl,
+        processingMode: checkout.processingMode,
+      });
+
+      return res.status(200).json({ success: true, redirectUrl: checkout.redirectUrl, reference });
+    }
+
     if (
       payment.reference !== reference ||
       payment.provider !== "payfast" ||
@@ -612,168 +656,70 @@ if (
 
 export async function initializePayment(req, res) {
   try {
-    const authenticatedUserId =
-      getAuthenticatedUserId(req);
-
+    const authenticatedUserId = getAuthenticatedUserId(req);
     if (!authenticatedUserId) {
-      return res.status(401).json({
-        success: false,
-        message: "Authentication is required.",
-      });
+      return res.status(401).json({ success: false, message: "Authentication is required." });
     }
 
-    const {
-      userId,
-      packageId,
-      email,
-    } = req.body ?? {};
-
-    /*
-     * If the existing client sends userId, it must match the
-     * authenticated identity. It can never select another user.
-     */
-
-    if (
-      userId !== undefined &&
-      String(userId) !== authenticatedUserId
-    ) {
-      return res.status(403).json({
-        success: false,
-        message: "User identity mismatch.",
-      });
+    const { userId, packageId, email } = req.body ?? {};
+    if (userId !== undefined && String(userId) !== authenticatedUserId) {
+      return res.status(403).json({ success: false, message: "User identity mismatch." });
+    }
+    if (typeof packageId !== "string" || packageId.length > 64 || !/^[a-zA-Z0-9_-]+$/.test(packageId)) {
+      return res.status(400).json({ success: false, message: "Invalid payment package." });
+    }
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ success: false, message: "A valid email address is required." });
     }
 
-    if (
-      typeof packageId !== "string" ||
-      packageId.length > 64 ||
-      !/^[a-zA-Z0-9_-]+$/.test(packageId)
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid payment package.",
-      });
+    const paymentPackage = getPaymentPackage(packageId);
+    if (!paymentPackage || !Number.isFinite(Number(paymentPackage.amount)) || paymentPackage.amount <= 0) {
+      return res.status(400).json({ success: false, message: "Invalid payment package." });
     }
 
-    if (
-      typeof email !== "string" ||
-      !isValidEmail(email)
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "A valid email address is required.",
-      });
-    }
-
-    const paymentPackage =
-      getPaymentPackage(packageId);
-
-    if (
-      !paymentPackage ||
-      !Number.isSafeInteger(paymentPackage.minutes) ||
-      paymentPackage.minutes <= 0 ||
-      !Number.isFinite(Number(paymentPackage.amount)) ||
-      Number(paymentPackage.amount) <= 0
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid payment package.",
-      });
-    }
-
-    const reference =
-      `SALIVE-${crypto.randomUUID()
-        .replace(/-/g, "")
-        .toUpperCase()}`;
-
-    const normalizedEmail = email.toLowerCase();
-
-    /*
-     * Store the pending payment before creating checkout.
-     * Package price and minutes must come from the trusted
-     * server-side package configuration/service.
-     */
-
+    const reference = `SALIVE-${crypto.randomUUID().replace(/-/g, "").toUpperCase()}`;
     await createPaymentRecord({
       userId: authenticatedUserId,
       reference,
       packageId: paymentPackage.id,
-      email: normalizedEmail,
+      email: email.toLowerCase(),
     });
 
-    console.info("PAYMENT CONTROLLER HANDOFF:", {
-  referenceType: typeof reference,
-  referenceLength: reference.length,
-  referenceFormatValid:
-    /^SALIVE-[A-F0-9]{32}$/.test(reference),
-});
+    const checkout = await createYocoCheckout({
+      reference,
+      amountCents: Math.round(paymentPackage.amount * 100),
+      packageId: paymentPackage.id,
+      packageName: paymentPackage.name,
+      userId: authenticatedUserId,
+    });
 
-     
-const checkout = await initializePayfastTransaction({
-  email: normalizedEmail,
-  amount: paymentPackage.amount,
-  reference,
-  metadata: {
-    custom_str1: paymentPackage.id,
-  },
-});
-
-console.info("SA LIVE checkout initialized:", {
-  referenceFormatValid:
-    typeof reference === "string" &&
-    /^SALIVE-[A-F0-9]{32}$/.test(reference),
-  checkoutCreated: Boolean(checkout),
-  paymentUrlProvided:
-    typeof checkout?.paymentUrl === "string",
-});
-
-
-    if (
-  !checkout ||
-  typeof checkout.paymentUrl !== "string" ||
-  !checkout.fields ||
-  typeof checkout.fields !== "object" ||
-  Array.isArray(checkout.fields) ||
-  !checkout.paymentUrl.startsWith("https://")
-) {
-  throw new Error("Invalid PayFast checkout response.");
-}
-
-    const expectedHost =
-      PAYFAST_HOSTS[getPayfastMode()];
-
-    const checkoutUrl = new URL(checkout.paymentUrl);
-
-    if (
-      checkoutUrl.hostname !== expectedHost ||
-      checkoutUrl.protocol !== "https:"
-    ) {
-      throw new Error("Unexpected PayFast checkout host.");
-    }
+    await attachYocoCheckout({
+      reference,
+      checkoutId: checkout.checkoutId,
+      redirectUrl: checkout.redirectUrl,
+      processingMode: checkout.processingMode,
+    });
 
     return res.status(200).json({
       success: true,
-      message: "Payment checkout created.",
+      message: "Yoco checkout created.",
       payment: {
         reference,
         packageId: paymentPackage.id,
         packageName: paymentPackage.name,
         amount: paymentPackage.amount,
+        amountCents: checkout.amountCents,
         currency: "ZAR",
         minutes: paymentPackage.minutes,
-        paymentUrl: checkout.paymentUrl,
-        fields: checkout.fields,
+        redirectUrl: checkout.redirectUrl,
+        processingMode: checkout.processingMode,
       },
     });
   } catch (error) {
-    console.error(
-      "Initialize PayFast payment failed:",
-      error.message
-    );
-
+    console.error("Initialize Yoco payment failed:", error.message);
     return res.status(500).json({
       success: false,
-      message:
-        "Unable to initialize payment. Please try again.",
+      message: "Unable to initialize Yoco checkout. Please try again.",
     });
   }
 }
@@ -841,6 +787,121 @@ export async function verifyPayment(req, res) {
       success: false,
       message: "Unable to check payment status.",
     });
+  }
+}
+
+// ============================================================
+// YOCO WEBHOOK — SIGNATURE VERIFIED, RAW BODY REQUIRED
+// ============================================================
+
+function verifyYocoWebhookSignature(req) {
+  const secret = process.env.YOCO_WEBHOOK_SECRET;
+  const rawBody = req.rawBody;
+  const webhookId = req.headers["webhook-id"];
+  const timestamp = req.headers["webhook-timestamp"];
+  const signatureHeader = req.headers["webhook-signature"];
+
+  if (
+    typeof secret !== "string" || !secret.startsWith("whsec_") ||
+    !Buffer.isBuffer(rawBody) ||
+    typeof webhookId !== "string" || !webhookId ||
+    typeof timestamp !== "string" || !/^\d+$/.test(timestamp) ||
+    typeof signatureHeader !== "string"
+  ) return false;
+
+  const timestampMs = Number(timestamp) * 1000;
+  if (!Number.isFinite(timestampMs) || Math.abs(Date.now() - timestampMs) > 180000) return false;
+
+  let secretBytes;
+  try {
+    secretBytes = Buffer.from(secret.slice("whsec_".length), "base64");
+  } catch {
+    return false;
+  }
+  if (!secretBytes.length) return false;
+
+  const signedContent = Buffer.concat([
+    Buffer.from(`${webhookId}.${timestamp}.`, "utf8"),
+    rawBody,
+  ]);
+  const expected = crypto.createHmac("sha256", secretBytes).update(signedContent).digest("base64");
+
+  return signatureHeader.split(" ").some((part) => {
+    const [version, value] = part.split(",", 2);
+    if (version !== "v1" || !value) return false;
+    const a = Buffer.from(value);
+    const b = Buffer.from(expected);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  });
+}
+
+export async function yocoWebhook(req, res) {
+  try {
+    if (!verifyYocoWebhookSignature(req)) {
+      return res.status(400).send("Invalid webhook signature");
+    }
+
+    let event;
+    try {
+      event = JSON.parse(req.rawBody.toString("utf8"));
+    } catch {
+      return res.status(400).send("Invalid JSON payload");
+    }
+
+    if (!event || typeof event !== "object" || typeof event.type !== "string") {
+      return res.status(400).send("Invalid event");
+    }
+
+    if (event.type === "payment.failed") {
+      const failedCheckoutId = event.payload?.metadata?.checkoutId;
+      if (typeof failedCheckoutId === "string") {
+        await markYocoPaymentFailed(failedCheckoutId, event.id);
+      }
+      return res.status(200).send("Event acknowledged");
+    }
+    if (event.type !== "payment.succeeded") {
+      return res.status(200).send("Event ignored");
+    }
+
+    const payload = event.payload;
+    const checkoutId = payload?.metadata?.checkoutId;
+    if (
+      !payload ||
+      payload.status !== "succeeded" ||
+      !Number.isSafeInteger(payload.amount) ||
+      payload.currency !== "ZAR" ||
+      typeof checkoutId !== "string"
+    ) {
+      return res.status(400).send("Invalid payment payload");
+    }
+
+    const payment = await getPaymentByYocoCheckoutId(checkoutId);
+    if (!payment || payment.provider !== "yoco") {
+      return res.status(404).send("Payment not found");
+    }
+
+    if (
+      payment.amountCents !== payload.amount ||
+      payment.currency !== payload.currency ||
+      payment.yocoProcessingMode !== payload.mode
+    ) {
+      console.warn("Yoco webhook payment mismatch:", payment.reference);
+      return res.status(400).send("Payment details mismatch");
+    }
+
+    const result = await creditSuccessfulPayment(payment.reference, {
+      paymentId: payload.id,
+      eventId: event.id,
+    });
+
+    console.info("Yoco payment webhook processed:", {
+      reference: payment.reference,
+      alreadyCredited: result.alreadyCredited,
+    });
+    return res.status(200).send("OK");
+  } catch (error) {
+    console.error("Yoco webhook processing failed:", error.message);
+    return res.status(500).send("Webhook processing failed");
   }
 }
 
@@ -1082,7 +1143,7 @@ export async function paymentCallback(req, res) {
      */
 
     if (
-      payment.provider === "payfast" &&
+      ["payfast", "yoco"].includes(payment.provider) &&
       payment.status === "complete" &&
       payment.credited === true
     ) {

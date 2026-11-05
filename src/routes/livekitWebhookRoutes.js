@@ -17,7 +17,7 @@ const callSessions = db.collection("callSessions");
 const hosts = db.collection("hosts");
 const callRooms = db.collection("callRooms");
 
-const MAX_GROUP_PARTICIPANTS = 4;
+const MAX_GROUP_PARTICIPANTS = 6;
 
 function getLiveKitConfig() {
   const url = process.env.LIVEKIT_URL?.trim();

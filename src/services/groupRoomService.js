@@ -6,8 +6,8 @@ import { db } from "../config/firebase.js";
 // SA LIVE — GROUP ROOM SERVICE
 // ============================================================
 
-export const MAX_GROUP_CUSTOMERS = 3;
-export const MAX_GROUP_PARTICIPANTS = 4;
+export const MAX_GROUP_CUSTOMERS = 5;
+export const MAX_GROUP_PARTICIPANTS = 6;
 
 const users = db.collection("users");
 const hosts = db.collection("hosts");
@@ -142,17 +142,10 @@ function safeHost(hostId, data) {
   };
 }
 
-function getRoomMaxCustomers(room) {
-  const configured = Number(room?.maxCustomers);
-
-  if (
-    !Number.isSafeInteger(configured) ||
-    configured < 1
-  ) {
-    return MAX_GROUP_CUSTOMERS;
-  }
-
-  return Math.min(configured, MAX_GROUP_CUSTOMERS);
+function getRoomMaxCustomers(_room) {
+  // Server-side policy is authoritative. This also upgrades legacy
+  // rooms that were created with maxCustomers: 3.
+  return MAX_GROUP_CUSTOMERS;
 }
 
 function isValidGroupRoom(room, hostId) {

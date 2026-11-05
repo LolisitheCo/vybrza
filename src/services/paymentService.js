@@ -240,7 +240,7 @@ function validatePackageIntegrity(payment) {
   );
 
   if (
-    payment.provider !== "payfast" ||
+    !new Set(["payfast", "yoco"]).has(payment.provider) ||
     payment.currency !== "ZAR" ||
     payment.packageId !== paymentPackage.id ||
     payment.amount !== paymentPackage.amount ||
@@ -357,7 +357,7 @@ export async function createPaymentRecord({
       currency: "ZAR",
       minutes: paymentPackage.minutes,
       email: normalizedEmail,
-      provider: "payfast",
+      provider: "yoco",
       status: "pending",
       credited: false,
       createdAt: now,
@@ -400,16 +400,108 @@ export async function getPaymentByReference(reference) {
 }
 
 // ============================================================
-// CREDIT VERIFIED PAYFAST PAYMENT ONCE
+// YOCO CHECKOUT RECORD HELPERS
+// ============================================================
+
+export async function attachYocoCheckout({
+  reference,
+  checkoutId,
+  redirectUrl,
+  processingMode,
+}) {
+  reference = requirePaymentReference(reference);
+  checkoutId = requireString(checkoutId, "Yoco checkout ID", 200);
+  redirectUrl = requireString(redirectUrl, "Yoco redirect URL", 2048);
+
+  if (!/^https:\/\/c\.yoco\.com\//i.test(redirectUrl)) {
+    throw new Error("Yoco redirect URL is invalid.");
+  }
+
+  if (!new Set(["test", "live"]).has(processingMode)) {
+    throw new Error("Yoco processing mode is invalid.");
+  }
+
+  const paymentRef = paymentsCollection.doc(reference);
+
+  await db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(paymentRef);
+
+    if (!snapshot.exists) throw new Error("Payment record was not found.");
+    const payment = snapshot.data();
+
+    if (payment.provider !== "yoco" || payment.status !== "pending" || payment.credited === true) {
+      throw new Error("Payment is not available for Yoco checkout.");
+    }
+
+    if (payment.yocoCheckoutId && payment.yocoCheckoutId !== checkoutId) {
+      throw new Error("A different Yoco checkout is already attached to this payment.");
+    }
+
+    transaction.update(paymentRef, {
+      yocoCheckoutId: checkoutId,
+      yocoRedirectUrl: redirectUrl,
+      yocoProcessingMode: processingMode,
+      updatedAt: new Date(),
+    });
+  });
+
+  return { reference, checkoutId, redirectUrl, processingMode };
+}
+
+export async function getPaymentByYocoCheckoutId(checkoutId) {
+  if (typeof checkoutId !== "string" || !checkoutId.trim() || checkoutId.length > 200) {
+    return null;
+  }
+
+  const snapshot = await paymentsCollection
+    .where("yocoCheckoutId", "==", checkoutId.trim())
+    .limit(1)
+    .get();
+
+  if (snapshot.empty) return null;
+  const doc = snapshot.docs[0];
+  return { id: doc.id, ...doc.data() };
+}
+
+export async function markYocoPaymentFailed(checkoutId, eventId) {
+  const payment = await getPaymentByYocoCheckoutId(checkoutId);
+  if (!payment) return { found: false };
+
+  const paymentRef = paymentsCollection.doc(payment.reference);
+  return db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(paymentRef);
+    if (!snapshot.exists) return { found: false };
+    const current = snapshot.data();
+
+    // A late failure notification must never reverse a completed payment.
+    if (current.credited === true || current.status === "complete") {
+      return { found: true, alreadyComplete: true };
+    }
+    if (current.status !== "pending" || current.provider !== "yoco") {
+      return { found: true, unchanged: true };
+    }
+
+    transaction.update(paymentRef, {
+      status: "failed",
+      failedAt: new Date(),
+      yocoFailureEventId: typeof eventId === "string" ? eventId : null,
+      updatedAt: new Date(),
+    });
+    return { found: true, failed: true };
+  });
+}
+
+// ============================================================
+// CREDIT VERIFIED PAYMENT ONCE (YOCO OR LEGACY PAYFAST)
 // ============================================================
 //
-// Call only after the backend has verified the PayFast ITN,
+// Call only after the backend has verified the provider webhook,
 // including its signature, payment status, amount and reference.
 // Never credit minutes just because the customer returns to
 // the website or opens a Telegram payment link.
 // ============================================================
 
-export async function creditSuccessfulPayment(reference) {
+export async function creditSuccessfulPayment(reference, metadata = {}) {
   reference = requirePaymentReference(reference);
 
   const paymentRef = paymentsCollection.doc(reference);
@@ -483,6 +575,8 @@ export async function creditSuccessfulPayment(reference) {
       status: "complete",
       credited: true,
       creditedAt: now,
+      yocoPaymentId: typeof metadata.paymentId === "string" ? metadata.paymentId : null,
+      yocoWebhookEventId: typeof metadata.eventId === "string" ? metadata.eventId : null,
       updatedAt: now,
     });
 

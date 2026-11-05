@@ -150,6 +150,11 @@ app.use("/api/livekit", livekitWebhookRoutes);
 app.use(express.json({
   limit: "100kb",
   strict: true,
+  verify(req, res, buffer) {
+    if (req.originalUrl === "/api/payments/yoco/webhook") {
+      req.rawBody = Buffer.from(buffer);
+    }
+  },
 }));
 
 // ------------------------------------------------------------
