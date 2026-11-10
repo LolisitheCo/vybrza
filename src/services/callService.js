@@ -1,14 +1,32 @@
 
 import { db } from "../config/firebase.js";
 import { finalizeCallBilling } from "./billingService.js";
-import {
-  removeCallFromGroupRoom,
-} from "./groupRoomService.js";
+import { removeCallFromGroupRoom } from "./groupRoomService.js";
 
-const callsCollection = db.collection("callSessions");
-const usersCollection = db.collection("users");
-const hostsCollection = db.collection("hosts");
-const callRoomsCollection = db.collection("callRooms");
+// ============================================================
+// SA LIVE — CALL SERVICE
+// Group calls: 1 host + maximum 5 customers
+// ============================================================
+
+const callSessions = db.collection("callSessions");
+const users = db.collection("users");
+const hosts = db.collection("hosts");
+const callRooms = db.collection("callRooms");
+
+const ACTIVE_STATUSES = new Set([
+  "matching",
+  "matched",
+  "active",
+]);
+
+const TERMINAL_STATUSES = new Set([
+  "ended",
+  "completed",
+  "cancelled",
+  "canceled",
+  "failed",
+  "expired",
+]);
 
 const ALLOWED_END_REASONS = new Set([
   "completed",
@@ -20,19 +38,11 @@ const ALLOWED_END_REASONS = new Set([
   "system_error",
 ]);
 
-const ACTIVE_STATUSES = new Set([
-  "matching",
-  "matched",
-  "active",
-]);
+const MAX_ID_LENGTH = 150;
 
-const VALID_ID_PATTERN = /^[A-Za-z0-9_-]{1,150}$/;
-const MAX_ROOM_URL_LENGTH = 2048;
-const MAX_ROOM_ID_LENGTH = 256;
-
-/* -------------------------------------------------------------------------- */
-/* HELPERS                                                                    */
-/* -------------------------------------------------------------------------- */
+// ============================================================
+// GENERAL HELPERS
+// ============================================================
 
 function makeError(message, status = 400) {
   const error = new Error(message);
@@ -40,233 +50,245 @@ function makeError(message, status = 400) {
   return error;
 }
 
-function validateId(value, fieldName) {
+function validateId(value, fieldName = "ID") {
   if (
     typeof value !== "string" ||
     !value.trim() ||
-    value.trim().length > 150 ||
-    !VALID_ID_PATTERN.test(value.trim())
+    value.trim().length > MAX_ID_LENGTH ||
+    !/^[A-Za-z0-9_-]+$/.test(value.trim())
   ) {
-    throw makeError(`A valid ${fieldName} is required.`, 400);
+    throw makeError(`A valid ${fieldName} is required.`);
   }
 
   return value.trim();
 }
 
-function toCall(snapshot) {
-  if (!snapshot?.exists) return null;
-
-  return {
-    ...snapshot.data(),
-    id: snapshot.id,
-  };
-}
-
-function toDate(value) {
-  if (!value) return null;
-
-  if (value instanceof Date) {
-    return Number.isNaN(value.getTime()) ? null : value;
-  }
-
-  if (typeof value.toDate === "function") {
-    const date = value.toDate();
-
-    return date instanceof Date && !Number.isNaN(date.getTime())
-      ? date
-      : null;
-  }
-
-  const date = new Date(value);
-
-  return Number.isNaN(date.getTime()) ? null : date;
-}
-
-function sortNewestFirst(calls) {
-  return calls.sort((a, b) => {
-    const aTime = toDate(a.createdAt)?.getTime() ?? 0;
-    const bTime = toDate(b.createdAt)?.getTime() ?? 0;
-
-    return bTime - aTime;
-  });
-}
-
-function validateRoomId(roomId) {
+function validateRoomId(value) {
   if (
-    typeof roomId !== "string" ||
-    !roomId.trim() ||
-    roomId.trim().length > MAX_ROOM_ID_LENGTH
+    typeof value !== "string" ||
+    !value.trim() ||
+    value.trim().length > 200 ||
+    !/^[A-Za-z0-9_-]+$/.test(value.trim())
   ) {
-    throw makeError("A valid LiveKit room ID is required.", 400);
+    throw makeError("A valid LiveKit room ID is required.");
   }
 
-  return roomId.trim();
+  return value.trim();
 }
 
-function validateRoomUrl(roomUrl) {
+function validateRoomUrl(value) {
   if (
-    typeof roomUrl !== "string" ||
-    !roomUrl.trim() ||
-    roomUrl.trim().length > MAX_ROOM_URL_LENGTH
+    typeof value !== "string" ||
+    !value.trim() ||
+    value.trim().length > 1000
   ) {
-    throw makeError("A valid LiveKit server URL is required.", 400);
+    throw makeError("A valid LiveKit room URL is required.");
   }
 
   let parsed;
 
   try {
-    parsed = new URL(roomUrl.trim());
+    parsed = new URL(value);
   } catch {
-    throw makeError("The LiveKit server URL is invalid.", 400);
+    throw makeError("The LiveKit room URL is invalid.");
   }
 
   if (
     !["https:", "wss:"].includes(parsed.protocol) ||
-    !parsed.hostname ||
     parsed.username ||
-    parsed.password ||
-    parsed.hash
+    parsed.password
   ) {
-    throw makeError("A secure LiveKit server URL is required.", 400);
+    throw makeError("The LiveKit room URL is invalid.");
   }
 
-  return parsed.toString().replace(/\/+$/, "");
+  return value.trim();
 }
 
-function validateEndReason(reason) {
+function timestampMillis(value) {
+  if (!value) return 0;
+
+  if (typeof value.toMillis === "function") {
+    return value.toMillis();
+  }
+
+  if (typeof value.toDate === "function") {
+    return value.toDate().getTime();
+  }
+
+  const result = new Date(value).getTime();
+
+  return Number.isFinite(result) ? result : 0;
+}
+
+function normalizeMinutes(value) {
+  const minutes = Number(value ?? 0);
+
+  if (!Number.isSafeInteger(minutes) || minutes < 0) {
+    return null;
+  }
+
+  return minutes;
+}
+
+function normalizeRemainder(value) {
+  const remainder = Number(value ?? 0);
+
   if (
-    typeof reason !== "string" ||
-    !ALLOWED_END_REASONS.has(reason)
+    !Number.isSafeInteger(remainder) ||
+    remainder < 0 ||
+    remainder > 59
   ) {
-    throw makeError("Invalid call end reason.", 400);
+    return null;
   }
 
-  return reason;
+  return remainder;
 }
 
-function isGroupCall(call) {
-  return (
-    typeof call?.groupRoomId === "string" &&
-    call.groupRoomId.trim().length > 0
+function isTerminalCall(call) {
+  if (!call) return true;
+  if (call.endedAt) return true;
+
+  return TERMINAL_STATUSES.has(
+    String(call.status || "").toLowerCase()
   );
 }
 
-function readCustomerMinutes(value) {
-  if (
-    !Number.isSafeInteger(value) ||
-    value < 0
-  ) {
-    throw makeError(
-      "Customer minute balance is invalid.",
-      409
-    );
-  }
-
-  return value;
+function getCustomerId(call) {
+  return call?.userId || call?.customerUid || null;
 }
 
-function readSecondsRemainder(value) {
-  const seconds = value ?? 0;
-
-  if (
-    !Number.isSafeInteger(seconds) ||
-    seconds < 0 ||
-    seconds > 59
-  ) {
-    throw makeError(
-      "Customer seconds remainder is invalid.",
-      409
-    );
-  }
-
-  return seconds;
+function isGroupCall(call) {
+  return Boolean(call?.groupRoomId);
 }
 
-/*
- * Release a reservation only when it still belongs to this call.
- *
- * For group calls, the host's shared reservation must be preserved.
- * The group-room lifecycle is responsible for releasing it.
- */
-function releaseReservation(
+function getSortedCalls(snapshot) {
+  return snapshot.docs
+    .map((doc) => ({
+      id: doc.id,
+      ...doc.data(),
+    }))
+    .sort((a, b) => {
+      const aTime =
+        timestampMillis(a.createdAt) ||
+        timestampMillis(a.startedAt);
+
+      const bTime =
+        timestampMillis(b.createdAt) ||
+        timestampMillis(b.startedAt);
+
+      return bTime - aTime;
+    });
+}
+
+// ============================================================
+// RESERVATION CLEANUP
+// ============================================================
+
+function releaseCustomerReservation(
   transaction,
-  snapshot,
-  callId,
-  now,
-  { preserveReservation = false } = {}
+  userSnapshot,
+  callId
 ) {
-  if (!snapshot?.exists || preserveReservation) return;
+  if (!userSnapshot?.exists) return;
 
-  const data = snapshot.data();
+  const user = userSnapshot.data();
 
-  if (data.activeCallId !== callId) return;
-
-  transaction.update(snapshot.ref, {
-    activeCallId: null,
-    updatedAt: now,
-  });
+  if (user.activeCallId === callId) {
+    transaction.update(userSnapshot.ref, {
+      activeCallId: null,
+      updatedAt: new Date(),
+    });
+  }
 }
 
-/* -------------------------------------------------------------------------- */
-/* CREATE CALL SESSION                                                        */
-/* -------------------------------------------------------------------------- */
+function releaseHostReservation(
+  transaction,
+  hostSnapshot,
+  callId,
+  groupCall
+) {
+  if (!hostSnapshot?.exists) return;
 
-export async function createCallSession({ userId, hostId }) {
-  const normalizedUserId = validateId(userId, "user ID");
-  const normalizedHostId = validateId(hostId, "host ID");
+  const host = hostSnapshot.data();
+
+  // Group calls share one host reservation across customers.
+  // Never clear the group reservation when one customer leaves.
+  if (groupCall) {
+    if (host.activeCallId === callId) {
+      transaction.update(hostSnapshot.ref, {
+        activeCallId: null,
+        updatedAt: new Date(),
+      });
+    }
+
+    return;
+  }
+
+  if (host.activeCallId === callId) {
+    transaction.update(hostSnapshot.ref, {
+      activeCallId: null,
+      updatedAt: new Date(),
+    });
+  }
+}
+
+// ============================================================
+// CREATE CALL SESSION
+// ============================================================
+
+export async function createCallSession({
+  userId,
+  hostId,
+}) {
+  const normalizedUserId = validateId(
+    userId,
+    "customer ID"
+  );
+
+  const normalizedHostId = validateId(
+    hostId,
+    "host ID"
+  );
 
   if (normalizedUserId === normalizedHostId) {
-    throw makeError(
-      "A user cannot call their own host account.",
-      400
-    );
+    throw makeError("A host cannot call themselves.");
   }
 
   const now = new Date();
-  const callRef = callsCollection.doc();
+  const callRef = callSessions.doc();
 
   const callData = {
     userId: normalizedUserId,
+    customerUid: normalizedUserId,
     hostId: normalizedHostId,
 
     status: "matching",
 
+    groupRoomId: null,
     roomId: null,
     roomUrl: null,
-    groupRoomId: null,
+
+    createdAt: now,
+    updatedAt: now,
 
     startedAt: null,
     endedAt: null,
 
     durationSeconds: 0,
     minutesUsed: 0,
-    billableSeconds: 0,
     billableMinutes: 0,
 
-    minutesAtStart: null,
-    secondsUsedRemainderAtStart: 0,
-
-    endReason: null,
-
     billingStatus: "pending",
-    billedAt: null,
-    billingError: null,
-
-    customerCharge: 0,
-    hostEarnings: 0,
-    saLiveRevenue: 0,
+    endReason: null,
 
     customerChargeCents: 0,
     hostEarningsCents: 0,
-    saLiveRevenueCents: 0,
+    saRevenueCents: 0,
 
     hostPayoutStatus: "pending",
-
-    createdAt: now,
-    updatedAt: now,
   };
 
-  await callRef.create(callData);
+  await callRef.set(callData);
 
   return {
     id: callRef.id,
@@ -274,542 +296,702 @@ export async function createCallSession({ userId, hostId }) {
   };
 }
 
-/* -------------------------------------------------------------------------- */
-/* GET CALL BY ID                                                             */
-/* -------------------------------------------------------------------------- */
+// ============================================================
+// GET CALL BY ID
+// ============================================================
 
 export async function getCallById(callId) {
-  const normalizedCallId = validateId(callId, "call ID");
+  const normalizedCallId = validateId(
+    callId,
+    "call ID"
+  );
 
-  const snapshot = await callsCollection
+  const snapshot = await callSessions
     .doc(normalizedCallId)
     .get();
 
-  return toCall(snapshot);
+  if (!snapshot.exists) {
+    return null;
+  }
+
+  return {
+    id: snapshot.id,
+    ...snapshot.data(),
+  };
 }
 
-/* -------------------------------------------------------------------------- */
-/* START CALL                                                                 */
-/* -------------------------------------------------------------------------- */
+// ============================================================
+// START CALL
+//
+// IMPORTANT SECURITY CHECKS:
+// 1. Customer must still own this active request.
+// 2. Host must still own the correct reservation.
+// 3. Group room must still contain this customer and call.
+// 4. Group room must belong to this host.
+// 5. Customer must still have available minutes.
+// All checks happen inside one Firestore transaction.
+// ============================================================
 
-/**
- * Trusted backend code must verify that the required participants
- * are present in LiveKit before calling this function.
- *
- * Each customer has an independent timer and billing record,
- * even when several customers share the same group room.
- *
- * The customer's balance snapshot is captured here, when the
- * actual call timer starts.
- */
-export async function startCall(callId, roomId, roomUrl) {
-  const normalizedCallId = validateId(callId, "call ID");
+export async function startCall(
+  callId,
+  roomId,
+  roomUrl
+) {
+  const normalizedCallId = validateId(
+    callId,
+    "call ID"
+  );
+
   const normalizedRoomId = validateRoomId(roomId);
   const normalizedRoomUrl = validateRoomUrl(roomUrl);
 
-  const callRef = callsCollection.doc(normalizedCallId);
+  const callRef = callSessions.doc(normalizedCallId);
 
   return db.runTransaction(async (transaction) => {
-    const snapshot = await transaction.get(callRef);
+    // --------------------------------------------------------
+    // READ 1 — CALL
+    // --------------------------------------------------------
 
-    if (!snapshot.exists) {
-      throw makeError("Call not found.", 404);
+    const callSnapshot = await transaction.get(callRef);
+
+    if (!callSnapshot.exists) {
+      throw makeError("Call session not found.", 404);
     }
 
-    const call = snapshot.data();
+    const call = callSnapshot.data();
 
-    let groupRoomRef = null;
-    let groupRoom = null;
+    const customerId = validateId(
+      getCustomerId(call),
+      "customer ID"
+    );
 
-    // Read and validate the shared room.
-    if (call.groupRoomId) {
-      groupRoomRef = callRoomsCollection.doc(call.groupRoomId);
+    const hostId = validateId(
+      call.hostId,
+      "host ID"
+    );
 
-      const groupRoomSnapshot = await transaction.get(
-        groupRoomRef
+    if (isTerminalCall(call)) {
+      throw makeError(
+        "This call has already ended.",
+        409
+      );
+    }
+
+    if (!ACTIVE_STATUSES.has(call.status)) {
+      throw makeError(
+        "This call cannot be started.",
+        409
+      );
+    }
+
+    if (
+      call.roomId &&
+      call.roomId !== normalizedRoomId
+    ) {
+      throw makeError(
+        "The supplied room does not match the assigned call room.",
+        409
+      );
+    }
+
+    const groupCall = isGroupCall(call);
+
+    // --------------------------------------------------------
+    // READ 2 — CUSTOMER AND HOST
+    // --------------------------------------------------------
+
+    const userRef = users.doc(customerId);
+    const hostRef = hosts.doc(hostId);
+
+    const [userSnapshot, hostSnapshot] = await Promise.all([
+      transaction.get(userRef),
+      transaction.get(hostRef),
+    ]);
+
+    if (!userSnapshot.exists) {
+      throw makeError("Customer account not found.", 404);
+    }
+
+    if (!hostSnapshot.exists) {
+      throw makeError("Host account not found.", 404);
+    }
+
+    const user = userSnapshot.data();
+    const host = hostSnapshot.data();
+
+    // --------------------------------------------------------
+    // CUSTOMER RESERVATION CHECK
+    // --------------------------------------------------------
+
+    if (user.activeCallId !== normalizedCallId) {
+      throw makeError(
+        "The customer's call reservation is no longer valid.",
+        409
+      );
+    }
+
+    if (
+      user.accountStatus &&
+      user.accountStatus !== "active"
+    ) {
+      throw makeError(
+        "Customer account is not active.",
+        403
+      );
+    }
+
+    // --------------------------------------------------------
+    // HOST ACCOUNT CHECK
+    // --------------------------------------------------------
+
+    if (
+      host.status !== "active" ||
+      !host.firebaseUid
+    ) {
+      throw makeError(
+        "The assigned host is no longer active.",
+        409
+      );
+    }
+
+    // --------------------------------------------------------
+    // READ 3 — GROUP ROOM, WHEN APPLICABLE
+    // --------------------------------------------------------
+
+    let roomRef = null;
+    let roomSnapshot = null;
+    let room = null;
+
+    if (groupCall) {
+      const groupRoomId = validateId(
+        call.groupRoomId,
+        "group room ID"
       );
 
-      if (!groupRoomSnapshot.exists) {
+      roomRef = callRooms.doc(groupRoomId);
+
+      roomSnapshot = await transaction.get(roomRef);
+
+      if (!roomSnapshot.exists) {
         throw makeError(
           "The assigned group room no longer exists.",
           409
         );
       }
 
-      groupRoom = groupRoomSnapshot.data();
+      room = roomSnapshot.data();
+
+      // ------------------------------------------------------
+      // GROUP ROOM VALIDATION
+      // ------------------------------------------------------
 
       if (
-        !["waiting_host", "active"].includes(groupRoom.status) ||
-        groupRoom.endedAt ||
-        groupRoom.roomName !== normalizedRoomId ||
-        groupRoom.hostId !== call.hostId ||
-        !Array.isArray(groupRoom.callIds) ||
-        !groupRoom.callIds.includes(normalizedCallId) ||
-        !Array.isArray(groupRoom.customerIds) ||
-        !groupRoom.customerIds.includes(call.userId)
+        room.hostId !== hostId ||
+        room.roomName !== normalizedRoomId
       ) {
         throw makeError(
-          "This customer is no longer eligible to start in this group room.",
+          "The group room does not match this call.",
+          409
+        );
+      }
+
+      if (
+        !["waiting_host", "active"].includes(room.status) ||
+        room.endedAt
+      ) {
+        throw makeError(
+          "The group room is no longer available.",
+          409
+        );
+      }
+
+      if (
+        !Array.isArray(room.customerIds) ||
+        !Array.isArray(room.callIds) ||
+        !room.customerIds.includes(customerId) ||
+        !room.callIds.includes(normalizedCallId)
+      ) {
+        throw makeError(
+          "The customer is not a member of this group room.",
+          403
+        );
+      }
+
+      // ------------------------------------------------------
+      // HOST GROUP RESERVATION
+      // ------------------------------------------------------
+
+      if (host.activeGroupRoomId !== call.groupRoomId) {
+        throw makeError(
+          "The host's group-room reservation is no longer valid.",
+          409
+        );
+      }
+
+      // A group host must not simultaneously hold a
+      // separate one-to-one reservation.
+      if (host.activeCallId) {
+        throw makeError(
+          "The host has another active call reservation.",
+          409
+        );
+      }
+    } else {
+      // ------------------------------------------------------
+      // LEGACY ONE-TO-ONE RESERVATION
+      // ------------------------------------------------------
+
+      if (host.activeCallId !== normalizedCallId) {
+        throw makeError(
+          "The host's call reservation is no longer valid.",
+          409
+        );
+      }
+
+      if (host.activeGroupRoomId) {
+        throw makeError(
+          "The host is already assigned to a group room.",
           409
         );
       }
     }
 
-    // An identical retry must never reset the timer or balance snapshot.
+    // --------------------------------------------------------
+    // CUSTOMER BALANCE VALIDATION
+    // --------------------------------------------------------
+
+    const minutes = normalizeMinutes(user.minutes);
+
+    const remainder = normalizeRemainder(
+      user.secondsUsedRemainder
+    );
+
+    if (minutes === null || remainder === null) {
+      throw makeError(
+        "Customer balance information is invalid.",
+        409
+      );
+    }
+
+    const availableSeconds =
+      minutes * 60 - remainder;
+
+    if (availableSeconds <= 0) {
+      throw makeError(
+        "Customer has insufficient minutes to start this call.",
+        402
+      );
+    }
+
+    // --------------------------------------------------------
+    // IDEMPOTENT ACTIVE CALL
+    // --------------------------------------------------------
+
     if (call.status === "active") {
       if (
         call.roomId !== normalizedRoomId ||
         call.roomUrl !== normalizedRoomUrl
       ) {
         throw makeError(
-          "This call is already active in a different room.",
+          "This call is already active in another room.",
           409
         );
       }
 
-      // Repair room status if necessary.
-      if (groupRoomRef && groupRoom.status !== "active") {
-        const now = new Date();
-
-        transaction.update(groupRoomRef, {
+      // Repair room status if the call is active but the
+      // group-room status was not updated.
+      if (groupCall && room.status !== "active") {
+        transaction.update(roomRef, {
           status: "active",
-          startedAt: groupRoom.startedAt || now,
-          updatedAt: now,
+          startedAt: room.startedAt || call.startedAt || new Date(),
+          updatedAt: new Date(),
         });
       }
 
       return {
-        ...call,
-        id: snapshot.id,
+        success: true,
+        alreadyStarted: true,
+        call: {
+          id: callSnapshot.id,
+          ...call,
+        },
       };
     }
 
+    // --------------------------------------------------------
+    // ONLY MATCHED CALLS MAY START
+    // --------------------------------------------------------
+
     if (call.status !== "matched") {
       throw makeError(
-        "Only a matched call can be started.",
-        409
-      );
-    }
-
-    if (call.startedAt || call.endedAt) {
-      throw makeError(
-        "This call has already started or ended.",
-        409
-      );
-    }
-
-    const userId = call.userId || call.customerUid;
-
-    if (
-      typeof userId !== "string" ||
-      !userId.trim()
-    ) {
-      throw makeError(
-        "Customer ID is missing from this call.",
-        409
-      );
-    }
-
-    const userRef = usersCollection.doc(userId);
-    const userSnapshot = await transaction.get(userRef);
-
-    if (!userSnapshot.exists) {
-      throw makeError(
-        "Customer account was not found.",
-        404
-      );
-    }
-
-    const user = userSnapshot.data();
-
-    // Keep the existing whole-minute package balance.
-    const customerMinutes = readCustomerMinutes(
-      user.minutes
-    );
-
-    // Read partial-minute usage from the new field.
-    // Existing customers without this field start at zero.
-    const secondsUsedRemainder = readSecondsRemainder(
-      user.secondsUsedRemainder
-    );
-
-    const availableSeconds =
-      customerMinutes * 60 - secondsUsedRemainder;
-
-    if (
-      !Number.isSafeInteger(availableSeconds) ||
-      availableSeconds <= 0
-    ) {
-      throw makeError(
-        "Customer has no available call time.",
+        "The host has not accepted this call yet.",
         409
       );
     }
 
     const now = new Date();
 
-    const update = {
+    // --------------------------------------------------------
+    // ALL READS COMPLETE — BEGIN WRITES
+    // --------------------------------------------------------
+
+    transaction.update(callRef, {
       status: "active",
 
-      // Existing snapshot retained for compatibility.
-      minutesAtStart: customerMinutes,
-
-      // New snapshot for accurate per-second billing.
-      secondsUsedRemainderAtStart: secondsUsedRemainder,
+      // Keep a canonical customer ID for billing.
+      userId: customerId,
+      customerUid: customerId,
 
       roomId: normalizedRoomId,
       roomUrl: normalizedRoomUrl,
 
       startedAt: now,
       updatedAt: now,
-    };
 
-    transaction.update(callRef, update);
+      minutesAtStart: minutes,
+      secondsUsedRemainderAtStart: remainder,
+      availableSecondsAtStart: availableSeconds,
+    });
 
-    // Update the shared room in the same transaction.
-    if (groupRoomRef) {
-      transaction.update(groupRoomRef, {
+    if (groupCall) {
+      transaction.update(roomRef, {
         status: "active",
-        startedAt: groupRoom.startedAt || now,
+        startedAt: room.startedAt || now,
         updatedAt: now,
       });
     }
 
     return {
-      ...call,
-      ...update,
-      id: snapshot.id,
+      success: true,
+      alreadyStarted: false,
+
+      call: {
+        id: callSnapshot.id,
+        ...call,
+        userId: customerId,
+        customerUid: customerId,
+        status: "active",
+        roomId: normalizedRoomId,
+        roomUrl: normalizedRoomUrl,
+        startedAt: now,
+        updatedAt: now,
+        minutesAtStart: minutes,
+        secondsUsedRemainderAtStart: remainder,
+        availableSecondsAtStart: availableSeconds,
+      },
     };
   });
 }
 
-/* -------------------------------------------------------------------------- */
-/* END CALL                                                                   */
-/* -------------------------------------------------------------------------- */
+// ============================================================
+// END CALL
+//
+// Billing is finalized after the call has been safely marked
+// completed. A failed billing attempt remains pending and can
+// be retried by calling endCall again.
+// ============================================================
 
-/**
- * Each customer call is ended and billed independently.
- *
- * Group call:
- * - releases only this customer's activeCallId;
- * - preserves the host's shared group-room reservation;
- * - removes only this customer from the shared room;
- * - finalizes only this customer's billing.
- *
- * Legacy one-to-one call:
- * - releases this customer's reservation;
- * - releases the host's activeCallId if it belongs to this call.
- */
-export async function endCall(callId, reason = "completed") {
-  const normalizedCallId = validateId(callId, "call ID");
-  const normalizedReason = validateEndReason(reason);
+export async function endCall(
+  callId,
+  reason = "completed"
+) {
+  const normalizedCallId = validateId(
+    callId,
+    "call ID"
+  );
 
-  const callRef = callsCollection.doc(normalizedCallId);
+  if (!ALLOWED_END_REASONS.has(reason)) {
+    throw makeError("Invalid call end reason.");
+  }
 
-  const endedCall = await db.runTransaction(async (transaction) => {
-    const snapshot = await transaction.get(callRef);
+  const callRef = callSessions.doc(normalizedCallId);
 
-    if (!snapshot.exists) {
-      throw makeError("Call not found.", 404);
-    }
+  const transactionResult = await db.runTransaction(
+    async (transaction) => {
+      // ------------------------------------------------------
+      // READ 1 — CALL
+      // ------------------------------------------------------
 
-    const call = snapshot.data();
+      const callSnapshot = await transaction.get(callRef);
 
-    if (
-      typeof call.userId !== "string" ||
-      typeof call.hostId !== "string"
-    ) {
-      throw makeError(
-        "Call participant data is invalid.",
-        500
-      );
-    }
+      if (!callSnapshot.exists) {
+        throw makeError("Call session not found.", 404);
+      }
 
-    const userId = validateId(call.userId, "user ID");
-    const hostId = validateId(call.hostId, "host ID");
+      const call = callSnapshot.data();
 
-    const userRef = usersCollection.doc(userId);
-    const hostRef = hostsCollection.doc(hostId);
-
-    // All transaction reads before writes.
-    const [userSnapshot, hostSnapshot] = await Promise.all([
-      transaction.get(userRef),
-      transaction.get(hostRef),
-    ]);
-
-    const now = new Date();
-    const groupCall = isGroupCall(call);
-
-    // A previous request may already have completed this call.
-    if (call.status === "completed") {
-      releaseReservation(
-        transaction,
-        userSnapshot,
-        normalizedCallId,
-        now
+      const customerId = validateId(
+        getCustomerId(call),
+        "customer ID"
       );
 
-      releaseReservation(
-        transaction,
-        hostSnapshot,
-        normalizedCallId,
-        now,
-        { preserveReservation: groupCall }
+      const hostId = validateId(
+        call.hostId,
+        "host ID"
       );
 
-      return {
-        ...call,
-        id: snapshot.id,
-        alreadyEnded: true,
-        neverStarted: !toDate(call.startedAt),
-      };
-    }
+      const userRef = users.doc(customerId);
+      const hostRef = hosts.doc(hostId);
 
-    if (!ACTIVE_STATUSES.has(call.status)) {
-      throw makeError(
-        "This call cannot be ended from its current state.",
-        409
+      // ------------------------------------------------------
+      // READ 2 — CUSTOMER AND HOST
+      // ------------------------------------------------------
+
+      const [userSnapshot, hostSnapshot] = await Promise.all([
+        transaction.get(userRef),
+        transaction.get(hostRef),
+      ]);
+
+      const groupCall = isGroupCall(call);
+
+      // ------------------------------------------------------
+      // ALREADY COMPLETED — ALLOW BILLING RETRY
+      // ------------------------------------------------------
+
+      if (call.status === "completed") {
+        releaseCustomerReservation(
+          transaction,
+          userSnapshot,
+          normalizedCallId
+        );
+
+        releaseHostReservation(
+          transaction,
+          hostSnapshot,
+          normalizedCallId,
+          groupCall
+        );
+
+        return {
+          call: {
+            id: callSnapshot.id,
+            ...call,
+          },
+          alreadyEnded: true,
+          shouldFinalizeBilling:
+            call.billingStatus === "pending" &&
+            Boolean(call.startedAt),
+          shouldRemoveFromRoom: groupCall,
+        };
+      }
+
+      // ------------------------------------------------------
+      // OTHER TERMINAL STATUSES
+      // ------------------------------------------------------
+
+      if (isTerminalCall(call)) {
+        return {
+          call: {
+            id: callSnapshot.id,
+            ...call,
+          },
+          alreadyEnded: true,
+          shouldFinalizeBilling: false,
+          shouldRemoveFromRoom: false,
+        };
+      }
+
+      if (!ACTIVE_STATUSES.has(call.status)) {
+        throw makeError(
+          "This call cannot be ended in its current state.",
+          409
+        );
+      }
+
+      const now = new Date();
+
+      const startedAtMillis = timestampMillis(
+        call.startedAt
       );
-    }
 
-    const startedAt = toDate(call.startedAt);
+      const hasStarted = startedAtMillis > 0;
 
-    if (call.startedAt && !startedAt) {
-      throw makeError(
-        "The call start timestamp is invalid. Billing was not changed.",
-        500
-      );
-    }
-
-    // Calculate duration using the trusted backend clock.
-    const durationSeconds = startedAt
-      ? Math.max(
-          0,
-          Math.floor(
-            (now.getTime() - startedAt.getTime()) / 1000
+      const durationSeconds = hasStarted
+        ? Math.max(
+            0,
+            Math.floor(
+              (now.getTime() - startedAtMillis) / 1000
+            )
           )
-        )
-      : 0;
+        : 0;
 
-    // Retained for compatibility with older history displays.
-    // Actual billing uses durationSeconds.
-    const minutesUsed =
-      durationSeconds > 0
+      const minutesUsed = hasStarted
         ? Math.ceil(durationSeconds / 60)
         : 0;
 
-    const neverStarted = !startedAt;
+      // ------------------------------------------------------
+      // COMPLETE CALL
+      // ------------------------------------------------------
 
-    const update = {
-      status: "completed",
-      endedAt: now,
+      transaction.update(callRef, {
+        status: "completed",
 
-      durationSeconds,
-      minutesUsed,
+        // Canonical ID supports billing and older records.
+        userId: customerId,
+        customerUid: customerId,
 
-      // The billing service calculates final billable seconds.
-      billableSeconds: 0,
-      billableMinutes: 0,
+        endedAt: now,
+        updatedAt: now,
 
-      endReason: normalizedReason,
-      updatedAt: now,
+        durationSeconds,
+        minutesUsed,
 
-      ...(neverStarted
-        ? {
-            billingStatus: "finalized",
-            billedAt: now,
-            billingError: null,
+        // The billing service calculates the final charge.
+        billableMinutes: 0,
 
-            customerCharge: 0,
-            hostEarnings: 0,
-            saLiveRevenue: 0,
+        billingStatus: hasStarted
+          ? "pending"
+          : "not_required",
 
-            customerChargeCents: 0,
-            hostEarningsCents: 0,
-            saLiveRevenueCents: 0,
-          }
-        : {
-            billingStatus: "pending",
-            billingError: null,
-          }),
-    };
+        endReason: reason,
+      });
 
-    transaction.update(callRef, update);
+      // ------------------------------------------------------
+      // RELEASE CUSTOMER RESERVATION
+      // ------------------------------------------------------
 
-    // Release this customer's own reservation.
-    releaseReservation(
-      transaction,
-      userSnapshot,
-      normalizedCallId,
-      now
-    );
+      releaseCustomerReservation(
+        transaction,
+        userSnapshot,
+        normalizedCallId
+      );
 
-    // Preserve the shared group-room host reservation.
-    releaseReservation(
-      transaction,
-      hostSnapshot,
-      normalizedCallId,
-      now,
-      { preserveReservation: groupCall }
-    );
+      // ------------------------------------------------------
+      // RELEASE HOST RESERVATION
+      // ------------------------------------------------------
 
-    return {
-      ...call,
-      ...update,
-      id: snapshot.id,
-      neverStarted,
-    };
-  });
+      // A group host stays reserved until the entire group
+      // room has ended. One customer's departure must not
+      // release the host for another call.
+      releaseHostReservation(
+        transaction,
+        hostSnapshot,
+        normalizedCallId,
+        groupCall
+      );
 
-  /*
-   * Remove this customer's membership from the shared room.
-   * This happens before billing so a completed customer does
-   * not continue occupying a room slot if billing fails.
-   */
-  if (isGroupCall(endedCall)) {
+      return {
+        call: {
+          id: callSnapshot.id,
+          ...call,
+          userId: customerId,
+          customerUid: customerId,
+          status: "completed",
+          endedAt: now,
+          updatedAt: now,
+          durationSeconds,
+          minutesUsed,
+          billableMinutes: 0,
+          billingStatus: hasStarted
+            ? "pending"
+            : "not_required",
+          endReason: reason,
+        },
+        alreadyEnded: false,
+        shouldFinalizeBilling: hasStarted,
+        shouldRemoveFromRoom: groupCall,
+      };
+    }
+  );
+
+  // ==========================================================
+  // GROUP ROOM CLEANUP
+  // ==========================================================
+
+  if (transactionResult.shouldRemoveFromRoom) {
     try {
       await removeCallFromGroupRoom({
-        callId: endedCall.id,
+        callId: normalizedCallId,
       });
     } catch (error) {
+      // Billing must still be attempted. A later endCall retry
+      // can retry room cleanup as well.
       console.error(
-        "SA LIVE group-room cleanup failed.",
-        {
-          callId: endedCall.id,
-          message:
-            typeof error?.message === "string"
-              ? error.message.slice(0, 300)
-              : "Unknown cleanup error",
-        }
+        "[SA LIVE] Group room cleanup failed:",
+        normalizedCallId,
+        error.message
       );
     }
   }
 
-  // Calls that never started must not be billed.
-  if (endedCall.neverStarted) {
-    const latestCall = await getCallById(endedCall.id);
-    return latestCall ?? endedCall;
+  // ==========================================================
+  // NO BILLING FOR CALLS THAT NEVER STARTED
+  // ==========================================================
+
+  if (!transactionResult.shouldFinalizeBilling) {
+    return await getCallById(normalizedCallId);
   }
 
-  // Already-finalized calls must never be charged again.
-  if (endedCall.billingStatus === "finalized") {
-    return endedCall;
-  }
+  // ==========================================================
+  // FINALIZE BILLING
+  // ==========================================================
 
-  /*
-   * Billing is performed outside the call-ending transaction.
-   * finalizeCallBilling has its own atomic transaction and
-   * idempotency protection.
-   */
   try {
-    const billing = await finalizeCallBilling(endedCall.id);
+    await finalizeCallBilling(normalizedCallId);
 
-    const latestCall = await getCallById(endedCall.id);
-
-    console.info(
-      "SA LIVE call billing finalization completed.",
-      {
-        callId: endedCall.id,
-        callStatus: latestCall?.status ?? endedCall.status,
-        billingStatus:
-          latestCall?.billingStatus ??
-          billing?.billingStatus ??
-          "unknown",
-        billableSeconds: billing?.billableSeconds ?? 0,
-      }
+    console.log(
+      "[SA LIVE] Call billing finalized:",
+      normalizedCallId
     );
-
-    return {
-      ...(latestCall ?? endedCall),
-      billing,
-    };
   } catch (error) {
     console.error(
-      "SA LIVE call billing finalization failed.",
-      {
-        callId: endedCall.id,
-        message:
-          typeof error?.message === "string"
-            ? error.message.slice(0, 300)
-            : "Unknown billing error",
-      }
+      "[SA LIVE] Call billing failed:",
+      normalizedCallId,
+      error.message
     );
 
-    // Record failure only if billing is not already finalized.
+    // Preserve the completed call and pending billing status.
+    // Do not reverse or manually recalculate any balances.
     try {
-      await db.runTransaction(async (transaction) => {
-        const latestSnapshot = await transaction.get(callRef);
-
-        if (!latestSnapshot.exists) return;
-
-        const latestData = latestSnapshot.data();
-
-        if (
-          latestData.status === "completed" &&
-          latestData.billingStatus !== "finalized"
-        ) {
-          transaction.update(callRef, {
-            billingError:
-              typeof error?.message === "string"
-                ? error.message.slice(0, 500)
-                : "Billing finalization failed.",
-            updatedAt: new Date(),
-          });
-        }
+      await callRef.update({
+        billingError: String(error.message || "Billing failed")
+          .slice(0, 500),
+        billingErrorAt: new Date(),
+        updatedAt: new Date(),
       });
-    } catch (recordError) {
+    } catch (updateError) {
       console.error(
-        "Could not record SA LIVE billing error.",
-        {
-          callId: endedCall.id,
-          message:
-            typeof recordError?.message === "string"
-              ? recordError.message.slice(0, 300)
-              : "Unknown error",
-        }
+        "[SA LIVE] Could not record billing error:",
+        updateError.message
       );
     }
 
-    // The call remains completed.
-    // A trusted backend retry can finalize billing later.
     throw error;
   }
+
+  return await getCallById(normalizedCallId);
 }
 
-/* -------------------------------------------------------------------------- */
-/* GET USER CALL HISTORY                                                      */
-/* -------------------------------------------------------------------------- */
+// ============================================================
+// CUSTOMER CALL HISTORY
+// ============================================================
 
 export async function getUserCallHistory(userId) {
-  const normalizedUserId = validateId(userId, "user ID");
+  const normalizedUserId = validateId(
+    userId,
+    "customer ID"
+  );
 
-  const snapshot = await callsCollection
+  const snapshot = await callSessions
     .where("userId", "==", normalizedUserId)
     .get();
 
-  return sortNewestFirst(
-    snapshot.docs.map((doc) => ({
-      ...doc.data(),
-      id: doc.id,
-    }))
-  );
+  return getSortedCalls(snapshot);
 }
 
-/* -------------------------------------------------------------------------- */
-/* GET HOST CALL HISTORY                                                      */
-/* -------------------------------------------------------------------------- */
+// ============================================================
+// HOST CALL HISTORY
+// ============================================================
 
 export async function getHostCallHistory(hostId) {
-  const normalizedHostId = validateId(hostId, "host ID");
+  const normalizedHostId = validateId(
+    hostId,
+    "host ID"
+  );
 
-  const snapshot = await callsCollection
+  const snapshot = await callSessions
     .where("hostId", "==", normalizedHostId)
     .get();
 
-  return sortNewestFirst(
-    snapshot.docs.map((doc) => ({
-      ...doc.data(),
-      id: doc.id,
-    }))
-  );
+  return getSortedCalls(snapshot);
 }

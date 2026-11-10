@@ -104,7 +104,6 @@ function isExpiredPendingRequest(call, now = Date.now()) {
 
   const createdAt = getTimestampMs(call.createdAt);
 
-  // Do not expire records with missing timestamps automatically.
   if (!createdAt) {
     return false;
   }
@@ -117,7 +116,7 @@ function safeCallResponse(id, data = {}) {
     id,
 
     hostId: data.hostId ?? null,
-    userId: data.userId ?? null,
+    userId: data.userId ?? data.customerUid ?? null,
 
     status: data.status ?? "unknown",
 
@@ -147,7 +146,11 @@ function safeCallList(calls) {
 }
 
 function noStore(res) {
-  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  res.setHeader(
+    "Cache-Control",
+    "no-store, no-cache, must-revalidate"
+  );
+
   res.setHeader("Pragma", "no-cache");
 }
 
@@ -155,13 +158,10 @@ function noStore(res) {
 // EXPIRE ONE PENDING REQUEST
 // ============================================================
 
-/**
- * Expires an unaccepted matching request.
- *
- * This is transactional so a simultaneous host acceptance
- * cannot also successfully attach the same request.
- */
-async function expirePendingRequest(callId, expectedHostId) {
+async function expirePendingRequest(
+  callId,
+  expectedHostId
+) {
   const callRef = callSessions.doc(callId);
 
   return db.runTransaction(async (transaction) => {
@@ -223,15 +223,9 @@ async function expirePendingRequest(callId, expectedHostId) {
 }
 
 // ============================================================
-// GET MY CALL REQUESTS
+// GET HOST CALL REQUESTS
 // ============================================================
 
-/**
- * GET /api/calls/requests
- *
- * Returns requests assigned to the authenticated host.
- * Old matching requests are expired and cleaned up first.
- */
 export async function getMyCallRequests(req, res, next) {
   try {
     const hostId = getAuthenticatedHostId(req);
@@ -248,13 +242,15 @@ export async function getMyCallRequests(req, res, next) {
       .where("hostId", "==", hostId)
       .get();
 
-    // Expire old pending requests before building the response.
     for (const document of initialSnapshot.docs) {
       const call = document.data();
 
       if (isExpiredPendingRequest(call)) {
         try {
-          await expirePendingRequest(document.id, hostId);
+          await expirePendingRequest(
+            document.id,
+            hostId
+          );
         } catch (error) {
           console.error(
             "[SA LIVE] Could not expire pending request:",
@@ -265,7 +261,6 @@ export async function getMyCallRequests(req, res, next) {
       }
     }
 
-    // Refetch because the expiry transactions may have changed status.
     const refreshedSnapshot = await callSessions
       .where("hostId", "==", hostId)
       .get();
@@ -278,11 +273,7 @@ export async function getMyCallRequests(req, res, next) {
         )
       )
       .filter((call) => {
-        if (call.endedAt) {
-          return false;
-        }
-
-        if (isTerminal(call)) {
+        if (call.endedAt || isTerminal(call)) {
           return false;
         }
 
@@ -290,7 +281,6 @@ export async function getMyCallRequests(req, res, next) {
           return false;
         }
 
-        // Active calls remain visible regardless of age.
         if (
           call.status === "active" ||
           call.startedAt
@@ -298,9 +288,10 @@ export async function getMyCallRequests(req, res, next) {
           return true;
         }
 
-        // Only show unaccepted requests that have not expired.
         if (call.status === "matching") {
-          const createdMs = getTimestampMs(call.createdAt);
+          const createdMs = getTimestampMs(
+            call.createdAt
+          );
 
           return (
             createdMs > 0 &&
@@ -308,7 +299,6 @@ export async function getMyCallRequests(req, res, next) {
           );
         }
 
-        // Matched calls remain visible while the call is being joined.
         return call.status === "matched";
       })
       .sort((a, b) => {
@@ -335,15 +325,9 @@ export async function getMyCallRequests(req, res, next) {
 }
 
 // ============================================================
-// GET MY CALL HISTORY
+// GET HOST CALL HISTORY
 // ============================================================
 
-/**
- * GET /api/calls/history
- *
- * Each customer's call remains a separate history entry,
- * even when multiple customers shared a group room.
- */
 export async function getMyCallHistory(req, res, next) {
   try {
     const hostId = getAuthenticatedHostId(req);
@@ -378,22 +362,6 @@ export async function getMyCallHistory(req, res, next) {
 // ACCEPT CALL REQUEST
 // ============================================================
 
-/**
- * POST /api/calls/:callId/accept
- *
- * The groupRoomService performs the transaction that:
- * - Confirms this request belongs to the host.
- * - Confirms the request is still matching.
- * - Rechecks customer balance.
- * - Rechecks host availability.
- * - Rechecks room capacity.
- * - Attaches the existing request to the group room.
- * - Changes matching -> matched.
- * - Reserves the customer.
- *
- * Host acceptance and customer cancellation both update the
- * same call document transactionally. Only one should succeed.
- */
 export async function acceptCallRequest(req, res, next) {
   try {
     const hostId = getAuthenticatedHostId(req);
@@ -445,7 +413,9 @@ export async function acceptCallRequest(req, res, next) {
         result.message ||
         "Call accepted successfully.",
 
-      alreadyAttached: Boolean(result.alreadyAttached),
+      alreadyAttached: Boolean(
+        result.alreadyAttached
+      ),
 
       call: safeCallResponse(
         result.call?.id || callId,

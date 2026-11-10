@@ -162,6 +162,7 @@ function getRoomCustomerIds(room) {
   ];
 }
 
+
 function roomHasCapacity(room, hostId) {
   if (!room || room.hostId !== hostId) {
     return false;
@@ -178,15 +179,16 @@ function roomHasCapacity(room, hostId) {
     return false;
   }
 
+  // Never allow new customers into an ended room.
   if (room.endedAt) {
     return false;
   }
 
-  // Legacy rooms may still store maxCustomers: 3. The current
-  // server policy is authoritative, so existing rooms can grow to
-  // the new five-customer limit without trusting stale client data.
-  return getRoomCustomerIds(room).length < MAX_GROUP_CUSTOMERS;
+  const customerIds = getRoomCustomerIds(room);
+
+  return customerIds.length < MAX_GROUP_CUSTOMERS;
 }
+
 
 function getPublicHostProfile(hostId, host) {
   return {
