@@ -12,10 +12,21 @@ import {
   cancelCustomerCall,
 } from "../controllers/customerCallController.js";
 
+import {
+  syncEmailVerification,
+} from "../controllers/emailVerificationController.js";
+
 const router = express.Router();
 
-// All customer call operations require authentication.
+// All routes require a valid Firebase login.
 router.use(verifyFirebaseToken);
+
+// IMPORTANT:
+// Synchronisation must happen BEFORE requireVerifiedEmail.
+router.post(
+  "/me/sync-email-verification",
+  syncEmailVerification
+);
 
 // All customer call operations require a verified email.
 router.use(requireVerifiedEmail);
