@@ -239,8 +239,11 @@ export async function getMyCallRequests(req, res, next) {
     }
 
     const initialSnapshot = await callSessions
-      .where("hostId", "==", hostId)
-      .get();
+  .where("hostId", "==", hostId)
+  .where("status", "in", [...ACTIVE_REQUEST_STATUSES])
+  .orderBy("createdAt", "desc")
+  .limit(100)
+  .get();
 
     for (const document of initialSnapshot.docs) {
       const call = document.data();
@@ -261,9 +264,12 @@ export async function getMyCallRequests(req, res, next) {
       }
     }
 
-    const refreshedSnapshot = await callSessions
-      .where("hostId", "==", hostId)
-      .get();
+   const refreshedSnapshot = await callSessions
+  .where("hostId", "==", hostId)
+  .where("status", "in", [...ACTIVE_REQUEST_STATUSES])
+  .orderBy("createdAt", "desc")
+  .limit(100)
+  .get();
 
     const calls = refreshedSnapshot.docs
       .map((document) =>

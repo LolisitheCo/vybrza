@@ -67,14 +67,16 @@ function sendError(res, error, knownMessages = new Set()) {
       ? error.message
       : "An unexpected error occurred.";
 
-  const status =
+  const explicitStatus =
     Number.isInteger(error?.status) &&
     error.status >= 400 &&
     error.status < 500
       ? error.status
-      : knownMessages.has(message)
-        ? 400
-        : 500;
+      : null;
+
+  const status =
+    explicitStatus ??
+    (knownMessages.has(message) ? 400 : 500);
 
   if (status >= 500) {
     console.error("[SA LIVE HOST CONTROLLER]", {

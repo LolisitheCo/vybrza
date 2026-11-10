@@ -292,19 +292,37 @@ function roomHasCapacity(room, hostId) {
     return false;
   }
 
-  const customerIds = Array.isArray(room.customerIds)
-    ? room.customerIds
-    : [];
+  if (
+    !Array.isArray(room.customerIds) ||
+    !Array.isArray(room.callIds)
+  ) {
+    return false;
+  }
 
-  // Do not let a stale legacy maxCustomers: 3 field reduce the
-  // current server-enforced capacity for an active room.
-  const uniqueCustomerIds = new Set(
-    customerIds.filter(
-      (id) => typeof id === "string" && id.trim()
+  const customerIds = room.customerIds;
+  const callIds = room.callIds;
+
+  if (
+    customerIds.length !== callIds.length ||
+    customerIds.length > MAX_GROUP_CUSTOMERS ||
+    new Set(customerIds).size !== customerIds.length ||
+    new Set(callIds).size !== callIds.length
+  ) {
+    return false;
+  }
+
+  if (
+    customerIds.some(
+      (id) => typeof id !== "string" || !id.trim()
+    ) ||
+    callIds.some(
+      (id) => typeof id !== "string" || !id.trim()
     )
-  );
+  ) {
+    return false;
+  }
 
-  return uniqueCustomerIds.size < MAX_GROUP_CUSTOMERS;
+  return customerIds.length < MAX_GROUP_CUSTOMERS;
 }
 
 /**

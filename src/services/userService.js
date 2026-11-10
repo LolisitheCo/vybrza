@@ -373,16 +373,8 @@ export async function addMinutes(userId, minutes) {
 }
 
 // ============================================================
-// DEDUCT MINUTES
+// DEDUCT MINUTES — PARTIAL-SECOND SAFE
 // ============================================================
-
-/**
- * Use billingService.js for actual call billing.
- *
- * This helper is retained for compatibility with other
- * existing services. It is not a substitute for the
- * atomic customer/host/platform billing transaction.
- */
 
 export async function deductMinutes(userId, minutes) {
   const uid = requireUserId(userId);
@@ -413,9 +405,40 @@ export async function deductMinutes(userId, minutes) {
 
     const user = snapshot.data();
 
-    const current = normalizeMinutes(user.minutes);
+    const currentMinutes = normalizeMinutes(user.minutes);
 
-    if (current < minutes) {
+    const currentRemainder =
+      user.secondsUsedRemainder ?? 0;
+
+    if (
+      !Number.isSafeInteger(currentRemainder) ||
+      currentRemainder < 0 ||
+      currentRemainder > 59
+    ) {
+      throw makeError(
+        "Invalid customer seconds remainder.",
+        409,
+        "INVALID_SECONDS_REMAINDER"
+      );
+    }
+
+    const availableSeconds =
+      currentMinutes * 60 - currentRemainder;
+
+    const deductionSeconds = minutes * 60;
+
+    if (
+      !Number.isSafeInteger(availableSeconds) ||
+      availableSeconds < 0
+    ) {
+      throw makeError(
+        "Invalid customer available balance.",
+        409,
+        "INVALID_MINUTE_BALANCE"
+      );
+    }
+
+    if (availableSeconds < deductionSeconds) {
       throw makeError(
         "Insufficient available minutes.",
         409,
@@ -423,14 +446,26 @@ export async function deductMinutes(userId, minutes) {
       );
     }
 
-    const updated = current - minutes;
+    const remainingSeconds =
+      availableSeconds - deductionSeconds;
+
+    const updatedMinutes =
+      Math.ceil(remainingSeconds / 60);
+
+    const updatedRemainder =
+      updatedMinutes * 60 - remainingSeconds;
 
     transaction.update(userRef, {
-      minutes: updated,
+      minutes: updatedMinutes,
+      secondsUsedRemainder: updatedRemainder,
       updatedAt: new Date(),
     });
 
-    return updated;
+    return {
+      minutes: updatedMinutes,
+      secondsUsedRemainder: updatedRemainder,
+      availableSeconds: remainingSeconds,
+    };
   });
 }
 

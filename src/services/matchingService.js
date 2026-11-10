@@ -33,6 +33,11 @@ const ACTIVE_CALL_STATUSES = new Set([
   "active",
 ]);
 
+const GROUP_MEMBER_STATUSES = new Set([
+  "matched",
+  "active",
+]);
+
 // ============================================================
 // HELPERS
 // ============================================================
@@ -146,22 +151,9 @@ function isHostBaseAvailable(host, now = new Date()) {
   }
 }
 
-function getRoomCustomerIds(room) {
-  if (!Array.isArray(room?.customerIds)) {
-    return [];
-  }
-
-  return [
-    ...new Set(
-      room.customerIds.filter(
-        (id) =>
-          typeof id === "string" &&
-          id.trim().length > 0
-      ).map((id) => id.trim())
-    ),
-  ];
-}
-
+// ============================================================
+// GROUP ROOM VALIDATION
+// ============================================================
 
 function roomHasCapacity(room, hostId) {
   if (!room || room.hostId !== hostId) {
@@ -179,25 +171,115 @@ function roomHasCapacity(room, hostId) {
     return false;
   }
 
-  // Never allow new customers into an ended room.
   if (room.endedAt) {
     return false;
   }
 
-  const customerIds = getRoomCustomerIds(room);
+  if (
+    !Array.isArray(room.customerIds) ||
+    !Array.isArray(room.callIds)
+  ) {
+    return false;
+  }
+
+  const customerIds = room.customerIds;
+  const callIds = room.callIds;
+
+  if (
+    customerIds.length !== callIds.length ||
+    customerIds.length > MAX_GROUP_CUSTOMERS ||
+    new Set(customerIds).size !== customerIds.length ||
+    new Set(callIds).size !== callIds.length
+  ) {
+    return false;
+  }
+
+  if (
+    customerIds.some(
+      (id) =>
+        typeof id !== "string" ||
+        !id.trim() ||
+        id !== id.trim()
+    ) ||
+    callIds.some(
+      (id) =>
+        typeof id !== "string" ||
+        !id.trim() ||
+        id !== id.trim()
+    )
+  ) {
+    return false;
+  }
 
   return customerIds.length < MAX_GROUP_CUSTOMERS;
 }
 
+/**
+ * Confirms that the room's customerIds and callIds
+ * actually refer to the corresponding call documents.
+ *
+ * All reads happen before any transaction writes.
+ */
+async function validateExistingRoomMembers(
+  transaction,
+  roomSnapshot,
+  room
+) {
+  const customerIds = room.customerIds;
+  const callIds = room.callIds;
+
+  if (customerIds.length === 0) {
+    return true;
+  }
+
+  const callRefs = callIds.map((callId) =>
+    callSessionsCollection.doc(callId)
+  );
+
+  const callSnapshots = await Promise.all(
+    callRefs.map((ref) => transaction.get(ref))
+  );
+
+  for (let index = 0; index < callSnapshots.length; index++) {
+    const snapshot = callSnapshots[index];
+
+    if (!snapshot.exists) {
+      return false;
+    }
+
+    const call = snapshot.data();
+
+    const callCustomerId =
+      call.userId ?? call.customerUid;
+
+    if (
+      call.hostId !== room.hostId ||
+      callCustomerId !== customerIds[index] ||
+      call.groupRoomId !== roomSnapshot.id ||
+      !GROUP_MEMBER_STATUSES.has(call.status) ||
+      call.endedAt
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ============================================================
+// PUBLIC HOST PROFILE
+// ============================================================
 
 function getPublicHostProfile(hostId, host) {
   return {
     id: hostId,
+
     displayName:
       typeof host.displayName === "string" &&
       host.displayName.trim()
         ? host.displayName.trim().slice(0, 80)
-        : typeof host.name === "string" && host.name.trim()
+        : typeof host.name === "string" &&
+            host.name.trim()
           ? host.name.trim().slice(0, 80)
           : "SA LIVE Host",
 
@@ -241,26 +323,34 @@ async function checkCustomerReservation(
     "Active call ID"
   );
 
-  const oldCallRef = callSessionsCollection.doc(oldCallId);
-  const oldCallSnapshot = await transaction.get(oldCallRef);
+  const oldCallRef =
+    callSessionsCollection.doc(oldCallId);
 
-  if (
-    oldCallSnapshot.exists &&
-    isActiveCall(oldCallSnapshot.data())
-  ) {
+  const oldCallSnapshot = await transaction.get(
+    oldCallRef
+  );
+
+  if (oldCallSnapshot.exists) {
     const oldCall = oldCallSnapshot.data();
 
-    if (oldCall.userId !== userId) {
+    // Never overwrite a reservation pointing to another
+    // customer's call, even if that call is terminal.
+    if (
+      oldCall.userId !== userId &&
+      oldCall.customerUid !== userId
+    ) {
       throw makeError(
-        "Your existing call reservation is inconsistent.",
+        "Your existing call reservation is inconsistent. Please contact support.",
         409
       );
     }
 
-    return {
-      available: false,
-      staleCallId: null,
-    };
+    if (isActiveCall(oldCall)) {
+      return {
+        available: false,
+        staleCallId: null,
+      };
+    }
   }
 
   return {
@@ -279,7 +369,9 @@ async function createCallRequestForHost(userId, hostId) {
   const callRef = callSessionsCollection.doc();
 
   return db.runTransaction(async (transaction) => {
-    // All reads must happen before writes.
+    // --------------------------------------------------------
+    // READ CUSTOMER AND HOST
+    // --------------------------------------------------------
 
     const [userSnapshot, hostSnapshot] = await Promise.all([
       transaction.get(userRef),
@@ -287,7 +379,10 @@ async function createCallRequestForHost(userId, hostId) {
     ]);
 
     if (!userSnapshot.exists) {
-      throw makeError("Customer account not found.", 404);
+      throw makeError(
+        "Customer account not found.",
+        404
+      );
     }
 
     if (!hostSnapshot.exists) {
@@ -298,6 +393,7 @@ async function createCallRequestForHost(userId, hostId) {
     }
 
     const user = userSnapshot.data();
+
     const host = {
       id: hostSnapshot.id,
       ...hostSnapshot.data(),
@@ -305,11 +401,18 @@ async function createCallRequestForHost(userId, hostId) {
 
     const now = new Date();
 
+    // --------------------------------------------------------
+    // CUSTOMER ACCOUNT VALIDATION
+    // --------------------------------------------------------
+
     if (
       user.accountStatus &&
       user.accountStatus !== "active"
     ) {
-      throw makeError("Your account is not active.", 403);
+      throw makeError(
+        "Your account is not active.",
+        403
+      );
     }
 
     const minutes = normalizeMinutes(user.minutes);
@@ -321,6 +424,10 @@ async function createCallRequestForHost(userId, hostId) {
       );
     }
 
+    // --------------------------------------------------------
+    // HOST AVAILABILITY
+    // --------------------------------------------------------
+
     if (!isHostBaseAvailable(host, now)) {
       return {
         matched: false,
@@ -328,7 +435,10 @@ async function createCallRequestForHost(userId, hostId) {
       };
     }
 
-    // Check the customer's existing reservation.
+    // --------------------------------------------------------
+    // CUSTOMER RESERVATION
+    // --------------------------------------------------------
+
     const reservation = await checkCustomerReservation(
       transaction,
       user,
@@ -342,9 +452,13 @@ async function createCallRequestForHost(userId, hostId) {
       );
     }
 
-    // Read the host's existing group room, if any.
+    // --------------------------------------------------------
+    // EXISTING GROUP ROOM
+    // --------------------------------------------------------
+
     let roomSnapshot = null;
     let roomRef = null;
+    let room = null;
 
     if (host.activeGroupRoomId) {
       const roomId = requireDocumentId(
@@ -353,20 +467,62 @@ async function createCallRequestForHost(userId, hostId) {
       );
 
       roomRef = callRoomsCollection.doc(roomId);
+
       roomSnapshot = await transaction.get(roomRef);
 
-      if (
-        !roomSnapshot.exists ||
-        !roomHasCapacity(roomSnapshot.data(), host.id)
-      ) {
-        return {
-          matched: false,
-          reason: "room_unavailable",
-        };
+      if (!roomSnapshot.exists) {
+        // The host points to a room that no longer exists.
+        // Clear only the stale pointer we just checked.
+        transaction.update(hostRef, {
+          activeGroupRoomId: null,
+          updatedAt: now,
+        });
+      } else {
+        room = roomSnapshot.data();
+
+        if (room.status === "ended" || room.endedAt) {
+          transaction.update(hostRef, {
+            activeGroupRoomId: null,
+            updatedAt: now,
+          });
+
+          roomSnapshot = null;
+          roomRef = null;
+          room = null;
+        } else {
+          if (!roomHasCapacity(room, host.id)) {
+            return {
+              matched: false,
+              reason: "room_unavailable",
+            };
+          }
+
+          const membersValid =
+            await validateExistingRoomMembers(
+              transaction,
+              roomSnapshot,
+              room
+            );
+
+          if (!membersValid) {
+            console.error(
+              "[SA LIVE] Existing group room membership is inconsistent:",
+              roomSnapshot.id
+            );
+
+            return {
+              matched: false,
+              reason: "room_unavailable",
+            };
+          }
+        }
       }
     }
 
-    // Check any legacy one-to-one host reservation.
+    // --------------------------------------------------------
+    // LEGACY ONE-TO-ONE HOST RESERVATION
+    // --------------------------------------------------------
+
     let clearLegacyHostReservation = false;
 
     if (host.activeCallId) {
@@ -378,26 +534,27 @@ async function createCallRequestForHost(userId, hostId) {
       const legacyCallRef =
         callSessionsCollection.doc(legacyCallId);
 
-      const legacyCallSnapshot = await transaction.get(
-        legacyCallRef
-      );
+      const legacyCallSnapshot =
+        await transaction.get(legacyCallRef);
 
-      if (
-        legacyCallSnapshot.exists &&
-        isActiveCall(legacyCallSnapshot.data())
-      ) {
-        // A host already using a legacy call cannot accept
-        // a new group request.
-        return {
-          matched: false,
-          reason: "host_unavailable",
-        };
+      if (legacyCallSnapshot.exists) {
+        const legacyCall = legacyCallSnapshot.data();
+
+        if (isActiveCall(legacyCall)) {
+          return {
+            matched: false,
+            reason: "host_unavailable",
+          };
+        }
       }
 
       clearLegacyHostReservation = true;
     }
 
-    // Create the waiting request. No room is created here.
+    // --------------------------------------------------------
+    // CREATE WAITING REQUEST
+    // --------------------------------------------------------
+
     const callData = {
       userId,
       customerUid: userId,
@@ -438,15 +595,16 @@ async function createCallRequestForHost(userId, hostId) {
       hostPayoutStatus: "pending",
     };
 
+    // --------------------------------------------------------
+    // WRITE CUSTOMER AND HOST RESERVATIONS
+    // --------------------------------------------------------
+
     transaction.create(callRef, callData);
 
-    const userUpdate = {
+    transaction.update(userRef, {
       activeCallId: callRef.id,
       updatedAt: now,
-    };
-
-    // The new request replaces only a stale reservation.
-    transaction.update(userRef, userUpdate);
+    });
 
     if (clearLegacyHostReservation) {
       transaction.update(hostRef, {
@@ -469,30 +627,38 @@ async function createCallRequestForHost(userId, hostId) {
 }
 
 // ============================================================
-// MATCH CUSTOMER TO A HOST
+// MATCH CUSTOMER TO SELECTED HOST
 // ============================================================
 
 /**
- * Creates one pending request for an available host.
+ * Creates one pending request for the selected host.
  *
  * This function deliberately does NOT:
+ *
  * - Create a LiveKit room.
  * - Attach the customer to a group room.
  * - Start the call timer.
  * - Deduct customer minutes.
  * - Pay host earnings.
  *
- * The host acceptance service is responsible for rechecking
- * capacity and attaching this existing request transactionally.
+ * Host acceptance is responsible for rechecking capacity
+ * and attaching the existing request transactionally.
  */
-export async function matchUserToHost(userId, selectedHostId) {
-  userId = requireDocumentId(userId, "Customer ID");
-  selectedHostId = requireDocumentId(selectedHostId, "Host ID");
+export async function matchUserToHost(
+  userId,
+  selectedHostId
+) {
+  userId = requireDocumentId(
+    userId,
+    "Customer ID"
+  );
 
-  // A customer-selected request must never fall back to another host.
-  // The transaction inside createCallRequestForHost rechecks the
-  // customer's account, balance, reservation and the selected host's
-  // approval/availability/schedule/capacity before creating the request.
+  selectedHostId = requireDocumentId(
+    selectedHostId,
+    "Host ID"
+  );
+
+  // Never fall back to a different host.
   const result = await createCallRequestForHost(
     userId,
     selectedHostId
@@ -501,11 +667,13 @@ export async function matchUserToHost(userId, selectedHostId) {
   if (!result.matched) {
     const unavailable = makeError(
       result.reason === "room_unavailable"
-        ? "This host's call room is currently full. Please choose another host."
+        ? "This host's call room is currently full or unavailable. Please choose another host."
         : "This host is currently unavailable. Please choose another host.",
       409
     );
+
     unavailable.retry = true;
+
     throw unavailable;
   }
 

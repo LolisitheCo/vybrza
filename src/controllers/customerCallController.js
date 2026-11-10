@@ -62,8 +62,14 @@ function timestampMillis(value) {
   return Number.isFinite(result) ? result : 0;
 }
 
+// Only expire requests that are still waiting and have
+// not been attached to a video room.
 function isExpiredRequest(call, now = Date.now()) {
-  if (call.status !== PENDING_STATUS) {
+  if (
+    call.status !== PENDING_STATUS ||
+    call.groupRoomId ||
+    call.roomId
+  ) {
     return false;
   }
 
@@ -85,40 +91,51 @@ function isTerminalCall(call) {
   );
 }
 
+// Only return approved public call information.
 function safeCallResponse(call, callId) {
   if (!call) return null;
 
   return {
     id: callId,
-
     status: call.status ?? null,
-
     hostId: call.hostId ?? null,
-
     groupRoomId: call.groupRoomId ?? null,
-
     roomId: call.roomId ?? null,
-
     roomUrl: call.roomUrl ?? null,
-
     createdAt: call.createdAt ?? null,
-
     updatedAt: call.updatedAt ?? null,
-
     startedAt: call.startedAt ?? null,
-
     endedAt: call.endedAt ?? null,
-
     durationSeconds: Number(call.durationSeconds) || 0,
-
     billableMinutes: Number(call.billableMinutes) || 0,
-
     endReason: call.endReason ?? null,
   };
 }
 
+// Never return the complete internal host document.
+function safeHostResponse(host) {
+  if (!host || typeof host !== "object") {
+    return null;
+  }
+
+  return {
+    id: host.id ?? null,
+    username: host.username ?? null,
+    displayName: host.displayName ?? null,
+    photoURL: host.photoURL ?? host.profilePicture ?? null,
+    bio: host.bio ?? null,
+    languages: Array.isArray(host.languages)
+      ? host.languages
+      : [],
+  };
+}
+
 function noStore(res) {
-  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  res.setHeader(
+    "Cache-Control",
+    "no-store, no-cache, must-revalidate"
+  );
+
   res.setHeader("Pragma", "no-cache");
 }
 
@@ -129,10 +146,10 @@ function noStore(res) {
 /**
  * POST /api/customer-calls/match
  *
- * Creates a matching request.
+ * Creates a matching request for the selected host.
  *
- * The customer remains in the waiting room until the host
- * accepts the request.
+ * The customer remains in the waiting room until
+ * the selected host accepts the request.
  */
 export async function requestCustomerCall(req, res, next) {
   try {
@@ -146,12 +163,14 @@ export async function requestCustomerCall(req, res, next) {
       );
     }
 
-    const hostId = req.body?.hostId;
+    const hostId =
+      typeof req.body?.hostId === "string"
+        ? req.body.hostId.trim()
+        : "";
 
     if (
-      typeof hostId !== "string" ||
-      !hostId.trim() ||
-      hostId.trim().length > 200 ||
+      !hostId ||
+      hostId.length > 200 ||
       hostId.includes("/") ||
       hostId.includes("\0")
     ) {
@@ -162,7 +181,11 @@ export async function requestCustomerCall(req, res, next) {
       );
     }
 
-    const result = await matchUserToHost(userId, hostId.trim());
+    // Match only the host selected by the customer.
+    const result = await matchUserToHost(
+      userId,
+      hostId
+    );
 
     noStore(res);
 
@@ -172,7 +195,7 @@ export async function requestCustomerCall(req, res, next) {
 
         message:
           result?.message ||
-          "No available host was found. Please try again shortly.",
+          "The selected host is currently unavailable. Please try again shortly.",
 
         retry: Boolean(result?.retry),
       });
@@ -188,10 +211,14 @@ export async function requestCustomerCall(req, res, next) {
         result.call.id
       ),
 
-      host: result.host ?? null,
+      host: safeHostResponse(result.host),
     });
   } catch (error) {
-    if (error.status) {
+    if (
+      Number.isInteger(error.status) &&
+      error.status >= 400 &&
+      error.status <= 499
+    ) {
       return sendError(
         res,
         error.status,
@@ -215,9 +242,8 @@ export async function requestCustomerCall(req, res, next) {
 /**
  * GET /api/customer-calls/current
  *
- * Used by the waiting room to poll the request status.
- *
- * Only returns the authenticated customer's own call.
+ * Used by the customer waiting room to retrieve
+ * the authenticated customer's current call.
  */
 export async function getCurrentCustomerCall(req, res, next) {
   try {
@@ -246,13 +272,17 @@ export async function getCurrentCustomerCall(req, res, next) {
         const user = userSnapshot.data();
         const callId = user.activeCallId;
 
-        if (!callId || typeof callId !== "string") {
+        if (
+          !callId ||
+          typeof callId !== "string"
+        ) {
           return {
             call: null,
           };
         }
 
         const callRef = callSessionsCollection.doc(callId);
+
         const callSnapshot = await transaction.get(callRef);
 
         const now = new Date();
@@ -272,7 +302,7 @@ export async function getCurrentCustomerCall(req, res, next) {
 
         const call = callSnapshot.data();
 
-        // Verify ownership before exposing any call information.
+        // Verify ownership before exposing call information.
         if (
           call.userId !== userId &&
           call.customerUid !== userId
@@ -282,7 +312,7 @@ export async function getCurrentCustomerCall(req, res, next) {
           };
         }
 
-        // Expire old waiting requests and release their reservation.
+        // Expire an old waiting request.
         if (isExpiredRequest(call, now.getTime())) {
           transaction.update(callRef, {
             status: "expired",
@@ -319,7 +349,10 @@ export async function getCurrentCustomerCall(req, res, next) {
         }
 
         return {
-          call: safeCallResponse(call, callSnapshot.id),
+          call: safeCallResponse(
+            call,
+            callSnapshot.id
+          ),
         };
       }
     );
@@ -372,16 +405,12 @@ export async function getCurrentCustomerCall(req, res, next) {
 /**
  * POST /api/customer-calls/cancel
  *
- * Only a request in "matching" status can be cancelled here.
+ * Only a request in "matching" status can be cancelled.
  *
- * Host acceptance changes matching -> matched in a Firestore
- * transaction. Cancellation changes matching -> cancelled
- * in a Firestore transaction.
+ * Host acceptance and customer cancellation both update
+ * the same call document inside Firestore transactions.
  *
- * Because both transactions update the same call document,
- * only one operation can win.
- *
- * Accepted calls must be ended through the call-ending flow.
+ * Accepted calls must use the normal call-ending flow.
  */
 export async function cancelCustomerCall(req, res, next) {
   try {
@@ -410,18 +439,23 @@ export async function cancelCustomerCall(req, res, next) {
         const user = userSnapshot.data();
         const callId = user.activeCallId;
 
-        if (!callId || typeof callId !== "string") {
+        if (
+          !callId ||
+          typeof callId !== "string"
+        ) {
           return {
             error: "no_current_call",
           };
         }
 
         const callRef = callSessionsCollection.doc(callId);
+
         const callSnapshot = await transaction.get(callRef);
 
         const now = new Date();
 
-        // The call document disappeared. Release the stale pointer.
+        // The call document disappeared.
+        // Release the stale customer pointer.
         if (!callSnapshot.exists) {
           transaction.update(userRef, {
             activeCallId: null,
@@ -435,6 +469,7 @@ export async function cancelCustomerCall(req, res, next) {
 
         const call = callSnapshot.data();
 
+        // Verify ownership.
         if (
           call.userId !== userId &&
           call.customerUid !== userId
@@ -444,7 +479,8 @@ export async function cancelCustomerCall(req, res, next) {
           };
         }
 
-        // If another operation already ended it, clean the pointer.
+        // If another operation already ended the call,
+        // clear the stale customer pointer.
         if (isTerminalCall(call)) {
           transaction.update(userRef, {
             activeCallId: null,
@@ -456,7 +492,7 @@ export async function cancelCustomerCall(req, res, next) {
           };
         }
 
-        // A request older than ten minutes expires instead.
+        // Expire old waiting requests instead of cancelling.
         if (isExpiredRequest(call, now.getTime())) {
           transaction.update(callRef, {
             status: "expired",
@@ -479,8 +515,7 @@ export async function cancelCustomerCall(req, res, next) {
           };
         }
 
-        // This is the important distinction:
-        // matching is cancellable; matched and active are not.
+        // Only matching requests can be cancelled here.
         if (call.status !== PENDING_STATUS) {
           return {
             error: "already_accepted",

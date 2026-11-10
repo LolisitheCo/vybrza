@@ -1,4 +1,3 @@
-
 import express from "express";
 import {
   AccessToken,
@@ -19,8 +18,8 @@ import {
 
 // ============================================================
 // SA LIVE — LIVEKIT ROUTES
-// Group calls: 1 host + up to 5 customers
-// Maximum participants: 6
+// One host + maximum five customers
+// Maximum participants: six
 // ============================================================
 
 const router = express.Router();
@@ -32,10 +31,12 @@ const hosts = db.collection("hosts");
 const callRooms = db.collection("callRooms");
 
 const MAX_GROUP_PARTICIPANTS = 6;
+const MAX_GROUP_CUSTOMERS = 5;
+
 const JOIN_RESERVATION_MS = 120_000;
 const TOKEN_TTL = "90s";
 
-const VALID_CALL_ID = /^[A-Za-z0-9_-]{1,150}$/;
+const VALID_ID = /^[A-Za-z0-9_-]{1,150}$/;
 
 const ACTIVE_CALL_STATUSES = new Set([
   "matched",
@@ -48,6 +49,8 @@ const ALLOWED_END_REASONS = new Set([
   "host_ended",
   "connection_lost",
   "insufficient_balance",
+  "admin_ended",
+  "system_error",
 ]);
 
 // ============================================================
@@ -60,21 +63,14 @@ function httpError(status, message) {
   return error;
 }
 
-function sendError(res, status, message) {
-  return res.status(status).json({
-    success: false,
-    message,
-  });
-}
-
-function validateCallId(value) {
+function validateId(value, fieldName = "ID") {
   if (
     typeof value !== "string" ||
-    !VALID_CALL_ID.test(value.trim())
+    !VALID_ID.test(value.trim())
   ) {
     throw httpError(
       400,
-      "A valid callId is required."
+      `A valid ${fieldName} is required.`
     );
   }
 
@@ -82,23 +78,26 @@ function validateCallId(value) {
 }
 
 function getCallId(req) {
-  return validateCallId(req.body?.callId);
+  return validateId(
+    req.body?.callId,
+    "callId"
+  );
 }
 
 function getFirebaseUid(req) {
-  const uid = req.user?.uid;
+  return validateId(
+    req.user?.uid,
+    "Firebase user ID"
+  );
+}
 
-  if (
-    typeof uid !== "string" ||
-    !uid.trim()
-  ) {
-    throw httpError(
-      401,
-      "Authentication is required."
-    );
-  }
+function noStore(res) {
+  res.setHeader(
+    "Cache-Control",
+    "no-store, no-cache, must-revalidate"
+  );
 
-  return uid.trim();
+  res.setHeader("Pragma", "no-cache");
 }
 
 // ============================================================
@@ -132,7 +131,7 @@ function getLiveKitConfig() {
     parsedUrl.hash
   ) {
     throw new Error(
-      "LIVEKIT_URL must be a valid secure LiveKit URL."
+      "LIVEKIT_URL must be a secure LiveKit URL."
     );
   }
 
@@ -143,6 +142,26 @@ function getLiveKitConfig() {
   };
 }
 
+function getRoomService() {
+  const config = getLiveKitConfig();
+
+  const parsedUrl = new URL(config.url);
+
+  if (parsedUrl.protocol === "wss:") {
+    parsedUrl.protocol = "https:";
+  }
+
+  return new RoomServiceClient(
+    parsedUrl.toString().replace(/\/+$/, ""),
+    config.apiKey,
+    config.apiSecret
+  );
+}
+
+// ============================================================
+// GENERAL HELPERS
+// ============================================================
+
 function getRoomName(call) {
   if (
     typeof call.roomId === "string" &&
@@ -151,48 +170,14 @@ function getRoomName(call) {
     return call.roomId.trim();
   }
 
+  if (call.groupRoomId) {
+    throw httpError(
+      409,
+      "The group call has no assigned LiveKit room name."
+    );
+  }
+
   return `salive-${call.id}`;
-}
-
-function getRoomService() {
-  const {
-    url,
-    apiKey,
-    apiSecret,
-  } = getLiveKitConfig();
-
-  const parsedUrl = new URL(url);
-
-  if (parsedUrl.protocol === "wss:") {
-    parsedUrl.protocol = "https:";
-  }
-
-  return new RoomServiceClient(
-    parsedUrl.toString().replace(/\/+$/, ""),
-    apiKey,
-    apiSecret
-  );
-}
-
-// ============================================================
-// GENERAL HELPERS
-// ============================================================
-
-function normalizeIds(value) {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return [
-    ...new Set(
-      value.filter(
-        (item) =>
-          typeof item === "string" &&
-          item.length > 0 &&
-          item.length <= 150
-      )
-    ),
-  ];
 }
 
 function toMillis(value) {
@@ -223,13 +208,59 @@ function isMissingRoomError(error) {
   );
 }
 
-function noStore(res) {
-  res.setHeader(
-    "Cache-Control",
-    "no-store, no-cache, must-revalidate"
-  );
+function validateRoomMembership(room) {
+  if (
+    !Array.isArray(room?.customerIds) ||
+    !Array.isArray(room?.callIds)
+  ) {
+    return false;
+  }
 
-  res.setHeader("Pragma", "no-cache");
+  const customers = room.customerIds;
+  const calls = room.callIds;
+
+  return (
+    customers.length === calls.length &&
+    customers.length <= MAX_GROUP_CUSTOMERS &&
+    customers.every(
+      (id) =>
+        typeof id === "string" &&
+        VALID_ID.test(id)
+    ) &&
+    calls.every(
+      (id) =>
+        typeof id === "string" &&
+        VALID_ID.test(id)
+    ) &&
+    new Set(customers).size === customers.length &&
+    new Set(calls).size === calls.length
+  );
+}
+
+function getMembershipIndex(room, callId, customerId) {
+  if (!validateRoomMembership(room)) {
+    return -1;
+  }
+
+  const customerIndex =
+    room.customerIds.indexOf(customerId);
+
+  const callIndex =
+    room.callIds.indexOf(callId);
+
+  if (
+    customerIndex === -1 ||
+    callIndex === -1 ||
+    customerIndex !== callIndex
+  ) {
+    return -1;
+  }
+
+  return customerIndex;
+}
+
+function noCacheResponse(res) {
+  noStore(res);
 }
 
 // ============================================================
@@ -248,6 +279,50 @@ async function getRoomParticipants(roomName) {
 
     throw error;
   }
+}
+
+async function removeLiveKitParticipant(
+  roomName,
+  identity
+) {
+  if (
+    typeof roomName !== "string" ||
+    !roomName.trim() ||
+    typeof identity !== "string" ||
+    !identity.trim()
+  ) {
+    return {
+      removed: false,
+      reason: "invalid_arguments",
+    };
+  }
+
+  const roomService = getRoomService();
+
+  const participants = await getRoomParticipants(
+    roomName
+  );
+
+  const exists = participants.some(
+    (participant) =>
+      participant.identity === identity
+  );
+
+  if (!exists) {
+    return {
+      removed: false,
+      reason: "participant_not_present",
+    };
+  }
+
+  await roomService.removeParticipant(
+    roomName,
+    identity
+  );
+
+  return {
+    removed: true,
+  };
 }
 
 // ============================================================
@@ -271,10 +346,11 @@ async function getAuthorizedCall(callId, firebaseUid) {
     ...snapshot.data(),
   };
 
-  // Support both current and legacy customer records.
+  const customerId =
+    call.userId || call.customerUid;
+
   const isCustomer =
-    call.userId === firebaseUid ||
-    call.customerUid === firebaseUid;
+    customerId === firebaseUid;
 
   let isAssignedHost = false;
   let hostData = null;
@@ -291,8 +367,8 @@ async function getAuthorizedCall(callId, firebaseUid) {
       hostData = hostSnapshot.data();
 
       isAssignedHost =
-        hostData?.firebaseUid === firebaseUid &&
-        hostData?.status === "active";
+        hostData.firebaseUid === firebaseUid &&
+        hostData.status === "active";
     }
   }
 
@@ -333,10 +409,7 @@ async function verifyGroupRoomMembership({
     !room ||
     room.id !== call.groupRoomId ||
     !room.roomName ||
-    (
-      call.roomId &&
-      call.roomId !== room.roomName
-    ) ||
+    room.roomName !== call.roomId ||
     !["waiting_host", "active"].includes(room.status) ||
     room.endedAt
   ) {
@@ -353,37 +426,42 @@ async function verifyGroupRoomMembership({
     );
   }
 
-  const customerIds = normalizeIds(room.customerIds);
-  const callIds = normalizeIds(room.callIds);
-
-  if (!callIds.includes(callId)) {
+  if (!validateRoomMembership(room)) {
     throw httpError(
-      403,
-      "This call is not assigned to the group room."
+      409,
+      "Group room membership is invalid."
     );
   }
 
-  if (
-    isCustomer &&
-    !customerIds.includes(firebaseUid)
-  ) {
-    throw httpError(
-      403,
-      "You are not a member of this group room."
-    );
+  if (isCustomer) {
+    const customerId =
+      call.userId || call.customerUid;
+
+    if (
+      customerId !== firebaseUid ||
+      getMembershipIndex(
+        room,
+        callId,
+        firebaseUid
+      ) === -1
+    ) {
+      throw httpError(
+        403,
+        "You are not a valid member of this group room."
+      );
+    }
   }
 
-  if (
-    isAssignedHost &&
-    (
+  if (isAssignedHost) {
+    if (
       !hostData?.firebaseUid ||
       hostData.firebaseUid !== firebaseUid
-    )
-  ) {
-    throw httpError(
-      403,
-      "You are not authorized to join this host room."
-    );
+    ) {
+      throw httpError(
+        403,
+        "You are not authorized to join this host room."
+      );
+    }
   }
 
   return room;
@@ -398,11 +476,13 @@ async function reserveGroupRoomSlot({
   roomName,
   identity,
   callId,
+  hostId,
   isHost,
 }) {
   const roomRef = callRooms.doc(groupRoomId);
+  const hostRef = hosts.doc(hostId);
 
-  // Read LiveKit presence before starting the Firestore transaction.
+  // Check actual LiveKit presence before the transaction.
   const liveParticipants = await getRoomParticipants(
     roomName
   );
@@ -416,9 +496,11 @@ async function reserveGroupRoomSlot({
   );
 
   return db.runTransaction(async (transaction) => {
-    const roomSnapshot = await transaction.get(
-      roomRef
-    );
+    const [roomSnapshot, hostSnapshot] =
+      await Promise.all([
+        transaction.get(roomRef),
+        transaction.get(hostRef),
+      ]);
 
     if (!roomSnapshot.exists) {
       throw httpError(
@@ -427,9 +509,18 @@ async function reserveGroupRoomSlot({
       );
     }
 
+    if (!hostSnapshot.exists) {
+      throw httpError(
+        404,
+        "Assigned host not found."
+      );
+    }
+
     const room = roomSnapshot.data();
+    const host = hostSnapshot.data();
 
     if (
+      room.hostId !== hostId ||
       room.roomName !== roomName ||
       !["waiting_host", "active"].includes(room.status) ||
       room.endedAt
@@ -440,39 +531,46 @@ async function reserveGroupRoomSlot({
       );
     }
 
-    const customerIds = normalizeIds(
-      room.customerIds
-    );
-
-    const callIds = normalizeIds(
-      room.callIds
-    );
-
-    if (!callIds.includes(callId)) {
+    if (
+      host.activeGroupRoomId !== groupRoomId
+    ) {
       throw httpError(
-        403,
-        "This call is not registered in this group room."
+        409,
+        "The host's group room reservation is invalid."
       );
     }
 
-    if (
-      !isHost &&
-      !customerIds.includes(identity)
-    ) {
+    if (!validateRoomMembership(room)) {
       throw httpError(
-        403,
-        "You are not registered in this group room."
+        409,
+        "Group room membership is invalid."
       );
     }
 
-    if (
-      isHost &&
-      room.hostId === undefined
-    ) {
-      throw httpError(
-        403,
-        "This group room has no assigned host."
-      );
+    if (isHost) {
+      if (
+        host.firebaseUid !== identity ||
+        host.status !== "active"
+      ) {
+        throw httpError(
+          403,
+          "You are not authorized to join this host room."
+        );
+      }
+    } else {
+      const membershipIndex =
+        getMembershipIndex(
+          room,
+          callId,
+          identity
+        );
+
+      if (membershipIndex === -1) {
+        throw httpError(
+          403,
+          "You are not registered in this group room."
+        );
+      }
     }
 
     const now = Date.now();
@@ -486,14 +584,9 @@ async function reserveGroupRoomSlot({
     const activeReservations =
       existingReservations.filter(
         (reservation) => {
-          if (
-            !reservation ||
-            typeof reservation.identity !== "string"
-          ) {
-            return false;
-          }
-
           return (
+            reservation &&
+            typeof reservation.identity === "string" &&
             toMillis(reservation.expiresAt) > now
           );
         }
@@ -518,7 +611,7 @@ async function reserveGroupRoomSlot({
     ) {
       throw httpError(
         409,
-        "This call room is full. Please try again shortly."
+        "This call room is full."
       );
     }
 
@@ -534,6 +627,7 @@ async function reserveGroupRoomSlot({
 
     nextReservations.push({
       identity,
+      callId: isHost ? null : callId,
       expiresAt,
     });
 
@@ -545,7 +639,8 @@ async function reserveGroupRoomSlot({
     return {
       reserved: true,
       expiresAt,
-      participantCount: occupiedIdentities.size +
+      participantCount:
+        occupiedIdentities.size +
         (alreadyCounted ? 0 : 1),
     };
   });
@@ -586,7 +681,7 @@ router.post("/token", async (req, res, next) => {
     let roomName = getRoomName(call);
 
     if (call.groupRoomId) {
-      const groupRoom =
+      const room =
         await verifyGroupRoomMembership({
           callId,
           call,
@@ -596,27 +691,27 @@ router.post("/token", async (req, res, next) => {
           hostData,
         });
 
-      roomName = groupRoom.roomName;
+      roomName = room.roomName;
 
       await reserveGroupRoomSlot({
         groupRoomId: call.groupRoomId,
         roomName,
         identity: firebaseUid,
         callId,
+        hostId: call.hostId,
         isHost: isAssignedHost,
       });
     } else {
-      // Legacy one-to-one room capacity.
       const participants =
         await getRoomParticipants(roomName);
 
-      const alreadyInRoom = participants.some(
+      const alreadyPresent = participants.some(
         (participant) =>
           participant.identity === firebaseUid
       );
 
       if (
-        !alreadyInRoom &&
+        !alreadyPresent &&
         participants.length >= 2
       ) {
         throw httpError(
@@ -632,6 +727,7 @@ router.post("/token", async (req, res, next) => {
       {
         identity: firebaseUid,
         ttl: TOKEN_TTL,
+
         metadata: JSON.stringify({
           callId,
           role: isCustomer ? "customer" : "host",
@@ -648,7 +744,7 @@ router.post("/token", async (req, res, next) => {
       canPublishData: true,
     });
 
-    noStore(res);
+    noCacheResponse(res);
 
     return res.status(200).json({
       success: true,
@@ -699,7 +795,7 @@ router.post("/start", async (req, res, next) => {
     let roomName = getRoomName(call);
 
     if (call.groupRoomId) {
-      const groupRoom =
+      const room =
         await verifyGroupRoomMembership({
           callId,
           call,
@@ -709,10 +805,9 @@ router.post("/start", async (req, res, next) => {
           hostData,
         });
 
-      roomName = groupRoom.roomName;
+      roomName = room.roomName;
     }
 
-    // Confirm actual LiveKit presence.
     const participants =
       await getRoomParticipants(roomName);
 
@@ -735,33 +830,24 @@ router.post("/start", async (req, res, next) => {
     ) {
       throw httpError(
         409,
-        "Both this customer and the assigned host must be present in the room."
+        "Both the assigned customer and host must be present in the room."
       );
     }
 
     const { url } = getLiveKitConfig();
 
-    /*
-     * callService.startCall is responsible for:
-     * - starting the customer's timer;
-     * - checking balance;
-     * - checking room membership;
-     * - marking the group room active.
-     *
-     * Do not update the group room again here.
-     */
-    const startedCall = await startCall(
+    const result = await startCall(
       callId,
       roomName,
       url
     );
 
-    noStore(res);
+    noCacheResponse(res);
 
     return res.status(200).json({
       success: true,
       message: "Call is active.",
-      call: startedCall,
+      call: result,
     });
   } catch (error) {
     return next(error);
@@ -774,20 +860,49 @@ router.post("/start", async (req, res, next) => {
 
 async function endCustomerSession(
   callId,
+  call,
+  firebaseUid,
   reason
 ) {
-  /*
-   * callService.endCall handles:
-   * - marking the session completed;
-   * - releasing the customer's reservation;
-   * - removing the call from its group room;
-   * - finalizing billing.
-   *
-   * Do not independently remove group membership here.
-   * If billing fails after the call has ended, the callService
-   * can retry billing without corrupting group membership.
-   */
-  return endCall(callId, reason);
+  const roomName = getRoomName(call);
+
+  let result;
+  let operationError;
+
+  try {
+    result = await endCall(callId, reason);
+  } catch (error) {
+    operationError = error;
+  }
+
+  // Remove only this customer from the shared room.
+  try {
+    await removeLiveKitParticipant(
+      roomName,
+      firebaseUid
+    );
+  } catch (error) {
+    console.error(
+      "[SA LIVE] Customer disconnection failed:",
+      {
+        callId,
+        message: error.message,
+      }
+    );
+
+    if (!operationError) {
+      operationError = httpError(
+        503,
+        "The call has ended, but the video connection could not be closed."
+      );
+    }
+  }
+
+  if (operationError) {
+    throw operationError;
+  }
+
+  return result;
 }
 
 // ============================================================
@@ -799,60 +914,57 @@ async function endHostGroupSession(
   callId,
   reason
 ) {
-  const roomRef = callRooms.doc(
-    call.groupRoomId
+  const groupRoomId = validateId(
+    call.groupRoomId,
+    "group room ID"
   );
+
+  const roomRef = callRooms.doc(groupRoomId);
 
   const roomSnapshot = await roomRef.get();
 
   if (!roomSnapshot.exists) {
-    const result = await endCall(
-      callId,
-      reason
+    throw httpError(
+      409,
+      "The group room document no longer exists. Manual cleanup is required."
     );
-
-    return {
-      endedCalls: [result],
-      billingFailures: [],
-    };
   }
 
   const roomData = roomSnapshot.data();
 
-  if (roomData.hostId !== call.hostId) {
+  if (
+    roomData.hostId !== call.hostId ||
+    typeof roomData.roomName !== "string" ||
+    !roomData.roomName.trim()
+  ) {
     throw httpError(
-      403,
-      "You are not assigned to this group room."
+      409,
+      "The group room assignment is invalid."
     );
   }
 
   const roomName = roomData.roomName;
 
-  if (
-    typeof roomName !== "string" ||
-    !roomName.trim()
-  ) {
+  if (!validateRoomMembership(roomData)) {
     throw httpError(
       409,
-      "The group room has no valid LiveKit room name."
+      "Group room membership is invalid."
     );
   }
 
-  const callIds = normalizeIds(
-    roomData.callIds
-  );
+  // Capture the call IDs before ending sessions.
+  const callIds = [...roomData.callIds];
 
   if (!callIds.includes(callId)) {
     callIds.push(callId);
   }
 
-  const results = [];
+  const endedCalls = [];
   const billingFailures = [];
+  const finalizationFailures = [];
 
-  /*
-   * End every customer session independently.
-   * Continue if one session has a billing error.
-   */
+  // End each customer's call independently.
+
   for (const groupCallId of callIds) {
     const groupCallSnapshot = await callSessions
       .doc(groupCallId)
@@ -866,8 +978,13 @@ async function endHostGroupSession(
 
     if (
       groupCall.hostId !== call.hostId ||
-      groupCall.groupRoomId !== call.groupRoomId
+      groupCall.groupRoomId !== groupRoomId
     ) {
+      finalizationFailures.push({
+        callId: groupCallId,
+        message: "Call does not belong to this group room.",
+      });
+
       continue;
     }
 
@@ -877,7 +994,8 @@ async function endHostGroupSession(
       ) ||
       (
         groupCall.status === "completed" &&
-        groupCall.billingStatus !== "finalized"
+        groupCall.billingStatus !== "finalized" &&
+        groupCall.billingStatus !== "not_required"
       );
 
     if (!shouldProcess) {
@@ -890,21 +1008,71 @@ async function endHostGroupSession(
         reason
       );
 
-      results.push(ended);
+      endedCalls.push(ended);
     } catch (error) {
-      billingFailures.push({
-        callId: groupCallId,
-        message:
-          typeof error?.message === "string"
-            ? error.message.slice(0, 250)
-            : "Call finalization failed.",
-      });
+      const latestSnapshot = await callSessions
+        .doc(groupCallId)
+        .get();
+
+      const latestCall = latestSnapshot.exists
+        ? latestSnapshot.data()
+        : null;
+
+      if (
+        latestCall?.status === "completed" &&
+        latestCall?.billingStatus === "pending"
+      ) {
+        billingFailures.push({
+          callId: groupCallId,
+          message:
+            String(error.message || "Billing pending").slice(0, 250),
+        });
+      } else {
+        finalizationFailures.push({
+          callId: groupCallId,
+          message:
+            String(error.message || "Call finalization failed").slice(0, 250),
+        });
+      }
     }
   }
 
+  // Do not close the room if a call failed to complete.
+
+  if (finalizationFailures.length > 0) {
+    const error = httpError(
+      503,
+      "Some customer sessions could not be finalized. The group room has not been closed."
+    );
+
+    error.details = {
+      finalizationFailures,
+      billingFailures,
+    };
+
+    throw error;
+  }
+
   /*
-   * Close the shared room and release the host reservation.
+   * If billing is pending, do not report the group as
+   * fully finalized. Calls have ended, but billing still
+   * needs retry/reconciliation.
    */
+  if (billingFailures.length > 0) {
+    const error = httpError(
+      503,
+      "The calls have ended, but some billing operations are pending."
+    );
+
+    error.details = {
+      billingFailures,
+    };
+
+    throw error;
+  }
+
+  // Close room and release host reservation.
+
   await db.runTransaction(async (transaction) => {
     const hostRef = hosts.doc(call.hostId);
 
@@ -917,51 +1085,66 @@ async function endHostGroupSession(
     ]);
 
     if (latestRoomSnapshot.exists) {
+      const latestRoom = latestRoomSnapshot.data();
+
+      if (
+        latestRoom.hostId !== call.hostId
+      ) {
+        throw httpError(
+          403,
+          "Group room ownership changed."
+        );
+      }
+
       transaction.update(roomRef, {
         status: "ended",
-        endedAt:
-          latestRoomSnapshot.data().endedAt ||
-          new Date(),
+        endedAt: latestRoom.endedAt || new Date(),
+        joinReservations: [],
         updatedAt: new Date(),
       });
     }
 
     if (
       hostSnapshot.exists &&
-      hostSnapshot.data()?.activeGroupRoomId ===
-        call.groupRoomId
+      hostSnapshot.data().activeGroupRoomId === groupRoomId
     ) {
       transaction.update(hostRef, {
         activeGroupRoomId: null,
+        activeCallId: null,
         updatedAt: new Date(),
       });
     }
   });
 
-  /*
-   * Delete the actual LiveKit room.
-   * The room document is the authoritative source for roomName.
-   */
+  // Delete the actual LiveKit room.
+
   try {
     await getRoomService().deleteRoom(roomName);
+
+    console.log(
+      "[SA LIVE] LiveKit group room deleted:",
+      groupRoomId
+    );
   } catch (error) {
     if (!isMissingRoomError(error)) {
       console.error(
-        "Could not delete ended SA LIVE LiveKit room.",
+        "[SA LIVE] LiveKit room deletion failed:",
         {
-          groupRoomId: call.groupRoomId,
-          message:
-            typeof error?.message === "string"
-              ? error.message.slice(0, 250)
-              : "Unknown LiveKit error",
+          groupRoomId,
+          message: error.message,
         }
+      );
+
+      throw httpError(
+        503,
+        "Calls have ended, but the LiveKit room could not be deleted."
       );
     }
   }
 
   return {
-    endedCalls: results,
-    billingFailures,
+    endedCalls,
+    billingFailures: [],
   };
 }
 
@@ -983,45 +1166,37 @@ router.post("/end", async (req, res, next) => {
       firebaseUid
     );
 
-    const requestedReason =
+    let reason =
       typeof req.body?.reason === "string"
         ? req.body.reason
         : "completed";
 
-    if (!ALLOWED_END_REASONS.has(requestedReason)) {
+    if (!ALLOWED_END_REASONS.has(reason)) {
       throw httpError(
         400,
         "Invalid call end reason."
       );
     }
 
-    let reason = requestedReason;
-
-    if (
-      isCustomer &&
-      reason === "host_ended"
-    ) {
+    if (isCustomer && reason === "host_ended") {
       reason = "user_ended";
     }
 
-    if (
-      isAssignedHost &&
-      reason === "user_ended"
-    ) {
+    if (isAssignedHost && reason === "user_ended") {
       reason = "host_ended";
     }
 
-    // --------------------------------------------------------
-    // CUSTOMER ENDS ONLY THEIR OWN SESSION
-    // --------------------------------------------------------
+    // CUSTOMER ENDS ONLY THEIR OWN SESSION.
 
     if (isCustomer) {
       const result = await endCustomerSession(
         callId,
+        call,
+        firebaseUid,
         reason
       );
 
-      noStore(res);
+      noCacheResponse(res);
 
       return res.status(200).json({
         success: true,
@@ -1030,9 +1205,7 @@ router.post("/end", async (req, res, next) => {
       });
     }
 
-    // --------------------------------------------------------
-    // HOST ENDS THE SHARED GROUP ROOM
-    // --------------------------------------------------------
+    // HOST ENDS THE SHARED GROUP ROOM.
 
     if (
       isAssignedHost &&
@@ -1046,7 +1219,7 @@ router.post("/end", async (req, res, next) => {
           : reason
       );
 
-      noStore(res);
+      noCacheResponse(res);
 
       return res.status(200).json({
         success: true,
@@ -1060,16 +1233,14 @@ router.post("/end", async (req, res, next) => {
       });
     }
 
-    // --------------------------------------------------------
-    // LEGACY ONE-TO-ONE HOST SESSION
-    // --------------------------------------------------------
+    // LEGACY ONE-TO-ONE HOST SESSION.
 
     const result = await endCall(
       callId,
       reason
     );
 
-    noStore(res);
+    noCacheResponse(res);
 
     return res.status(200).json({
       success: true,

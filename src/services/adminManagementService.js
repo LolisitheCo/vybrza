@@ -228,6 +228,13 @@ fail(
 );
 }
 
+if (host.activeGroupRoomId) {
+  fail(
+    409,
+    "This host has an active group room. End the group session before deactivating the host."
+  );
+}
+
 await ensureNotAdmin(firebaseUid);
 await ensureNoActiveCalls("hostId", id);
 await ensureNoPendingWithdrawals(id);

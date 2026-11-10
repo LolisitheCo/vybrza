@@ -1,6 +1,6 @@
-
 import crypto from "node:crypto";
 import { db } from "../config/firebase.js";
+import { isWithinHostSchedule } from "./hostAvailabilityService.js";
 
 // ============================================================
 // SA LIVE — GROUP ROOM SERVICE
@@ -74,26 +74,29 @@ function timestampMillis(value) {
     return value.toDate().getTime();
   }
 
-  const date = new Date(value).getTime();
+  const result = new Date(value).getTime();
 
-  return Number.isFinite(date) ? date : 0;
-}
-
-function normalizeIdArray(value) {
-  if (!Array.isArray(value)) return [];
-
-  return [...new Set(value.filter(isValidId))];
+  return Number.isFinite(result) ? result : 0;
 }
 
 function hasValidRoomMembership(room) {
+  if (
+    !Array.isArray(room?.customerIds) ||
+    !Array.isArray(room?.callIds)
+  ) {
+    return false;
+  }
+
+  const customerIds = room.customerIds;
+  const callIds = room.callIds;
+
   return (
-    Array.isArray(room.customerIds) &&
-    Array.isArray(room.callIds) &&
-    room.customerIds.every(isValidId) &&
-    room.callIds.every(isValidId) &&
-    new Set(room.customerIds).size === room.customerIds.length &&
-    new Set(room.callIds).size === room.callIds.length &&
-    room.customerIds.length === room.callIds.length
+    customerIds.length === callIds.length &&
+    customerIds.length <= MAX_GROUP_CUSTOMERS &&
+    customerIds.every(isValidId) &&
+    callIds.every(isValidId) &&
+    new Set(customerIds).size === customerIds.length &&
+    new Set(callIds).size === callIds.length
   );
 }
 
@@ -117,7 +120,7 @@ function isTerminalCall(call) {
 }
 
 function isRecentlyActive(host, now = Date.now()) {
-  const lastSeen = timestampMillis(host.lastSeenAt);
+  const lastSeen = timestampMillis(host?.lastSeenAt);
   const age = now - lastSeen;
 
   return (
@@ -151,44 +154,22 @@ function safeHost(hostId, data) {
   };
 }
 
-function getRoomMaxCustomers() {
-  return MAX_GROUP_CUSTOMERS;
-}
-
 function isValidGroupRoom(room, hostId) {
-  if (!room || room.hostId !== hostId) {
-    return false;
-  }
-
-  if (
-    typeof room.roomName !== "string" ||
-    !VALID_ROOM_NAME_PATTERN.test(room.roomName)
-  ) {
-    return false;
-  }
-
-  if (!["waiting_host", "active"].includes(room.status)) {
-    return false;
-  }
-
-  if (room.endedAt) {
-    return false;
-  }
-
-  if (!hasValidRoomMembership(room)) {
-    return false;
-  }
-
-  return true;
+  return (
+    Boolean(room) &&
+    room.hostId === hostId &&
+    typeof room.roomName === "string" &&
+    VALID_ROOM_NAME_PATTERN.test(room.roomName) &&
+    ["waiting_host", "active"].includes(room.status) &&
+    !room.endedAt &&
+    hasValidRoomMembership(room)
+  );
 }
 
 function roomHasCapacity(room, hostId) {
-  if (!isValidGroupRoom(room, hostId)) {
-    return false;
-  }
-
   return (
-    room.customerIds.length < getRoomMaxCustomers()
+    isValidGroupRoom(room, hostId) &&
+    room.customerIds.length < MAX_GROUP_CUSTOMERS
   );
 }
 
@@ -216,27 +197,11 @@ function isRequestExpired(call, now = Date.now()) {
   );
 }
 
-async function getScheduleChecker() {
-  const service = await import("./hostAvailabilityService.js");
-
-  if (typeof service.isWithinHostSchedule !== "function") {
-    throw makeError(
-      "Host availability service is not configured.",
-      500
-    );
-  }
-
-  return service.isWithinHostSchedule;
-}
-
 // ============================================================
 // HOST AVAILABILITY
 // ============================================================
 
-async function hostCanAcceptCalls(
-  host,
-  now = new Date()
-) {
+function hostCanAcceptCalls(host, now = new Date()) {
   if (!host || host.status !== "active") {
     return false;
   }
@@ -256,12 +221,8 @@ async function hostCanAcceptCalls(
     return false;
   }
 
-  const isWithinHostSchedule = await getScheduleChecker();
-
   try {
-    return Boolean(
-      await isWithinHostSchedule(host, now)
-    );
+    return isWithinHostSchedule(host, now) === true;
   } catch (error) {
     console.error(
       "[SA LIVE] Host schedule validation failed:",
@@ -291,24 +252,13 @@ export async function attachExistingCallToGroupRoom({
   callId,
   hostId,
 }) {
-  const normalizedCallId = normalizeId(
-    callId,
-    "call ID"
-  );
-
-  const normalizedHostId = normalizeId(
-    hostId,
-    "host ID"
-  );
+  const normalizedCallId = normalizeId(callId, "call ID");
+  const normalizedHostId = normalizeId(hostId, "host ID");
 
   const callRef = callSessions.doc(normalizedCallId);
 
-  const isWithinHostSchedule = await getScheduleChecker();
-
   return db.runTransaction(async (transaction) => {
-    // --------------------------------------------------------
-    // READ 1 — CALL REQUEST
-    // --------------------------------------------------------
+    // READ 1 — CALL
 
     const callSnapshot = await transaction.get(callRef);
 
@@ -330,9 +280,12 @@ export async function attachExistingCallToGroupRoom({
       };
     }
 
-    // --------------------------------------------------------
-    // IDEMPOTENT RESPONSE
-    // --------------------------------------------------------
+    const customerId = normalizeId(
+      call.userId || call.customerUid,
+      "customer ID"
+    );
+
+        // IDEMPOTENT ACCEPTANCE
 
     if (
       call.groupRoomId &&
@@ -343,10 +296,7 @@ export async function attachExistingCallToGroupRoom({
         "group room ID"
       );
 
-      const existingRoomRef = callRooms.doc(
-        existingRoomId
-      );
-
+      const existingRoomRef = callRooms.doc(existingRoomId);
       const existingRoomSnapshot = await transaction.get(
         existingRoomRef
       );
@@ -359,45 +309,78 @@ export async function attachExistingCallToGroupRoom({
         };
       }
 
-      const room = existingRoomSnapshot.data();
+      // Read customer and host reservations.
+      const userRef = users.doc(customerId);
+      const hostRef = hosts.doc(normalizedHostId);
 
-      const customerId = call.userId || call.customerUid;
+      const [userSnapshot, hostSnapshot] = await Promise.all([
+        transaction.get(userRef),
+        transaction.get(hostRef),
+      ]);
+
+      if (!userSnapshot.exists || !hostSnapshot.exists) {
+        return {
+          matched: false,
+          message: "Customer or host account not found.",
+          retry: false,
+        };
+      }
+
+      const room = existingRoomSnapshot.data();
+      const user = userSnapshot.data();
+      const host = hostSnapshot.data();
 
       if (
-        isValidGroupRoom(room, normalizedHostId) &&
-        room.customerIds.includes(customerId) &&
-        room.callIds.includes(normalizedCallId)
+        !isValidGroupRoom(room, normalizedHostId) ||
+        !room.customerIds.includes(customerId) ||
+        !room.callIds.includes(normalizedCallId) ||
+        room.customerIds.indexOf(customerId) !==
+          room.callIds.indexOf(normalizedCallId)
       ) {
         return {
-          matched: true,
-          alreadyAttached: true,
-          message: "Call is already assigned to the group room.",
+          matched: false,
+          message: "The existing group-room assignment is inconsistent.",
+          retry: false,
+        };
+      }
 
-          call: {
-            id: callSnapshot.id,
-            ...call,
-          },
+      if (user.activeCallId !== normalizedCallId) {
+        return {
+          matched: false,
+          message: "Customer call reservation is inconsistent.",
+          retry: false,
+        };
+      }
 
-          room: makeRoomResponse(
-            existingRoomSnapshot.id,
-            room,
-            room.customerIds.length
-          ),
-
+      if (host.activeGroupRoomId !== existingRoomId) {
+        return {
+          matched: false,
+          message: "Host group-room reservation is inconsistent.",
           retry: false,
         };
       }
 
       return {
-        matched: false,
-        message: "The existing group-room assignment is inconsistent.",
+        matched: true,
+        alreadyAttached: true,
+        message: "Call is already assigned to the group room.",
+
+        call: {
+          id: callSnapshot.id,
+          ...call,
+        },
+
+        room: makeRoomResponse(
+          existingRoomSnapshot.id,
+          room,
+          room.customerIds.length
+        ),
+
         retry: false,
       };
     }
 
-    // --------------------------------------------------------
-    // VALIDATE REQUEST STATUS
-    // --------------------------------------------------------
+    // REQUEST STATUS AND TIMEOUT
 
     if (
       call.status !== "matching" ||
@@ -418,11 +401,6 @@ export async function attachExistingCallToGroupRoom({
       };
     }
 
-    const customerId = normalizeId(
-      call.userId || call.customerUid,
-      "customer ID"
-    );
-
     if (customerId === normalizedHostId) {
       return {
         matched: false,
@@ -431,9 +409,7 @@ export async function attachExistingCallToGroupRoom({
       };
     }
 
-    // --------------------------------------------------------
     // READ 2 — CUSTOMER AND HOST
-    // --------------------------------------------------------
 
     const userRef = users.doc(customerId);
     const hostRef = hosts.doc(normalizedHostId);
@@ -463,9 +439,7 @@ export async function attachExistingCallToGroupRoom({
     const host = hostSnapshot.data();
     const now = new Date();
 
-    // --------------------------------------------------------
-    // CUSTOMER RESERVATION AND BALANCE
-    // --------------------------------------------------------
+    // CUSTOMER RESERVATION
 
     if (user.activeCallId !== normalizedCallId) {
       return {
@@ -496,28 +470,9 @@ export async function attachExistingCallToGroupRoom({
       };
     }
 
-    // --------------------------------------------------------
     // HOST AVAILABILITY
-    // --------------------------------------------------------
 
-    let hostAvailable = false;
-
-    try {
-      hostAvailable =
-        host.status === "active" &&
-        typeof host.firebaseUid === "string" &&
-        Boolean(host.firebaseUid.trim()) &&
-        host.acceptingCalls === true &&
-        isRecentlyActive(host, now.getTime()) &&
-        Boolean(await isWithinHostSchedule(host, now));
-    } catch (error) {
-      console.error(
-        "[SA LIVE] Host availability check failed:",
-        error.message
-      );
-    }
-
-    if (!hostAvailable) {
+    if (!hostCanAcceptCalls(host, now)) {
       return {
         matched: false,
         message: "Host is no longer available to accept calls.",
@@ -525,13 +480,7 @@ export async function attachExistingCallToGroupRoom({
       };
     }
 
-    // --------------------------------------------------------
-    // READ 3 — LEGACY ONE-TO-ONE RESERVATION
-    // --------------------------------------------------------
-
-    // Check this independently of activeGroupRoomId.
-    // A host must never have a live one-to-one call and
-    // a group room simultaneously.
+    // LEGACY ONE-TO-ONE RESERVATION
 
     if (host.activeCallId) {
       const legacyCallId = normalizeId(
@@ -539,10 +488,7 @@ export async function attachExistingCallToGroupRoom({
         "host active call ID"
       );
 
-      const legacyCallRef = callSessions.doc(
-        legacyCallId
-      );
-
+      const legacyCallRef = callSessions.doc(legacyCallId);
       const legacyCallSnapshot = await transaction.get(
         legacyCallRef
       );
@@ -559,11 +505,9 @@ export async function attachExistingCallToGroupRoom({
       }
     }
 
-    // --------------------------------------------------------
-    // READ 4 — CURRENT GROUP ROOM
-    // --------------------------------------------------------
+    // CURRENT GROUP ROOM
 
-    let roomRef = null;
+    let roomRef;
     let roomData = null;
     let createNewRoom = true;
 
@@ -576,10 +520,7 @@ export async function attachExistingCallToGroupRoom({
         "host group room ID"
       );
 
-      const existingRoomRef = callRooms.doc(
-        activeRoomId
-      );
-
+      const existingRoomRef = callRooms.doc(activeRoomId);
       const existingRoomSnapshot = await transaction.get(
         existingRoomRef
       );
@@ -595,7 +536,6 @@ export async function attachExistingCallToGroupRoom({
           };
         }
 
-        // A room can only be replaced after it has genuinely ended.
         if (
           existingRoom.status !== "ended" &&
           !existingRoom.endedAt
@@ -622,37 +562,20 @@ export async function attachExistingCallToGroupRoom({
             };
           }
 
-          if (
-            customerIds.length >= MAX_GROUP_CUSTOMERS ||
-            callIds.length >= MAX_GROUP_CUSTOMERS
-          ) {
+          if (!roomHasCapacity(existingRoom, normalizedHostId)) {
             return {
               matched: false,
-              message: "This host's group room is full. Please try another host.",
+              message: "This host's group room is full.",
               retry: true,
             };
           }
 
           roomRef = existingRoomRef;
-
-          roomData = {
-            ...existingRoom,
-            customerIds,
-            callIds,
-          };
-
+          roomData = existingRoom;
           createNewRoom = false;
         }
       }
     }
-
-    // --------------------------------------------------------
-    // LEGACY RESERVATION WITHOUT GROUP ROOM
-    // --------------------------------------------------------
-
-    // If no group room exists, the host may still have an old
-    // one-to-one reservation pointer. It was checked above.
-    // No second active call is allowed.
 
     if (createNewRoom) {
       roomRef = proposedRoomRef;
@@ -662,10 +585,7 @@ export async function attachExistingCallToGroupRoom({
       ? proposedRoomName
       : roomData.roomName;
 
-    // --------------------------------------------------------
-    // ALL TRANSACTION READS ARE COMPLETE
-    // BEGIN WRITES
-    // --------------------------------------------------------
+    // ALL READS COMPLETE — BEGIN WRITES
 
     if (createNewRoom) {
       transaction.create(roomRef, {
@@ -687,30 +607,9 @@ export async function attachExistingCallToGroupRoom({
         endedAt: null,
       });
     } else {
-      const nextCustomerIds = [
-        ...roomData.customerIds,
-        customerId,
-      ];
-
-      const nextCallIds = [
-        ...roomData.callIds,
-        normalizedCallId,
-      ];
-
-      if (
-        nextCustomerIds.length > MAX_GROUP_CUSTOMERS ||
-        nextCallIds.length > MAX_GROUP_CUSTOMERS
-      ) {
-        return {
-          matched: false,
-          message: "The group room has reached its customer limit.",
-          retry: true,
-        };
-      }
-
       transaction.update(roomRef, {
-        customerIds: nextCustomerIds,
-        callIds: nextCallIds,
+        customerIds: [...roomData.customerIds, customerId],
+        callIds: [...roomData.callIds, normalizedCallId],
         maxCustomers: MAX_GROUP_CUSTOMERS,
         maxParticipants: MAX_GROUP_PARTICIPANTS,
         updatedAt: now,
@@ -730,6 +629,11 @@ export async function attachExistingCallToGroupRoom({
       minutesAtStart: minutes,
       updatedAt: now,
     });
+
+    const nextRoom = {
+      roomName,
+      status: createNewRoom ? "waiting_host" : roomData.status,
+    };
 
     return {
       matched: true,
@@ -751,15 +655,8 @@ export async function attachExistingCallToGroupRoom({
 
       room: makeRoomResponse(
         roomRef.id,
-        {
-          roomName,
-          status: createNewRoom
-            ? "waiting_host"
-            : roomData.status,
-        },
-        createNewRoom
-          ? 1
-          : roomData.customerIds.length + 1
+        nextRoom,
+        createNewRoom ? 1 : roomData.customerIds.length + 1
       ),
 
       retry: false,
@@ -775,15 +672,8 @@ export async function cancelMatchingCallRequest({
   callId,
   userId,
 }) {
-  const normalizedCallId = normalizeId(
-    callId,
-    "call ID"
-  );
-
-  const normalizedUserId = normalizeId(
-    userId,
-    "customer ID"
-  );
+  const normalizedCallId = normalizeId(callId, "call ID");
+  const normalizedUserId = normalizeId(userId, "customer ID");
 
   const callRef = callSessions.doc(normalizedCallId);
   const userRef = users.doc(normalizedUserId);
@@ -865,14 +755,8 @@ export async function cancelMatchingCallRequest({
 // REMOVE ONE CUSTOMER FROM A GROUP ROOM
 // ============================================================
 
-export async function removeCallFromGroupRoom({
-  callId,
-}) {
-  const normalizedCallId = normalizeId(
-    callId,
-    "call ID"
-  );
-
+export async function removeCallFromGroupRoom({ callId }) {
+  const normalizedCallId = normalizeId(callId, "call ID");
   const callRef = callSessions.doc(normalizedCallId);
 
   return db.runTransaction(async (transaction) => {
@@ -881,64 +765,158 @@ export async function removeCallFromGroupRoom({
     if (!callSnapshot.exists) {
       return {
         removed: false,
-        message: "Call not found.",
+        alreadyRemoved: true,
+        message: "Call no longer exists.",
       };
     }
 
     const call = callSnapshot.data();
+
+    if (!isTerminalCall(call)) {
+      throw makeError(
+        "An active call cannot be removed from its group room.",
+        409
+      );
+    }
+
     const roomId = call.groupRoomId;
 
     if (!roomId || !isValidId(roomId)) {
       return {
         removed: false,
-        message: "Call has no valid group room.",
+        alreadyRemoved: true,
+        message: "Call has no valid group room assignment.",
       };
     }
 
+    const hostId = normalizeId(call.hostId, "host ID");
+    const customerId = normalizeId(
+      call.userId || call.customerUid,
+      "customer ID"
+    );
+
     const roomRef = callRooms.doc(roomId);
-    const hostId = call.hostId;
-    const customerId = call.userId || call.customerUid;
+    const hostRef = hosts.doc(hostId);
 
     const [roomSnapshot, hostSnapshot] = await Promise.all([
       transaction.get(roomRef),
-      hostId
-        ? transaction.get(hosts.doc(hostId))
-        : Promise.resolve(null),
+      transaction.get(hostRef),
     ]);
 
+    const host = hostSnapshot.exists
+      ? hostSnapshot.data()
+      : null;
+
+    // Helper: release only this room's host reservation.
+    const releaseHostRoomReservation = (now) => {
+      if (
+        hostSnapshot.exists &&
+        host?.activeGroupRoomId === roomId
+      ) {
+        transaction.update(hostRef, {
+          activeGroupRoomId: null,
+          updatedAt: now,
+        });
+      }
+    };
+
+    const now = new Date();
+
+    // Missing room: clear a stale host pointer.
     if (!roomSnapshot.exists) {
+      releaseHostRoomReservation(now);
+
       return {
         removed: false,
-        message: "Group room no longer exists.",
+        alreadyRemoved: true,
+        roomEnded: true,
+        hostReservationReleased:
+          host?.activeGroupRoomId === roomId,
       };
     }
 
     const room = roomSnapshot.data();
 
-    if (!isValidGroupRoom(room, hostId)) {
+    if (room.hostId !== hostId) {
+      throw makeError(
+        "Group room belongs to a different host.",
+        403
+      );
+    }
+
+    // Already-ended room: clear a stale host pointer.
+    if (room.status === "ended" || room.endedAt) {
+      releaseHostRoomReservation(now);
+
       return {
         removed: false,
-        message: "Group room membership is invalid.",
+        alreadyRemoved: true,
+        roomEnded: true,
+        hostReservationReleased:
+          host?.activeGroupRoomId === roomId,
       };
     }
 
-    const customerIds = room.customerIds;
-    const callIds = room.callIds;
+    if (!isValidGroupRoom(room, hostId)) {
+      throw makeError(
+        "Group room membership is invalid.",
+        409
+      );
+    }
 
-    const nextCustomerIds = customerIds.filter(
-      (id) => id !== customerId
-    );
+    const customerIndex = room.customerIds.indexOf(customerId);
+    const callIndex = room.callIds.indexOf(normalizedCallId);
 
-    const nextCallIds = callIds.filter(
-      (id) => id !== normalizedCallId
-    );
+    // Both entries absent: this call was already removed.
+    if (customerIndex === -1 && callIndex === -1) {
+      // Repair an empty, active room rather than leaving
+      // the host reserved against an empty room.
+      if (room.customerIds.length === 0) {
+        transaction.update(roomRef, {
+          status: "ended",
+          endedAt: now,
+          updatedAt: now,
+        });
 
-    const now = new Date();
+        releaseHostRoomReservation(now);
+
+        return {
+          removed: false,
+          alreadyRemoved: true,
+          roomEnded: true,
+          remainingCustomers: 0,
+        };
+      }
+
+      return {
+        removed: false,
+        alreadyRemoved: true,
+        roomEnded: false,
+        remainingCustomers: room.customerIds.length,
+      };
+    }
 
     if (
-      nextCustomerIds.length === 0 ||
-      nextCallIds.length === 0
+      customerIndex === -1 ||
+      callIndex === -1 ||
+      customerIndex !== callIndex
     ) {
+      throw makeError(
+        "Customer and call room membership do not match.",
+        409
+      );
+    }
+
+    const nextCustomerIds = room.customerIds.filter(
+      (_, index) => index !== customerIndex
+    );
+
+    const nextCallIds = room.callIds.filter(
+      (_, index) => index !== callIndex
+    );
+
+    // Last customer leaves: end room and release host.
+    if (nextCustomerIds.length === 0) {
       transaction.update(roomRef, {
         customerIds: [],
         callIds: [],
@@ -947,23 +925,17 @@ export async function removeCallFromGroupRoom({
         updatedAt: now,
       });
 
-      if (
-        hostSnapshot?.exists &&
-        hostSnapshot.data().activeGroupRoomId === roomId
-      ) {
-        transaction.update(hostSnapshot.ref, {
-          activeGroupRoomId: null,
-          updatedAt: now,
-        });
-      }
+      releaseHostRoomReservation(now);
 
       return {
         removed: true,
+        alreadyRemoved: false,
         roomEnded: true,
         remainingCustomers: 0,
       };
     }
 
+    // Other customers remain: keep host reserved.
     transaction.update(roomRef, {
       customerIds: nextCustomerIds,
       callIds: nextCallIds,
@@ -972,12 +944,12 @@ export async function removeCallFromGroupRoom({
 
     return {
       removed: true,
+      alreadyRemoved: false,
       roomEnded: false,
       remainingCustomers: nextCustomerIds.length,
     };
   });
 }
-
 // ============================================================
 // GET GROUP ROOM
 // ============================================================
@@ -988,9 +960,7 @@ export async function getGroupRoom(roomId) {
     "group room ID"
   );
 
-  const snapshot = await callRooms
-    .doc(normalizedRoomId)
-    .get();
+  const snapshot = await callRooms.doc(normalizedRoomId).get();
 
   if (!snapshot.exists) {
     return null;
@@ -1007,10 +977,7 @@ export async function getGroupRoom(roomId) {
 // ============================================================
 
 export async function getGroupRoomForCall(callId) {
-  const normalizedCallId = normalizeId(
-    callId,
-    "call ID"
-  );
+  const normalizedCallId = normalizeId(callId, "call ID");
 
   const callSnapshot = await callSessions
     .doc(normalizedCallId)
