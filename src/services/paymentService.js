@@ -240,7 +240,7 @@ function validatePackageIntegrity(payment) {
   );
 
   if (
-    !new Set(["payfast", "yoco"]).has(payment.provider) ||
+    payment.provider !== "stitch" ||
     payment.currency !== "ZAR" ||
     payment.packageId !== paymentPackage.id ||
     payment.amount !== paymentPackage.amount ||
@@ -248,7 +248,7 @@ function validatePackageIntegrity(payment) {
     payment.minutes !== paymentPackage.minutes
   ) {
     throw new Error(
-      "The stored payment does not match the configured package."
+      "The stored payment does not match the configured Stitch package."
     );
   }
 
@@ -280,9 +280,8 @@ export function getPaymentPackage(packageId) {
 }
 
 // ============================================================
-// CREATE PENDING PAYMENT
+// CREATE PENDING STITCH PAYMENT
 // ============================================================
-
 
 export async function createPaymentRecord({
   userId,
@@ -314,7 +313,6 @@ export async function createPaymentRecord({
   const paymentRef = paymentsCollection.doc(reference);
 
   await db.runTransaction(async (transaction) => {
-    // Read both documents before writing anything.
     const userSnapshot = await transaction.get(userRef);
     const paymentSnapshot = await transaction.get(paymentRef);
 
@@ -325,8 +323,6 @@ export async function createPaymentRecord({
     const now = new Date();
 
     if (!userSnapshot.exists) {
-      // This ID must be the authenticated Firebase UID
-      // supplied by the website's verified backend middleware.
       transaction.create(userRef, {
         uid: userId,
         email: normalizedEmail,
@@ -339,7 +335,6 @@ export async function createPaymentRecord({
         updatedAt: now,
       });
     } else {
-      // Keep an existing website user's details and balance.
       transaction.update(userRef, {
         email: userSnapshot.get("email") || normalizedEmail,
         paymentEmail: normalizedEmail,
@@ -357,9 +352,20 @@ export async function createPaymentRecord({
       currency: "ZAR",
       minutes: paymentPackage.minutes,
       email: normalizedEmail,
-      provider: "yoco",
+
+      // Stitch is the only supported payment provider.
+      provider: "stitch",
+
       status: "pending",
       credited: false,
+
+      // Stitch payment-link details are attached after
+      // the payment link has been created successfully.
+      stitchPaymentLinkId: null,
+      stitchRedirectUrl: null,
+      stitchPaymentId: null,
+      stitchWebhookEventId: null,
+
       createdAt: now,
       updatedAt: now,
     });
@@ -369,9 +375,9 @@ export async function createPaymentRecord({
     reference,
     package: paymentPackage,
     status: "pending",
+    provider: "stitch",
   };
 }
-
 
 // ============================================================
 // GET PAYMENT BY REFERENCE
@@ -400,25 +406,41 @@ export async function getPaymentByReference(reference) {
 }
 
 // ============================================================
-// YOCO CHECKOUT RECORD HELPERS
+// ATTACH STITCH PAYMENT LINK
 // ============================================================
 
-export async function attachYocoCheckout({
+export async function attachStitchPaymentLink({
   reference,
-  checkoutId,
+  paymentLinkId,
   redirectUrl,
-  processingMode,
 }) {
   reference = requirePaymentReference(reference);
-  checkoutId = requireString(checkoutId, "Yoco checkout ID", 200);
-  redirectUrl = requireString(redirectUrl, "Yoco redirect URL", 2048);
 
-  if (!/^https:\/\/c\.yoco\.com\//i.test(redirectUrl)) {
-    throw new Error("Yoco redirect URL is invalid.");
+  paymentLinkId = requireString(
+    paymentLinkId,
+    "Stitch payment link ID",
+    200
+  );
+
+  redirectUrl = requireString(
+    redirectUrl,
+    "Stitch redirect URL",
+    2048
+  );
+
+  let parsedUrl;
+
+  try {
+    parsedUrl = new URL(redirectUrl);
+  } catch {
+    throw new Error("Stitch redirect URL is invalid.");
   }
 
-  if (!new Set(["test", "live"]).has(processingMode)) {
-    throw new Error("Yoco processing mode is invalid.");
+  if (
+    parsedUrl.protocol !== "https:" ||
+    parsedUrl.hostname !== "express.stitch.money"
+  ) {
+    throw new Error("Stitch redirect URL is invalid.");
   }
 
   const paymentRef = paymentsCollection.doc(reference);
@@ -426,82 +448,64 @@ export async function attachYocoCheckout({
   await db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(paymentRef);
 
-    if (!snapshot.exists) throw new Error("Payment record was not found.");
+    if (!snapshot.exists) {
+      throw new Error("Payment record was not found.");
+    }
+
     const payment = snapshot.data();
 
-    if (payment.provider !== "yoco" || payment.status !== "pending" || payment.credited === true) {
-      throw new Error("Payment is not available for Yoco checkout.");
+    if (
+      payment.provider !== "stitch" ||
+      payment.status !== "pending" ||
+      payment.credited === true
+    ) {
+      throw new Error(
+        "Payment is not available for Stitch checkout."
+      );
     }
 
-    if (payment.yocoCheckoutId && payment.yocoCheckoutId !== checkoutId) {
-      throw new Error("A different Yoco checkout is already attached to this payment.");
+    if (
+      payment.stitchPaymentLinkId &&
+      payment.stitchPaymentLinkId !== paymentLinkId
+    ) {
+      throw new Error(
+        "A different Stitch payment link is already attached to this payment."
+      );
     }
 
     transaction.update(paymentRef, {
-      yocoCheckoutId: checkoutId,
-      yocoRedirectUrl: redirectUrl,
-      yocoProcessingMode: processingMode,
+      stitchPaymentLinkId: paymentLinkId,
+      stitchRedirectUrl: redirectUrl,
+      stitchLinkCreatedAt: new Date(),
       updatedAt: new Date(),
     });
   });
 
-  return { reference, checkoutId, redirectUrl, processingMode };
-}
-
-export async function getPaymentByYocoCheckoutId(checkoutId) {
-  if (typeof checkoutId !== "string" || !checkoutId.trim() || checkoutId.length > 200) {
-    return null;
-  }
-
-  const snapshot = await paymentsCollection
-    .where("yocoCheckoutId", "==", checkoutId.trim())
-    .limit(1)
-    .get();
-
-  if (snapshot.empty) return null;
-  const doc = snapshot.docs[0];
-  return { id: doc.id, ...doc.data() };
-}
-
-export async function markYocoPaymentFailed(checkoutId, eventId) {
-  const payment = await getPaymentByYocoCheckoutId(checkoutId);
-  if (!payment) return { found: false };
-
-  const paymentRef = paymentsCollection.doc(payment.reference);
-  return db.runTransaction(async (transaction) => {
-    const snapshot = await transaction.get(paymentRef);
-    if (!snapshot.exists) return { found: false };
-    const current = snapshot.data();
-
-    // A late failure notification must never reverse a completed payment.
-    if (current.credited === true || current.status === "complete") {
-      return { found: true, alreadyComplete: true };
-    }
-    if (current.status !== "pending" || current.provider !== "yoco") {
-      return { found: true, unchanged: true };
-    }
-
-    transaction.update(paymentRef, {
-      status: "failed",
-      failedAt: new Date(),
-      yocoFailureEventId: typeof eventId === "string" ? eventId : null,
-      updatedAt: new Date(),
-    });
-    return { found: true, failed: true };
-  });
+  return {
+    reference,
+    paymentLinkId,
+    redirectUrl,
+    provider: "stitch",
+  };
 }
 
 // ============================================================
-// CREDIT VERIFIED PAYMENT ONCE (YOCO OR LEGACY PAYFAST)
+// CREDIT VERIFIED STITCH PAYMENT ONCE
 // ============================================================
 //
-// Call only after the backend has verified the provider webhook,
-// including its signature, payment status, amount and reference.
-// Never credit minutes just because the customer returns to
-// the website or opens a Telegram payment link.
+// Call only after the backend has:
+// 1. Verified the Stitch Svix webhook signature.
+// 2. Retrieved the payment link from Stitch.
+// 3. Retrieved the payment from Stitch.
+// 4. Verified payment status, amount and reference.
+//
+// Never credit minutes based only on a browser redirect.
 // ============================================================
 
-export async function creditSuccessfulPayment(reference, metadata = {}) {
+export async function creditSuccessfulPayment(
+  reference,
+  metadata = {}
+) {
   reference = requirePaymentReference(reference);
 
   const paymentRef = paymentsCollection.doc(reference);
@@ -514,6 +518,12 @@ export async function creditSuccessfulPayment(reference, metadata = {}) {
     }
 
     const payment = paymentSnapshot.data();
+
+    if (payment.provider !== "stitch") {
+      throw new Error(
+        "Payment provider does not match Stitch."
+      );
+    }
 
     if (payment.credited === true) {
       if (payment.status !== "complete") {
@@ -575,8 +585,22 @@ export async function creditSuccessfulPayment(reference, metadata = {}) {
       status: "complete",
       credited: true,
       creditedAt: now,
-      yocoPaymentId: typeof metadata.paymentId === "string" ? metadata.paymentId : null,
-      yocoWebhookEventId: typeof metadata.eventId === "string" ? metadata.eventId : null,
+
+      stitchPaymentId:
+        typeof metadata.paymentId === "string"
+          ? metadata.paymentId
+          : null,
+
+      stitchWebhookEventId:
+        typeof metadata.eventId === "string"
+          ? metadata.eventId
+          : null,
+
+      stitchPaymentLinkId:
+        typeof metadata.paymentLinkId === "string"
+          ? metadata.paymentLinkId
+          : payment.stitchPaymentLinkId || null,
+
       updatedAt: now,
     });
 

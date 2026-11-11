@@ -5,124 +5,37 @@ import {
   getPaymentPackage,
   createPaymentRecord,
   getPaymentByReference,
+  attachStitchPaymentLink,
   creditSuccessfulPayment,
-  attachYocoCheckout,
-  getPaymentByYocoCheckoutId,
-  markYocoPaymentFailed,
 } from "../services/paymentService.js";
 
 import {
-  initializePayfastTransaction,
-} from "../services/payfastService.js";
-import { createYocoCheckout } from "../services/yocoService.js";
+  createStitchPaymentLink,
+  getStitchPayment,
+  getStitchPaymentLink,
+} from "../services/stitchService.js";
 
 // ============================================================
-// CONFIGURATION
+// SA LIVE — STITCH EXPRESS PAYMENT CONTROLLER
+// Stitch Express is the only supported payment provider.
 // ============================================================
-
-const PAYFAST_HOSTS = Object.freeze({
-  live: "www.payfast.co.za",
-  sandbox: "sandbox.payfast.co.za",
-});
 
 const PAYMENT_REFERENCE_PATTERN = /^SALIVE-[A-F0-9]{32}$/;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const MAX_ITN_FIELDS = 100;
-const REQUEST_TIMEOUT_MS = 15000;
+const MAX_EMAIL_LENGTH = 254;
 
-const PAYFAST_SOURCE_RANGES = Object.freeze([
-  "197.97.145.144/28",
-  "41.74.179.192/27",
-  "102.216.36.0/28",
-  "102.216.36.128/28",
-  "144.126.193.139/32",
-]);
-
-
-function getPassphrase() {
-  const mode = (
-    process.env.PAYFAST_MODE || "live"
-  ).trim().toLowerCase();
-
-  if (mode !== "live" && mode !== "sandbox") {
-    throw new Error("PAYFAST_MODE must be live or sandbox.");
-  }
-
-  const variableName =
-    mode === "sandbox"
-      ? "PAYFAST_SANDBOX_PASSPHRASE"
-      : process.env.PAYFAST_LIVE_PASSPHRASE
-        ? "PAYFAST_LIVE_PASSPHRASE"
-        : "PAYFAST_PASSPHRASE";
-
-  const value = process.env[variableName];
-
-  if (
-    typeof value !== "string" ||
-    value.length === 0 ||
-    value !== value.trim() ||
-    value.length > 32
-  ) {
-    throw new Error(
-      `${variableName} is missing or invalid.`
-    );
-  }
-
-  return value;
-}
-
-
-
-function getMerchantId() {
-  const mode = (
-    process.env.PAYFAST_MODE || "live"
-  ).trim().toLowerCase();
-
-  if (mode !== "live" && mode !== "sandbox") {
-    throw new Error("PAYFAST_MODE must be live or sandbox.");
-  }
-
-  const variableName =
-    mode === "sandbox"
-      ? "PAYFAST_SANDBOX_MERCHANT_ID"
-      : process.env.PAYFAST_LIVE_MERCHANT_ID
-        ? "PAYFAST_LIVE_MERCHANT_ID"
-        : "PAYFAST_MERCHANT_ID";
-
-  const merchantId = process.env[variableName];
-
-  if (
-    typeof merchantId !== "string" ||
-    !/^\d{8}$/.test(merchantId.trim())
-  ) {
-    throw new Error(`${variableName} is missing or invalid.`);
-  }
-
-  return merchantId.trim();
-}
-
-
+const WEBHOOK_TOLERANCE_SECONDS = 300;
 
 // ============================================================
 // AUTHENTICATION HELPERS
 // ============================================================
-
-/*
- * Authentication middleware must establish the identity from
- * a verified session, Firebase token, or verified Telegram
- * identity. Never establish identity from an arbitrary body ID.
- *
- * Adapt the property names here to match your existing,
- * trusted authentication middleware.
- */
-
 
 function getAuthenticatedUserId(req) {
   const uid = req.user?.uid;
 
   if (
     typeof uid !== "string" ||
-    uid.trim().length === 0 ||
+    !uid.trim() ||
     uid.length > 128
   ) {
     return null;
@@ -131,9 +44,8 @@ function getAuthenticatedUserId(req) {
   return uid.trim();
 }
 
-
 function isPaymentOwner(payment, userId) {
-  return (
+  return Boolean(
     payment &&
     userId &&
     String(payment.userId) === userId
@@ -141,7 +53,74 @@ function isPaymentOwner(payment, userId) {
 }
 
 // ============================================================
-// HTTP RESPONSE HELPERS
+// INPUT VALIDATION
+// ============================================================
+
+function isValidReference(reference) {
+  return (
+    typeof reference === "string" &&
+    PAYMENT_REFERENCE_PATTERN.test(reference)
+  );
+}
+
+function isValidEmail(email) {
+  return (
+    typeof email === "string" &&
+    email.length <= MAX_EMAIL_LENGTH &&
+    email === email.trim() &&
+    EMAIL_PATTERN.test(email)
+  );
+}
+
+function validateStoredPayment(payment, reference) {
+  if (
+    !payment ||
+    payment.reference !== reference ||
+    payment.provider !== "stitch" ||
+    payment.currency !== "ZAR" ||
+    payment.status !== "pending" ||
+    payment.credited === true
+  ) {
+    return false;
+  }
+
+  const paymentPackage = getPaymentPackage(payment.packageId);
+
+  if (!paymentPackage) {
+    return false;
+  }
+
+  return (
+    payment.amount === paymentPackage.amount &&
+    payment.minutes === paymentPackage.minutes &&
+    payment.amountCents ===
+      Math.round(paymentPackage.amount * 100)
+  );
+}
+
+// ============================================================
+// CHECKOUT CREATION
+// ============================================================
+
+async function createCheckoutForPayment(payment) {
+  const checkout = await createStitchPaymentLink({
+    reference: payment.reference,
+    amountCents: payment.amountCents,
+    email: payment.email,
+    payerName: "SA LIVE Customer",
+  });
+
+  await attachStitchPaymentLink({
+    reference: payment.reference,
+    paymentLinkId: checkout.paymentLinkId,
+    redirectUrl: checkout.redirectUrl,
+  });
+
+  return checkout;
+}
+
+// ============================================================
+// HTML RESPONSE HELPERS
 // ============================================================
 
 function setSecurityHeaders(res) {
@@ -213,7 +192,7 @@ function renderPaymentPage({
     <h1>${escapeHtml(heading)}</h1>
     <p>${escapeHtml(message)}</p>
     ${minutesHtml}
-    <p>You can return to Telegram.</p>
+    <p>You can return to SA LIVE.</p>
   </main>
 </body>
 </html>`;
@@ -229,266 +208,125 @@ function sendPaymentPage(res, statusCode, page) {
 }
 
 // ============================================================
-// INPUT VALIDATION
+// INITIALIZE A NEW PAYMENT
 // ============================================================
 
-function isValidReference(reference) {
-  return (
-    typeof reference === "string" &&
-    PAYMENT_REFERENCE_PATTERN.test(reference)
-  );
-}
-
-function isValidEmail(email) {
-  return (
-    typeof email === "string" &&
-    email.length <= 254 &&
-    email === email.trim() &&
-    EMAIL_PATTERN.test(email)
-  );
-}
-
-function isScalarPayfastField(value) {
-  return (
-    typeof value === "string" ||
-    (typeof value === "number" &&
-      Number.isFinite(value))
-  );
-}
-
-// ============================================================
-// PAYFAST SIGNATURE VERIFICATION
-// ============================================================
-
-/*
- * PayFast-compatible URL encoding.
- * Spaces must become "+" and special characters must use
- * uppercase percent-encoding.
- */
-function payfastEncode(value) {
-  return encodeURIComponent(String(value))
-    .replace(/%20/g, "+")
-    .replace(/[!'()*]/g, (character) =>
-      `%${character.charCodeAt(0).toString(16).toUpperCase()}`
-    );
-}
-
-
-
-function getPayfastMode() {
-  const mode = (
-    process.env.PAYFAST_MODE || "live"
-  ).trim().toLowerCase();
-
-  if (mode !== "live" && mode !== "sandbox") {
-    throw new Error(
-      "PAYFAST_MODE must be either live or sandbox."
-    );
-  }
-
-  return mode;
-}
-
-
-
-function buildPayfastParameterString(
-  fields,
-  includePassphrase = true
-) {
-  const parts = [];
-
-  for (const [key, value] of Object.entries(fields)) {
-    // PayFast's ITN format ends at the signature field.
-    if (key === "signature") {
-      break;
-    }
-
-    if (!/^[a-zA-Z0-9_]+$/.test(key)) {
-      throw new Error("Invalid PayFast parameter name.");
-    }
-
-    if (!isScalarPayfastField(value)) {
-      throw new Error("Invalid PayFast parameter value.");
-    }
-
-    // Preserve blank values in ITN notifications.
-    // Encode values using PayFast-compatible URL encoding.
-    parts.push(`${key}=${payfastEncode(value)}`);
-  }
-
-  let parameterString = parts.join("&");
-
-  if (includePassphrase) {
-    parameterString +=
-      `${parameterString ? "&" : ""}passphrase=${payfastEncode(getPassphrase())}`;
-  }
-
-  return parameterString;
-}
-
-
-
-function verifyPayfastSignature(fields) {
+export async function initializePayment(req, res) {
   try {
-    const receivedSignature = fields.signature;
+    const authenticatedUserId =
+      getAuthenticatedUserId(req);
+
+    if (!authenticatedUserId) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication is required.",
+      });
+    }
+
+    const {
+      userId,
+      packageId,
+      email,
+    } = req.body ?? {};
+
+    // Never allow the request body to choose another user.
+    if (
+      userId !== undefined &&
+      String(userId) !== authenticatedUserId
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "User identity mismatch.",
+      });
+    }
 
     if (
-      typeof receivedSignature !== "string" ||
-      !/^[a-f0-9]{32}$/i.test(receivedSignature)
+      typeof packageId !== "string" ||
+      packageId.length > 64 ||
+      !/^[a-zA-Z0-9_-]+$/.test(packageId)
     ) {
-      return false;
+      return res.status(400).json({
+        success: false,
+        message: "Invalid payment package.",
+      });
     }
 
-    const parameterString =
-      buildPayfastParameterString(fields, true);
+    if (!isValidEmail(email)) {
+      return res.status(400).json({
+        success: false,
+        message: "A valid email address is required.",
+      });
+    }
 
-    const expectedSignature = crypto
-      .createHash("md5")
-      .update(parameterString, "utf8")
-      .digest("hex");
+    const paymentPackage = getPaymentPackage(packageId);
 
-    const actual = Buffer.from(receivedSignature, "hex");
-    const expected = Buffer.from(expectedSignature, "hex");
+    if (
+      !paymentPackage ||
+      !Number.isFinite(Number(paymentPackage.amount)) ||
+      paymentPackage.amount <= 0 ||
+      !Number.isSafeInteger(paymentPackage.minutes) ||
+      paymentPackage.minutes <= 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid payment package.",
+      });
+    }
 
-    console.info("PayFast signature comparison:", {
-  receivedMatchesCalculated:
-    receivedSignature.toLowerCase() === expectedSignature,
-  receivedSignatureLength: receivedSignature.length,
-  calculatedSignatureLength: expectedSignature.length,
-  fieldOrder: Object.keys(fields).filter(
-    (key) => key !== "signature"
-  ),
-  mode: getPayfastMode(),
-});
+    const reference =
+      `SALIVE-${crypto.randomUUID()
+        .replace(/-/g, "")
+        .toUpperCase()}`;
 
-    return (
-      actual.length === expected.length &&
-      crypto.timingSafeEqual(actual, expected)
-    );
+    // Create the trusted pending Firestore record first.
+    await createPaymentRecord({
+      userId: authenticatedUserId,
+      reference,
+      packageId: paymentPackage.id,
+      email: email.toLowerCase(),
+    });
+
+    const payment = await getPaymentByReference(reference);
+
+    if (!payment || payment.provider !== "stitch") {
+      throw new Error(
+        "Stitch payment record was not created correctly."
+      );
+    }
+
+    const checkout = await createCheckoutForPayment(payment);
+
+    return res.status(200).json({
+      success: true,
+      message: "Stitch checkout created.",
+      payment: {
+        reference,
+        packageId: paymentPackage.id,
+        packageName: paymentPackage.name,
+        amount: paymentPackage.amount,
+        amountCents: checkout.amountCents,
+        currency: "ZAR",
+        minutes: paymentPackage.minutes,
+        redirectUrl: checkout.redirectUrl,
+        provider: "stitch",
+      },
+    });
   } catch (error) {
     console.error(
-      "PayFast signature verification setup failed:",
+      "Initialize Stitch payment failed:",
       error.message
     );
-    return false;
+
+    return res.status(500).json({
+      success: false,
+      message:
+        "Unable to initialize checkout. Please try again.",
+    });
   }
 }
 
 // ============================================================
-// PAYFAST SOURCE IP VALIDATION
-// ============================================================
-
-function ipv4ToNumber(ip) {
-  const parts = ip.split(".");
-
-  if (
-    parts.length !== 4 ||
-    parts.some(
-      (part) =>
-        !/^\d{1,3}$/.test(part) ||
-        Number(part) > 255
-    )
-  ) {
-    return null;
-  }
-
-  return parts.reduce(
-    (result, part) =>
-      ((result << 8) | Number(part)) >>> 0,
-    0
-  );
-}
-
-function isIPv4InCidr(ip, cidr) {
-  const [network, prefixText] = cidr.split("/");
-  const addressNumber = ipv4ToNumber(ip);
-  const networkNumber = ipv4ToNumber(network);
-  const prefix = Number(prefixText);
-
-  if (
-    addressNumber === null ||
-    networkNumber === null ||
-    !Number.isInteger(prefix) ||
-    prefix < 0 ||
-    prefix > 32
-  ) {
-    return false;
-  }
-
-  const mask =
-    prefix === 0
-      ? 0
-      : (0xffffffff << (32 - prefix)) >>> 0;
-
-  return (
-    ((addressNumber & mask) >>> 0) ===
-    ((networkNumber & mask) >>> 0)
-  );
-}
-
-function normalizeRemoteAddress(address) {
-  if (typeof address !== "string") {
-    return "";
-  }
-
-  const normalized = address.trim();
-
-  if (normalized.startsWith("::ffff:")) {
-    return normalized.slice(7);
-  }
-
-  return normalized;
-}
-
-function isPayfastSourceIp(ip) {
-  const address = normalizeRemoteAddress(ip);
-
-  return PAYFAST_SOURCE_RANGES.some((range) =>
-    isIPv4InCidr(address, range)
-  );
-}
-
-// ============================================================
-// PAYFAST SERVER-TO-SERVER ITN VALIDATION
-// ============================================================
-
-async function validatePayfastWithServer(fields) {
-  const mode = getPayfastMode();
-  const host = PAYFAST_HOSTS[mode];
-
-  const parameterString =
-    buildPayfastParameterString(fields, false);
-
-  const response = await fetch(
-    `https://${host}/eng/query/validate`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type":
-          "application/x-www-form-urlencoded",
-        Accept: "text/plain",
-      },
-      body: parameterString,
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      redirect: "error",
-    }
-  );
-
-  if (!response.ok) {
-    throw new Error(
-      `PayFast validation returned HTTP ${response.status}.`
-    );
-  }
-
-  const responseText = (
-    await response.text()
-  ).trim();
-
-  return responseText === "VALID";
-}
-
-// ============================================================
-// INITIALIZE PAYMENT
+// RECREATE OR RETURN AN EXISTING CHECKOUT
 // ============================================================
 
 export async function initializeExistingPaymentCheckout(req, res) {
@@ -502,96 +340,44 @@ export async function initializeExistingPaymentCheckout(req, res) {
       });
     }
 
-    
-const authenticatedUserId = getAuthenticatedUserId(req);
+    const authenticatedUserId =
+      getAuthenticatedUserId(req);
 
-if (!authenticatedUserId) {
-  return res.status(401).json({
-    success: false,
-    message: "Authentication is required.",
-  });
-}
-
-const payment = await getPaymentByReference(reference);
-
-if (
-  !payment ||
-  String(payment.userId) !== authenticatedUserId
-) {
-  return res.status(404).json({
-    success: false,
-    message: "Payment not found.",
-  });
-}
-
-
-    if (payment.provider === "yoco") {
-      if (
-        payment.reference !== reference ||
-        payment.currency !== "ZAR" ||
-        payment.status !== "pending" ||
-        payment.credited === true
-      ) {
-        return res.status(409).json({ success: false, message: "This payment is no longer available for checkout." });
-      }
-
-      if (payment.yocoRedirectUrl && payment.yocoCheckoutId) {
-        return res.status(200).json({
-          success: true,
-          redirectUrl: payment.yocoRedirectUrl,
-          reference,
-        });
-      }
-
-      const paymentPackage = getPaymentPackage(payment.packageId);
-      if (!paymentPackage || payment.amountCents !== Math.round(paymentPackage.amount * 100)) {
-        return res.status(409).json({ success: false, message: "The stored payment details could not be verified." });
-      }
-
-      const checkout = await createYocoCheckout({
-        reference,
-        amountCents: payment.amountCents,
-        packageId: payment.packageId,
-        packageName: payment.packageName,
-        userId: authenticatedUserId,
+    if (!authenticatedUserId) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication is required.",
       });
-      await attachYocoCheckout({
-        reference,
-        checkoutId: checkout.checkoutId,
-        redirectUrl: checkout.redirectUrl,
-        processingMode: checkout.processingMode,
-      });
-
-      return res.status(200).json({ success: true, redirectUrl: checkout.redirectUrl, reference });
     }
 
-    if (
-      payment.reference !== reference ||
-      payment.provider !== "payfast" ||
-      payment.currency !== "ZAR" ||
-      payment.status !== "pending" ||
-      payment.credited === true
-    ) {
+    const payment =
+      await getPaymentByReference(reference);
+
+    if (!isPaymentOwner(payment, authenticatedUserId)) {
+      return res.status(404).json({
+        success: false,
+        message: "Payment not found.",
+      });
+    }
+
+    if (!validateStoredPayment(payment, reference)) {
       return res.status(409).json({
         success: false,
         message:
-          "This payment is no longer available for checkout. Check your balance in Telegram.",
+          "This payment is no longer available for checkout.",
       });
     }
 
-    const paymentPackage = getPaymentPackage(payment.packageId);
-
+    // Reuse the same pending payment link when available.
     if (
-      !paymentPackage ||
-      payment.amount !== paymentPackage.amount ||
-      payment.minutes !== paymentPackage.minutes ||
-      payment.amountCents !== Math.round(paymentPackage.amount * 100)
+      typeof payment.stitchPaymentLinkId === "string" &&
+      typeof payment.stitchRedirectUrl === "string"
     ) {
-      console.error("Stored payment package mismatch:", reference);
-
-      return res.status(409).json({
-        success: false,
-        message: "The stored payment details could not be verified.",
+      return res.status(200).json({
+        success: true,
+        provider: "stitch",
+        reference,
+        redirectUrl: payment.stitchRedirectUrl,
       });
     }
 
@@ -599,127 +385,28 @@ if (
       return res.status(409).json({
         success: false,
         message:
-          "A valid payment email is missing. Please update your email in Telegram.",
+          "A valid payment email is missing. Please update your email.",
       });
     }
 
-    const checkout = await initializePayfastTransaction({
-      email: payment.email,
-      amount: paymentPackage.amount,
-      reference,
-      metadata: {
-        custom_str1: paymentPackage.id,
-      },
-    });
-
-    const expectedHost = PAYFAST_HOSTS[getPayfastMode()];
-    const checkoutUrl = new URL(checkout.paymentUrl);
-
-    if (
-      checkoutUrl.protocol !== "https:" ||
-      checkoutUrl.hostname !== expectedHost ||
-      !checkout.fields ||
-      typeof checkout.fields !== "object" ||
-      Array.isArray(checkout.fields)
-    ) {
-      throw new Error("Invalid PayFast checkout response.");
-    }
-
-    // Ensure the signed fields match this existing payment.
-    if (
-      checkout.fields.m_payment_id !== reference ||
-      Number(checkout.fields.amount) !== paymentPackage.amount ||
-      checkout.fields.email_address !== payment.email
-    ) {
-      throw new Error("PayFast fields do not match the stored payment.");
-    }
+    const checkout = await createCheckoutForPayment(payment);
 
     return res.status(200).json({
       success: true,
-      paymentUrl: checkout.paymentUrl,
-      fields: checkout.fields,
+      provider: "stitch",
+      reference,
+      redirectUrl: checkout.redirectUrl,
     });
   } catch (error) {
     console.error(
-      "Existing PayFast checkout failed:",
+      "Existing Stitch checkout failed:",
       error.message
     );
 
     return res.status(500).json({
       success: false,
-      message: "Unable to prepare checkout. Please try again shortly.",
-    });
-  }
-}
-
-
-
-export async function initializePayment(req, res) {
-  try {
-    const authenticatedUserId = getAuthenticatedUserId(req);
-    if (!authenticatedUserId) {
-      return res.status(401).json({ success: false, message: "Authentication is required." });
-    }
-
-    const { userId, packageId, email } = req.body ?? {};
-    if (userId !== undefined && String(userId) !== authenticatedUserId) {
-      return res.status(403).json({ success: false, message: "User identity mismatch." });
-    }
-    if (typeof packageId !== "string" || packageId.length > 64 || !/^[a-zA-Z0-9_-]+$/.test(packageId)) {
-      return res.status(400).json({ success: false, message: "Invalid payment package." });
-    }
-    if (!isValidEmail(email)) {
-      return res.status(400).json({ success: false, message: "A valid email address is required." });
-    }
-
-    const paymentPackage = getPaymentPackage(packageId);
-    if (!paymentPackage || !Number.isFinite(Number(paymentPackage.amount)) || paymentPackage.amount <= 0) {
-      return res.status(400).json({ success: false, message: "Invalid payment package." });
-    }
-
-    const reference = `SALIVE-${crypto.randomUUID().replace(/-/g, "").toUpperCase()}`;
-    await createPaymentRecord({
-      userId: authenticatedUserId,
-      reference,
-      packageId: paymentPackage.id,
-      email: email.toLowerCase(),
-    });
-
-    const checkout = await createYocoCheckout({
-      reference,
-      amountCents: Math.round(paymentPackage.amount * 100),
-      packageId: paymentPackage.id,
-      packageName: paymentPackage.name,
-      userId: authenticatedUserId,
-    });
-
-    await attachYocoCheckout({
-      reference,
-      checkoutId: checkout.checkoutId,
-      redirectUrl: checkout.redirectUrl,
-      processingMode: checkout.processingMode,
-    });
-
-    return res.status(200).json({
-      success: true,
-      message: "Yoco checkout created.",
-      payment: {
-        reference,
-        packageId: paymentPackage.id,
-        packageName: paymentPackage.name,
-        amount: paymentPackage.amount,
-        amountCents: checkout.amountCents,
-        currency: "ZAR",
-        minutes: paymentPackage.minutes,
-        redirectUrl: checkout.redirectUrl,
-        processingMode: checkout.processingMode,
-      },
-    });
-  } catch (error) {
-    console.error("Initialize Yoco payment failed:", error.message);
-    return res.status(500).json({
-      success: false,
-      message: "Unable to initialize Yoco checkout. Please try again.",
+      message:
+        "Unable to prepare checkout. Please try again shortly.",
     });
   }
 }
@@ -752,13 +439,6 @@ export async function verifyPayment(req, res) {
     const payment =
       await getPaymentByReference(reference);
 
-    if (!payment) {
-      return res.status(404).json({
-        success: false,
-        message: "Payment record not found.",
-      });
-    }
-
     if (!isPaymentOwner(payment, authenticatedUserId)) {
       return res.status(404).json({
         success: false,
@@ -770,6 +450,7 @@ export async function verifyPayment(req, res) {
       success: true,
       payment: {
         reference: payment.reference,
+        provider: payment.provider,
         status: payment.status,
         credited: payment.credited === true,
         minutes: payment.minutes,
@@ -791,322 +472,267 @@ export async function verifyPayment(req, res) {
 }
 
 // ============================================================
-// YOCO WEBHOOK — SIGNATURE VERIFIED, RAW BODY REQUIRED
+// STITCH WEBHOOK SIGNATURE VERIFICATION
+// Svix signature + raw request body
 // ============================================================
 
-function verifyYocoWebhookSignature(req) {
-  const secret = process.env.YOCO_WEBHOOK_SECRET;
+function verifyStitchWebhookSignature(req) {
+  const secret = process.env.STITCH_WEBHOOK_SECRET;
   const rawBody = req.rawBody;
-  const webhookId = req.headers["webhook-id"];
-  const timestamp = req.headers["webhook-timestamp"];
-  const signatureHeader = req.headers["webhook-signature"];
+
+  const webhookId = req.headers["svix-id"];
+  const timestamp = req.headers["svix-timestamp"];
+  const signatureHeader = req.headers["svix-signature"];
 
   if (
-    typeof secret !== "string" || !secret.startsWith("whsec_") ||
+    typeof secret !== "string" ||
+    !secret.startsWith("whsec_") ||
     !Buffer.isBuffer(rawBody) ||
-    typeof webhookId !== "string" || !webhookId ||
-    typeof timestamp !== "string" || !/^\d+$/.test(timestamp) ||
+    typeof webhookId !== "string" ||
+    !webhookId ||
+    typeof timestamp !== "string" ||
+    !/^\d+$/.test(timestamp) ||
     typeof signatureHeader !== "string"
-  ) return false;
+  ) {
+    return false;
+  }
 
-  const timestampMs = Number(timestamp) * 1000;
-  if (!Number.isFinite(timestampMs) || Math.abs(Date.now() - timestampMs) > 180000) return false;
+  const timestampSeconds = Number(timestamp);
+
+  if (
+    !Number.isSafeInteger(timestampSeconds) ||
+    Math.abs(
+      Math.floor(Date.now() / 1000) - timestampSeconds
+    ) > WEBHOOK_TOLERANCE_SECONDS
+  ) {
+    return false;
+  }
 
   let secretBytes;
+
   try {
-    secretBytes = Buffer.from(secret.slice("whsec_".length), "base64");
+    secretBytes = Buffer.from(
+      secret.slice("whsec_".length),
+      "base64"
+    );
   } catch {
     return false;
   }
-  if (!secretBytes.length) return false;
+
+  if (!secretBytes.length) {
+    return false;
+  }
 
   const signedContent = Buffer.concat([
-    Buffer.from(`${webhookId}.${timestamp}.`, "utf8"),
+    Buffer.from(
+      `${webhookId}.${timestamp}.`,
+      "utf8"
+    ),
     rawBody,
   ]);
-  const expected = crypto.createHmac("sha256", secretBytes).update(signedContent).digest("base64");
 
-  return signatureHeader.split(" ").some((part) => {
-    const [version, value] = part.split(",", 2);
-    if (version !== "v1" || !value) return false;
-    const a = Buffer.from(value);
-    const b = Buffer.from(expected);
-    return a.length === b.length && crypto.timingSafeEqual(a, b);
-  });
+  const expectedSignature = crypto
+    .createHmac("sha256", secretBytes)
+    .update(signedContent)
+    .digest("base64");
+
+  const signatures = signatureHeader.split(" ");
+
+  for (const item of signatures) {
+    const [version, receivedSignature] =
+      item.split(",", 2);
+
+    if (
+      version !== "v1" ||
+      typeof receivedSignature !== "string"
+    ) {
+      continue;
+    }
+
+    const received = Buffer.from(
+      receivedSignature,
+      "base64"
+    );
+
+    const expected = Buffer.from(
+      expectedSignature,
+      "base64"
+    );
+
+    if (
+      received.length === expected.length &&
+      crypto.timingSafeEqual(received, expected)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
-export async function yocoWebhook(req, res) {
+// ============================================================
+// STITCH PAYMENT.PAID WEBHOOK
+// ============================================================
+
+export async function stitchWebhook(req, res) {
   try {
-    if (!verifyYocoWebhookSignature(req)) {
-      return res.status(400).send("Invalid webhook signature");
+    // Verify the signature before trusting any event data.
+    if (!verifyStitchWebhookSignature(req)) {
+      console.warn(
+        "Rejected Stitch webhook: invalid signature."
+      );
+
+      return res.status(400).send(
+        "Invalid webhook signature"
+      );
     }
 
     let event;
+
     try {
       event = JSON.parse(req.rawBody.toString("utf8"));
     } catch {
-      return res.status(400).send("Invalid JSON payload");
+      return res.status(400).send(
+        "Invalid webhook JSON"
+      );
     }
 
-    if (!event || typeof event !== "object" || typeof event.type !== "string") {
-      return res.status(400).send("Invalid event");
-    }
-
-    if (event.type === "payment.failed") {
-      const failedCheckoutId = event.payload?.metadata?.checkoutId;
-      if (typeof failedCheckoutId === "string") {
-        await markYocoPaymentFailed(failedCheckoutId, event.id);
-      }
-      return res.status(200).send("Event acknowledged");
-    }
-    if (event.type !== "payment.succeeded") {
-      return res.status(200).send("Event ignored");
-    }
-
-    const payload = event.payload;
-    const checkoutId = payload?.metadata?.checkoutId;
-    if (
-      !payload ||
-      payload.status !== "succeeded" ||
-      !Number.isSafeInteger(payload.amount) ||
-      payload.currency !== "ZAR" ||
-      typeof checkoutId !== "string"
-    ) {
-      return res.status(400).send("Invalid payment payload");
-    }
-
-    const payment = await getPaymentByYocoCheckoutId(checkoutId);
-    if (!payment || payment.provider !== "yoco") {
-      return res.status(404).send("Payment not found");
-    }
+    const webhookId = req.headers["svix-id"];
 
     if (
-      payment.amountCents !== payload.amount ||
-      payment.currency !== payload.currency ||
-      payment.yocoProcessingMode !== payload.mode
+      !event ||
+      typeof event !== "object" ||
+      event.status !== "PAID" ||
+      event.type !== "LINK" ||
+      typeof event.id !== "string" ||
+      typeof event.linkId !== "string" ||
+      !Number.isSafeInteger(event.amount) ||
+      event.amount < 100
     ) {
-      console.warn("Yoco webhook payment mismatch:", payment.reference);
-      return res.status(400).send("Payment details mismatch");
+      // Only payment.paid link payments are relevant to SA LIVE.
+      return res.status(400).send(
+        "Invalid Stitch payment event"
+      );
     }
 
-    const result = await creditSuccessfulPayment(payment.reference, {
-      paymentId: payload.id,
-      eventId: event.id,
-    });
-
-    console.info("Yoco payment webhook processed:", {
-      reference: payment.reference,
-      alreadyCredited: result.alreadyCredited,
-    });
-    return res.status(200).send("OK");
-  } catch (error) {
-    console.error("Yoco webhook processing failed:", error.message);
-    return res.status(500).send("Webhook processing failed");
-  }
-}
-
-// ============================================================
-// PAYFAST ITN WEBHOOK
-// ============================================================
-
-export async function paymentITN(req, res) {
-  try {
-    const fields = req.body;
+    // Retrieve the link directly from Stitch.
+    const paymentLink =
+      await getStitchPaymentLink(event.linkId);
 
     if (
-      !fields ||
-      typeof fields !== "object" ||
-      Array.isArray(fields) ||
-      Object.keys(fields).length === 0 ||
-      Object.keys(fields).length > MAX_ITN_FIELDS
+      !paymentLink ||
+      paymentLink.id !== event.linkId ||
+      paymentLink.status !== "PAID" ||
+      paymentLink.amount !== event.amount ||
+      typeof paymentLink.merchantReference !== "string" ||
+      paymentLink.paymentId !== event.id
     ) {
-      return res.status(400).send("Invalid notification");
+      console.warn(
+        "Stitch payment-link verification mismatch:",
+        event.linkId
+      );
+
+      return res.status(400).send(
+        "Payment-link verification failed"
+      );
     }
 
-    /*
-     * The Express route must parse this endpoint as URL-encoded
-     * form data. Do not trust arbitrary forwarded IP headers.
-     * Configure Express trusted proxies correctly in production.
-     */
-
-    const expressIp = normalizeRemoteAddress(req.ip || "");
-const socketIp = normalizeRemoteAddress(
-  req.socket?.remoteAddress || ""
-);
-
-const remoteAddress = expressIp || socketIp;
-
-const cloudflareIp = normalizeRemoteAddress(
-  typeof req.headers["cf-connecting-ip"] === "string"
-    ? req.headers["cf-connecting-ip"]
-    : ""
-);
-
-const sourceIpAllowed =
-  isPayfastSourceIp(remoteAddress) ||
-  (
-    cloudflareIp !== "" &&
-    isPayfastSourceIp(cloudflareIp)
-  );
-
-console.info("PayFast ITN proxy diagnostic:", {
-  expressIp: req.ip,
-  expressIps: req.ips,
-  socketIp: req.socket?.remoteAddress,
-  forwardedFor: req.headers["x-forwarded-for"] ?? null,
-  cloudflareConnectingIp:
-    req.headers["cf-connecting-ip"] ?? null,
-  sourceIpAllowed,
-});
-
-if (!sourceIpAllowed) {
-  console.warn(
-    "Rejected PayFast ITN: source IP not allowlisted."
-  );
-
-  return res.status(403).send("Forbidden");
-}
-
-    if (!verifyPayfastSignature(fields)) {
-      console.warn("Rejected PayFast ITN: invalid signature.");
-
-      return res.status(400).send("Invalid signature");
-    }
-
-    if (
-      typeof fields.merchant_id !== "string" &&
-      typeof fields.merchant_id !== "number"
-    ) {
-      return res.status(400).send("Invalid merchant");
-    }
-
-    if (
-      String(fields.merchant_id) !== getMerchantId()
-    ) {
-      return res.status(400).send("Invalid merchant");
-    }
-
-    const reference = fields.m_payment_id;
+    const reference = paymentLink.merchantReference;
 
     if (!isValidReference(reference)) {
-      return res.status(400).send("Invalid payment reference");
+      console.warn(
+        "Stitch webhook contained an unknown merchant reference."
+      );
+
+      return res.status(400).send(
+        "Unknown payment reference"
+      );
     }
 
-    const payment =
+    const localPayment =
       await getPaymentByReference(reference);
 
-    if (!payment) {
-      return res.status(404).send("Unknown payment");
-    }
-
     if (
-      payment.provider !== "payfast" ||
-      payment.currency !== "ZAR"
-    ) {
-      return res.status(400).send("Payment mismatch");
-    }
-
-    /*
-     * Compare integer cents to avoid floating-point money errors.
-     */
-
-    const expectedAmount = Number(payment.amount);
-    const receivedGross = Number(fields.amount_gross);
-
-    if (
-      !Number.isFinite(expectedAmount) ||
-      !Number.isFinite(receivedGross) ||
-      expectedAmount <= 0 ||
-      receivedGross <= 0 ||
-      Math.round(expectedAmount * 100) !==
-        Math.round(receivedGross * 100)
+      !localPayment ||
+      localPayment.provider !== "stitch" ||
+      localPayment.reference !== reference ||
+      localPayment.stitchPaymentLinkId !== event.linkId ||
+      localPayment.amountCents !== event.amount ||
+      localPayment.currency !== "ZAR"
     ) {
       console.warn(
-        "PayFast amount mismatch for reference:",
+        "Stitch webhook did not match a local payment:",
         reference
       );
 
-      return res.status(400).send("Amount mismatch");
-    }
-
-    /*
-     * Never credit minutes for FAILED, PENDING, CANCELLED,
-     * or any other non-COMPLETE notification.
-     */
-
-    if (fields.payment_status !== "COMPLETE") {
-      console.info(
-        "PayFast non-complete notification:",
-        fields.payment_status
+      return res.status(400).send(
+        "Local payment mismatch"
       );
-
-      return res.status(200).send("OK");
     }
 
-    /*
-     * Confirm the ITN directly with PayFast before touching
-     * any account balance.
-     */
+    // Retrieve the actual payment, not just the payment link.
+    const confirmedPayment =
+      await getStitchPayment(event.id);
 
-    const serverConfirmed =
-      await validatePayfastWithServer(fields);
-
-    if (!serverConfirmed) {
+    if (
+      !confirmedPayment ||
+      confirmedPayment.id !== event.id ||
+      !["PAID", "SETTLED"].includes(confirmedPayment.status) ||
+      confirmedPayment.type !== "LINK" ||
+      confirmedPayment.amount !== localPayment.amountCents ||
+      confirmedPayment.merchantReference !== reference
+    ) {
       console.warn(
-        "PayFast server validation failed for:",
+        "Stitch payment verification failed:",
         reference
       );
 
-      return res.status(400).send("Validation failed");
+      return res.status(400).send(
+        "Payment verification failed"
+      );
     }
 
-    /*
-     * CRITICAL:
-     * creditSuccessfulPayment MUST perform an atomic Firestore
-     * transaction, validate the pending payment, and ensure that
-     * the payment can only be credited once.
-     *
-     * This controller deliberately does not update balances.
-     */
-
-    const result =
-      await creditSuccessfulPayment(reference);
-
-    console.info(
-      "PayFast ITN processed:",
+    // This function MUST credit inside a Firestore transaction
+    // and refuse to credit an already credited payment.
+    const result = await creditSuccessfulPayment(
       reference,
-      result?.alreadyCredited
-        ? "already credited"
-        : "processed"
+      {
+        paymentId: confirmedPayment.id,
+        eventId: webhookId,
+        paymentLinkId: event.linkId,
+      }
     );
+
+    console.info("Stitch payment webhook processed:", {
+      reference,
+      eventId: webhookId,
+      alreadyCredited: result?.alreadyCredited === true,
+    });
 
     return res.status(200).send("OK");
   } catch (error) {
     console.error(
-      "PayFast ITN processing failed:",
+      "Stitch webhook processing failed:",
       error.message
     );
 
-    /*
-     * Return a failure status for transient processing errors
-     * so the notification can be investigated or retried.
-     */
-
+    // Non-2xx response allows Stitch to retry the delivery.
     return res.status(500).send(
-      "Notification processing failed"
+      "Webhook processing failed"
     );
   }
 }
 
 // ============================================================
 // CUSTOMER RETURN CALLBACK
+// A browser redirect is NOT proof of payment.
 // ============================================================
 
 export async function paymentCallback(req, res) {
   try {
     const reference =
-      req.query?.m_payment_id ??
-      req.query?.reference;
+      req.query?.reference ??
+      req.query?.merchantReference;
 
     if (!isValidReference(reference)) {
       return sendPaymentPage(
@@ -1116,7 +742,7 @@ export async function paymentCallback(req, res) {
           title: "SA LIVE Payment",
           heading: "Payment status unavailable",
           message:
-            "The payment reference is invalid. Return to Telegram and check your balance.",
+            "The payment reference is invalid. Return to SA LIVE and check your balance.",
         })
       );
     }
@@ -1132,18 +758,13 @@ export async function paymentCallback(req, res) {
           title: "SA LIVE Payment",
           heading: "Payment not found",
           message:
-            "We could not find this payment. Return to Telegram or contact support.",
+            "We could not find this payment. Return to SA LIVE or contact support.",
         })
       );
     }
 
-    /*
-     * A browser redirect is not proof of payment.
-     * Only the verified ITN processing flow can credit minutes.
-     */
-
     if (
-      ["payfast", "yoco"].includes(payment.provider) &&
+      payment.provider === "stitch" &&
       payment.status === "complete" &&
       payment.credited === true
     ) {
@@ -1154,7 +775,7 @@ export async function paymentCallback(req, res) {
           title: "SA LIVE Payment Successful",
           heading: "Payment successful",
           message:
-            "Your payment has been confirmed. Your minutes are available in Telegram.",
+            "Your payment has been confirmed. Your minutes are available in SA LIVE.",
           minutes: payment.minutes,
         })
       );
@@ -1168,7 +789,7 @@ export async function paymentCallback(req, res) {
           title: "SA LIVE Payment Pending",
           heading: "Payment confirmation pending",
           message:
-            "Your payment has not been confirmed yet. Check your balance in Telegram shortly. Avoid making another payment until you have checked the original transaction.",
+            "Your payment has not been confirmed yet. Check your balance shortly. Do not pay again until you have checked the original transaction.",
         })
       );
     }
@@ -1180,12 +801,12 @@ export async function paymentCallback(req, res) {
         title: "SA LIVE Payment",
         heading: "Payment not confirmed",
         message:
-          "Your payment has not been confirmed as successful. Return to Telegram to check its status.",
+          "Your payment has not been confirmed as successful. Check your balance in SA LIVE.",
       })
     );
   } catch (error) {
     console.error(
-      "PayFast return callback failed:",
+      "Stitch return callback failed:",
       error.message
     );
 
@@ -1196,7 +817,7 @@ export async function paymentCallback(req, res) {
         title: "SA LIVE Payment",
         heading: "Unable to check payment",
         message:
-          "We could not retrieve your payment status. Return to Telegram and try again shortly.",
+          "We could not retrieve your payment status. Please try again shortly.",
       })
     );
   }

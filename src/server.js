@@ -16,6 +16,7 @@ import livekitWebhookRoutes from "./routes/livekitWebhookRoutes.js";
 const app = express();
 
 app.set("trust proxy", 1);
+
 const PORT = Number(process.env.PORT) || 5000;
 const isProduction = process.env.NODE_ENV === "production";
 
@@ -90,8 +91,10 @@ app.use((req, res, next) => {
 app.use(
   cors({
     origin(origin, callback) {
-      // Requests without Origin are commonly server-to-server.
-      // This does not replace authentication or authorization.
+      // Server-to-server requests commonly have no Origin header.
+      // Authentication and webhook signature verification
+      // must still be performed separately.
+
       if (!origin) {
         return callback(null, true);
       }
@@ -103,6 +106,7 @@ app.use(
       } catch {
         const error = new Error("Invalid request origin.");
         error.status = 403;
+
         return callback(error);
       }
 
@@ -112,6 +116,7 @@ app.use(
 
       const error = new Error("Origin not allowed by CORS.");
       error.status = 403;
+
       return callback(error);
     },
 
@@ -136,26 +141,45 @@ app.use(
 );
 
 // ------------------------------------------------------------
-// LIVEKIT WEBHOOK — MUST RECEIVE RAW BODY
+// LIVEKIT WEBHOOK
+// MUST BE MOUNTED BEFORE EXPRESS JSON PARSING
 // ------------------------------------------------------------
 
-// Mount before express.json() so LiveKit signature
-// verification receives the original request body.
+// LiveKit has its own webhook signature verification.
+// Keep this route before express.json().
+
 app.use("/api/livekit", livekitWebhookRoutes);
 
 // ------------------------------------------------------------
-// REQUEST PARSING
+// REQUEST BODY PARSING
 // ------------------------------------------------------------
 
-app.use(express.json({
-  limit: "100kb",
-  strict: true,
-  verify(req, res, buffer) {
-    if (req.originalUrl === "/api/payments/yoco/webhook") {
-      req.rawBody = Buffer.from(buffer);
-    }
-  },
-}));
+// Stitch webhook signature verification requires the original
+// unmodified request body.
+//
+// The raw body is captured only for:
+// POST /api/payments/stitch/webhook
+//
+// express.json() still parses the request normally, so the
+// controller can access req.body and req.rawBody.
+
+app.use(
+  express.json({
+    limit: "100kb",
+    strict: true,
+
+    verify(req, res, buffer) {
+      const requestPath = req.originalUrl.split("?")[0];
+
+      if (
+        req.method === "POST" &&
+        requestPath === "/api/payments/stitch/webhook"
+      ) {
+        req.rawBody = Buffer.from(buffer);
+      }
+    },
+  })
+);
 
 // ------------------------------------------------------------
 // HEALTH ENDPOINTS
@@ -227,7 +251,10 @@ app.use((error, req, res, next) => {
   if (status >= 500) {
     console.error("SA LIVE API error:", error);
   } else if (status === 403) {
-    console.warn("SA LIVE request rejected:", error.message);
+    console.warn(
+      "SA LIVE request rejected:",
+      error.message
+    );
   }
 
   return res.status(status).json({
@@ -246,7 +273,9 @@ app.use((error, req, res, next) => {
 // ------------------------------------------------------------
 
 const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`SA LIVE API running on port ${PORT}`);
+  console.log(
+    `SA LIVE API running on port ${PORT}`
+  );
 });
 
 server.requestTimeout = 30_000;
@@ -263,11 +292,18 @@ function shutdown(signal) {
   if (shuttingDown) return;
 
   shuttingDown = true;
-  console.log(`${signal} received. Shutting down SA LIVE API.`);
+
+  console.log(
+    `${signal} received. Shutting down SA LIVE API.`
+  );
 
   server.close((error) => {
     if (error) {
-      console.error("Server shutdown error:", error);
+      console.error(
+        "Server shutdown error:",
+        error
+      );
+
       process.exitCode = 1;
     }
   });

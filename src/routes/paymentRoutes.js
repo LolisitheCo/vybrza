@@ -6,8 +6,7 @@ import {
   initializeExistingPaymentCheckout,
   verifyPayment,
   paymentCallback,
-  paymentITN,
-  yocoWebhook,
+  stitchWebhook,
 } from "../controllers/paymentController.js";
 
 import {
@@ -16,63 +15,37 @@ import {
 
 const router = express.Router();
 
-/*
-|--------------------------------------------------------------------------
-| AUTHENTICATED WEBSITE PAYMENT ROUTES
-|--------------------------------------------------------------------------
-| The user's identity comes from a verified Firebase ID token.
-| Never trust a user ID supplied by the browser.
-|--------------------------------------------------------------------------
-*/
-
-// POST /api/payments/initialize
+// Customer payment routes
 router.post(
   "/initialize",
   verifyFirebaseToken,
   initializePayment
 );
 
-// POST /api/payments/checkout/:reference
 router.post(
   "/checkout/:reference",
   verifyFirebaseToken,
   initializeExistingPaymentCheckout
 );
 
-// GET /api/payments/verify/:reference
 router.get(
   "/verify/:reference",
   verifyFirebaseToken,
   verifyPayment
 );
 
-/*
-|--------------------------------------------------------------------------
-| PUBLIC PAYFAST ROUTES
-|--------------------------------------------------------------------------
-| PayFast must be able to reach these endpoints without a user's
-| Firebase session. The controller validates payment notifications.
-|--------------------------------------------------------------------------
-*/
-
-// GET /api/payments/callback
-// Browser redirect only. Never credits minutes by itself.
-router.get("/callback", paymentCallback);
-
-// POST /api/payments/yoco/webhook
-// Yoco webhook; server.js preserves rawBody for signature verification.
-router.post("/yoco/webhook", yocoWebhook);
-
-// POST /api/payments/itn
-// Legacy PayFast notifications for already-created transactions only.
+// Stitch webhook — public endpoint.
+// Signature verification happens inside stitchWebhook.
 router.post(
-  "/itn",
-  express.urlencoded({
-    extended: false,
-    limit: "20kb",
-    parameterLimit: 100,
-  }),
-  paymentITN
+  "/stitch/webhook",
+  stitchWebhook
+);
+
+// Customer return page.
+// This does not confirm or credit payments.
+router.get(
+  "/callback",
+  paymentCallback
 );
 
 export default router;
