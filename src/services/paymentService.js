@@ -53,6 +53,10 @@ export const PAYMENT_PACKAGES = Object.freeze({
   }),
 });
 
+// ============================================================
+// VALIDATION LIMITS
+// ============================================================
+
 const MAX_ID_LENGTH = 200;
 const MAX_EMAIL_LENGTH = 254;
 const MAX_BANK_FIELD_LENGTH = 120;
@@ -83,7 +87,11 @@ function requireString(
 }
 
 function requireDocumentId(value, fieldName) {
-  const id = requireString(value, fieldName, MAX_ID_LENGTH);
+  const id = requireString(
+    value,
+    fieldName,
+    MAX_ID_LENGTH
+  );
 
   if (id.includes("/") || id.includes("\0")) {
     throw new Error(`${fieldName} is invalid.`);
@@ -119,7 +127,9 @@ function toCentsFromRand(amount, fieldName = "Amount") {
     !Number.isFinite(amount) ||
     amount <= 0
   ) {
-    throw new Error(`${fieldName} must be a positive amount.`);
+    throw new Error(
+      `${fieldName} must be a positive amount.`
+    );
   }
 
   const cents = Math.round(amount * 100);
@@ -141,7 +151,9 @@ function readStoredCents(value, fieldName) {
   const cents = value ?? 0;
 
   if (!validNonNegativeInteger(cents)) {
-    throw new Error(`${fieldName} balance is invalid.`);
+    throw new Error(
+      `${fieldName} balance is invalid.`
+    );
   }
 
   return cents;
@@ -151,7 +163,9 @@ function readStoredMinutes(value, fieldName) {
   const minutes = value ?? 0;
 
   if (!validNonNegativeInteger(minutes)) {
-    throw new Error(`${fieldName} minute balance is invalid.`);
+    throw new Error(
+      `${fieldName} minute balance is invalid.`
+    );
   }
 
   return minutes;
@@ -171,7 +185,9 @@ function validateEmail(email) {
     email.length > MAX_EMAIL_LENGTH ||
     !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
   ) {
-    throw new Error("A valid payment email is required.");
+    throw new Error(
+      "A valid payment email is required."
+    );
   }
 
   return email.trim().toLowerCase();
@@ -228,10 +244,14 @@ function validateBankDetails(bankDetails) {
 }
 
 function validatePackageIntegrity(payment) {
-  const paymentPackage = getPaymentPackage(payment.packageId);
+  const paymentPackage = getPaymentPackage(
+    payment.packageId
+  );
 
   if (!paymentPackage) {
-    throw new Error("The stored payment package is invalid.");
+    throw new Error(
+      "The stored payment package is invalid."
+    );
   }
 
   const expectedAmountCents = toCentsFromRand(
@@ -263,7 +283,9 @@ function validateWithdrawalRecord(withdrawal) {
     !validPositiveInteger(withdrawal.amountCents) ||
     withdrawal.currency !== "ZAR"
   ) {
-    throw new Error("The withdrawal record is invalid.");
+    throw new Error(
+      "The withdrawal record is invalid."
+    );
   }
 }
 
@@ -301,7 +323,9 @@ export async function createPaymentRecord({
   const normalizedEmail = validateEmail(email);
 
   if (!normalizedEmail) {
-    throw new Error("A valid payment email is required.");
+    throw new Error(
+      "A valid payment email is required."
+    );
   }
 
   const amountCents = toCentsFromRand(
@@ -317,7 +341,9 @@ export async function createPaymentRecord({
     const paymentSnapshot = await transaction.get(paymentRef);
 
     if (paymentSnapshot.exists) {
-      throw new Error("Payment reference already exists.");
+      throw new Error(
+        "Payment reference already exists."
+      );
     }
 
     const now = new Date();
@@ -336,7 +362,8 @@ export async function createPaymentRecord({
       });
     } else {
       transaction.update(userRef, {
-        email: userSnapshot.get("email") || normalizedEmail,
+        email:
+          userSnapshot.get("email") || normalizedEmail,
         paymentEmail: normalizedEmail,
         updatedAt: now,
       });
@@ -353,14 +380,17 @@ export async function createPaymentRecord({
       minutes: paymentPackage.minutes,
       email: normalizedEmail,
 
-      // Stitch is the only supported payment provider.
       provider: "stitch",
 
       status: "pending",
       credited: false,
 
-      // Stitch payment-link details are attached after
-      // the payment link has been created successfully.
+      // New Stitch Developer Portal fields.
+      stitchPaymentRequestId: null,
+      stitchPaymentRequestUrl: null,
+      stitchPaymentRequestCreatedAt: null,
+
+      // Retained for compatibility with older records.
       stitchPaymentLinkId: null,
       stitchRedirectUrl: null,
       stitchPaymentId: null,
@@ -406,25 +436,25 @@ export async function getPaymentByReference(reference) {
 }
 
 // ============================================================
-// ATTACH STITCH PAYMENT LINK
+// ATTACH STITCH PAYMENT REQUEST
 // ============================================================
 
-export async function attachStitchPaymentLink({
+export async function attachStitchPaymentRequest({
   reference,
-  paymentLinkId,
+  paymentRequestId,
   redirectUrl,
 }) {
   reference = requirePaymentReference(reference);
 
-  paymentLinkId = requireString(
-    paymentLinkId,
-    "Stitch payment link ID",
-    200
+  paymentRequestId = requireString(
+    paymentRequestId,
+    "Stitch payment request ID",
+    500
   );
 
   redirectUrl = requireString(
     redirectUrl,
-    "Stitch redirect URL",
+    "Stitch checkout URL",
     2048
   );
 
@@ -433,14 +463,18 @@ export async function attachStitchPaymentLink({
   try {
     parsedUrl = new URL(redirectUrl);
   } catch {
-    throw new Error("Stitch redirect URL is invalid.");
+    throw new Error(
+      "Stitch checkout URL is invalid."
+    );
   }
 
   if (
     parsedUrl.protocol !== "https:" ||
-    parsedUrl.hostname !== "express.stitch.money"
+    parsedUrl.hostname !== "secure.stitch.money"
   ) {
-    throw new Error("Stitch redirect URL is invalid.");
+    throw new Error(
+      "Stitch checkout URL is invalid."
+    );
   }
 
   const paymentRef = paymentsCollection.doc(reference);
@@ -449,7 +483,9 @@ export async function attachStitchPaymentLink({
     const snapshot = await transaction.get(paymentRef);
 
     if (!snapshot.exists) {
-      throw new Error("Payment record was not found.");
+      throw new Error(
+        "Payment record was not found."
+      );
     }
 
     const payment = snapshot.data();
@@ -465,41 +501,69 @@ export async function attachStitchPaymentLink({
     }
 
     if (
-      payment.stitchPaymentLinkId &&
-      payment.stitchPaymentLinkId !== paymentLinkId
+      payment.stitchPaymentRequestId &&
+      payment.stitchPaymentRequestId !== paymentRequestId
     ) {
       throw new Error(
-        "A different Stitch payment link is already attached to this payment."
+        "A different Stitch payment request is already attached to this payment."
       );
     }
 
+    const now = new Date();
+
     transaction.update(paymentRef, {
-      stitchPaymentLinkId: paymentLinkId,
+      stitchPaymentRequestId: paymentRequestId,
+      stitchPaymentRequestUrl: redirectUrl,
+      stitchPaymentRequestCreatedAt: now,
+
+      // Keep old generic redirect field populated for
+      // any existing frontend that reads this field.
       stitchRedirectUrl: redirectUrl,
-      stitchLinkCreatedAt: new Date(),
-      updatedAt: new Date(),
+
+      updatedAt: now,
     });
   });
 
   return {
     reference,
-    paymentLinkId,
+    paymentRequestId,
     redirectUrl,
     provider: "stitch",
   };
 }
 
 // ============================================================
+// BACKWARDS-COMPATIBILITY ALIAS
+// ============================================================
+//
+// New controller code should use attachStitchPaymentRequest.
+// This alias allows older imports to be migrated separately.
+// ============================================================
+
+export async function attachStitchPaymentLink({
+  reference,
+  paymentLinkId,
+  redirectUrl,
+}) {
+  return attachStitchPaymentRequest({
+    reference,
+    paymentRequestId: paymentLinkId,
+    redirectUrl,
+  });
+}
+
+// ============================================================
 // CREDIT VERIFIED STITCH PAYMENT ONCE
 // ============================================================
 //
-// Call only after the backend has:
-// 1. Verified the Stitch Svix webhook signature.
-// 2. Retrieved the payment link from Stitch.
-// 3. Retrieved the payment from Stitch.
-// 4. Verified payment status, amount and reference.
+// Call this only after the backend has:
+// 1. Verified the Stitch webhook signature.
+// 2. Matched the Stitch payment request to the SA LIVE record.
+// 3. Confirmed the request is completed.
+// 4. Verified the amount and currency.
+// 5. Verified the external reference.
 //
-// Never credit minutes based only on a browser redirect.
+// Never credit minutes from a browser redirect alone.
 // ============================================================
 
 export async function creditSuccessfulPayment(
@@ -514,7 +578,9 @@ export async function creditSuccessfulPayment(
     const paymentSnapshot = await transaction.get(paymentRef);
 
     if (!paymentSnapshot.exists) {
-      throw new Error("Payment record was not found.");
+      throw new Error(
+        "Payment record was not found."
+      );
     }
 
     const payment = paymentSnapshot.data();
@@ -557,7 +623,9 @@ export async function creditSuccessfulPayment(
     const userSnapshot = await transaction.get(userRef);
 
     if (!userSnapshot.exists) {
-      throw new Error("User account was not found.");
+      throw new Error(
+        "User account was not found."
+      );
     }
 
     const currentMinutes = readStoredMinutes(
@@ -586,16 +654,26 @@ export async function creditSuccessfulPayment(
       credited: true,
       creditedAt: now,
 
+      // Stitch payment ID, if supplied by the verified
+      // webhook or payment lookup.
       stitchPaymentId:
         typeof metadata.paymentId === "string"
           ? metadata.paymentId
-          : null,
+          : payment.stitchPaymentId || null,
 
+      // Stitch payment request ID.
+      stitchPaymentRequestId:
+        typeof metadata.paymentRequestId === "string"
+          ? metadata.paymentRequestId
+          : payment.stitchPaymentRequestId || null,
+
+      // Verified webhook event ID.
       stitchWebhookEventId:
         typeof metadata.eventId === "string"
           ? metadata.eventId
-          : null,
+          : payment.stitchWebhookEventId || null,
 
+      // Older compatibility field.
       stitchPaymentLinkId:
         typeof metadata.paymentLinkId === "string"
           ? metadata.paymentLinkId
@@ -618,9 +696,8 @@ export async function creditSuccessfulPayment(
 //
 // hostId is the document ID in the hosts collection.
 //
-// Call only after the trusted call-billing service has completed
-// billing and finalized the call. completedMinutes must be
-// calculated by the trusted backend, never by a browser.
+// Call only after the trusted call-billing service has
+// completed billing and finalized the call.
 // ============================================================
 
 export async function recordHostEarnings({
@@ -638,10 +715,14 @@ export async function recordHostEarnings({
   }
 
   const amountCents =
-    completedMinutes * HOST_EARNINGS_PER_MINUTE * 100;
+    completedMinutes *
+    HOST_EARNINGS_PER_MINUTE *
+    100;
 
   if (!Number.isSafeInteger(amountCents)) {
-    throw new Error("Host earnings amount is invalid.");
+    throw new Error(
+      "Host earnings amount is invalid."
+    );
   }
 
   const hostRef = hostsCollection.doc(hostId);
@@ -760,22 +841,27 @@ export async function getHostEarningsSummary(hostId) {
   const snapshot = await hostsCollection.doc(hostId).get();
 
   if (!snapshot.exists) {
-    throw new Error("Host account was not found.");
+    throw new Error(
+      "Host account was not found."
+    );
   }
 
   return {
     hostId,
     currency: "ZAR",
+
     available:
       readStoredCents(
         snapshot.get("availableHostEarningsCents"),
         "Available host earnings"
       ) / 100,
+
     lifetime:
       readStoredCents(
         snapshot.get("lifetimeHostEarningsCents"),
         "Lifetime host earnings"
       ) / 100,
+
     pendingWithdrawals:
       readStoredCents(
         snapshot.get("pendingHostWithdrawalsCents"),
@@ -814,7 +900,9 @@ export async function createHostWithdrawalRequest({
     const hostSnapshot = await transaction.get(hostRef);
 
     if (!hostSnapshot.exists) {
-      throw new Error("Host account was not found.");
+      throw new Error(
+        "Host account was not found."
+      );
     }
 
     const host = hostSnapshot.data();
@@ -868,7 +956,10 @@ export async function createHostWithdrawalRequest({
     transaction.update(hostRef, {
       availableHostEarningsCents:
         availableCents - amountCents,
-      pendingHostWithdrawalsCents: newReservedCents,
+
+      pendingHostWithdrawalsCents:
+        newReservedCents,
+
       updatedAt: now,
     });
   });
@@ -887,8 +978,8 @@ export async function createHostWithdrawalRequest({
 // ============================================================
 //
 // An authorized administrator must confirm the real bank
-// transfer before calling this function. This function does
-// not transfer money.
+// transfer before calling this function.
+// This function does not transfer money.
 // ============================================================
 
 export async function markHostWithdrawalPaid({
@@ -924,7 +1015,9 @@ export async function markHostWithdrawalPaid({
       await transaction.get(withdrawalRef);
 
     if (!withdrawalSnapshot.exists) {
-      throw new Error("Withdrawal request was not found.");
+      throw new Error(
+        "Withdrawal request was not found."
+      );
     }
 
     const withdrawal = withdrawalSnapshot.data();
@@ -949,7 +1042,9 @@ export async function markHostWithdrawalPaid({
     const hostSnapshot = await transaction.get(hostRef);
 
     if (!hostSnapshot.exists) {
-      throw new Error("Host account was not found.");
+      throw new Error(
+        "Host account was not found."
+      );
     }
 
     const pendingCents = readStoredCents(
@@ -968,6 +1063,7 @@ export async function markHostWithdrawalPaid({
     transaction.update(hostRef, {
       pendingHostWithdrawalsCents:
         pendingCents - withdrawal.amountCents,
+
       updatedAt: now,
     });
 
@@ -1022,7 +1118,9 @@ export async function rejectHostWithdrawal({
       await transaction.get(withdrawalRef);
 
     if (!withdrawalSnapshot.exists) {
-      throw new Error("Withdrawal request was not found.");
+      throw new Error(
+        "Withdrawal request was not found."
+      );
     }
 
     const withdrawal = withdrawalSnapshot.data();
@@ -1039,7 +1137,9 @@ export async function rejectHostWithdrawal({
     const hostSnapshot = await transaction.get(hostRef);
 
     if (!hostSnapshot.exists) {
-      throw new Error("Host account was not found.");
+      throw new Error(
+        "Host account was not found."
+      );
     }
 
     const host = hostSnapshot.data();
@@ -1072,9 +1172,12 @@ export async function rejectHostWithdrawal({
     const now = new Date();
 
     transaction.update(hostRef, {
-      availableHostEarningsCents: newAvailableCents,
+      availableHostEarningsCents:
+        newAvailableCents,
+
       pendingHostWithdrawalsCents:
         pendingCents - withdrawal.amountCents,
+
       updatedAt: now,
     });
 
