@@ -51,13 +51,11 @@ function getStitchConfig() {
 // ACCESS TOKEN
 // ============================================================
 
+
 async function getStitchAccessToken() {
   const { clientId, clientSecret } = getStitchConfig();
 
-  if (
-    cachedAccessToken &&
-    Date.now() < tokenExpiresAt
-  ) {
+  if (cachedAccessToken && Date.now() < tokenExpiresAt) {
     return cachedAccessToken;
   }
 
@@ -65,8 +63,8 @@ async function getStitchAccessToken() {
     grant_type: "client_credentials",
     client_id: clientId,
     client_secret: clientSecret,
+    audience: "https://secure.stitch.money/connect/token",
     scope: "client_paymentrequest",
-    audience: STITCH_TOKEN_URL,
   });
 
   const response = await fetch(STITCH_TOKEN_URL, {
@@ -88,20 +86,21 @@ async function getStitchAccessToken() {
     });
 
     throw new Error(
-      "Could not authenticate with Stitch Developer Portal."
+      result.error || "Could not authenticate with Stitch Developer Portal."
     );
   }
 
   cachedAccessToken = result.access_token;
 
   const expiresIn = Number(result.expires_in || 3600);
-
   tokenExpiresAt =
-    Date.now() +
-    Math.max(expiresIn - 60, 60) * 1000;
+    Date.now() + Math.max(expiresIn - 60, 60) * 1000;
+
+  console.info("Stitch Developer Portal authentication successful.");
 
   return cachedAccessToken;
 }
+
 
 // ============================================================
 // GRAPHQL CLIENT
