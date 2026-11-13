@@ -155,7 +155,12 @@ function addRedirectUrl(paymentLink, reference) {
 // CREATE OR REUSE STITCH CHECKOUT
 // ============================================================
 
+
 async function createCheckoutForPayment(payment, req = {}) {
+  // ==========================================================
+  // REUSE AN EXISTING STITCH PAYMENT LINK
+  // ==========================================================
+
   if (
     typeof payment.stitchPaymentLinkId === "string" &&
     payment.stitchPaymentLinkId.trim()
@@ -174,20 +179,37 @@ async function createCheckoutForPayment(payment, req = {}) {
       );
     }
 
-    if (existingLink.status !== "PENDING") {
+    if (
+      String(existingLink.status || "").toUpperCase() !== "PENDING"
+    ) {
       throw new Error(
         "The existing Stitch payment link is no longer pending."
       );
     }
 
+    const redirectUrl = addRedirectUrl(
+      existingLink,
+      payment.reference
+    );
+
+    console.log("STITCH EXISTING PAYMENT LINK DIAGNOSTIC:", {
+      paymentLinkId: existingLink.id,
+      returnedLink: existingLink.link,
+      finalCheckoutUrl: redirectUrl,
+      amount: existingLink.amount,
+      merchantReference: existingLink.merchantReference,
+      status: existingLink.status,
+    });
+
     return {
       paymentLinkId: existingLink.id,
-      redirectUrl: addRedirectUrl(
-        existingLink,
-        payment.reference
-      ),
+      redirectUrl,
     };
   }
+
+  // ==========================================================
+  // CREATE A NEW STITCH PAYMENT LINK
+  // ==========================================================
 
   const paymentLink = await createStitchPaymentLink({
     amount: payment.amountCents,
@@ -196,10 +218,15 @@ async function createCheckoutForPayment(payment, req = {}) {
     merchantReference: payment.reference,
   });
 
+  // ==========================================================
+  // VALIDATE STITCH RESPONSE
+  // ==========================================================
+
   if (
     !paymentLink ||
     typeof paymentLink.id !== "string" ||
     typeof paymentLink.link !== "string" ||
+    !paymentLink.link.trim() ||
     paymentLink.amount !== payment.amountCents ||
     paymentLink.merchantReference !== payment.reference
   ) {
@@ -208,10 +235,31 @@ async function createCheckoutForPayment(payment, req = {}) {
     );
   }
 
+  // ==========================================================
+  // PREPARE CHECKOUT URL
+  // ==========================================================
+
   const redirectUrl = addRedirectUrl(
     paymentLink,
     payment.reference
   );
+
+  // ==========================================================
+  // DIAGNOSTIC LOGGING
+  // ==========================================================
+
+  console.log("STITCH NEW PAYMENT LINK DIAGNOSTIC:", {
+    paymentLinkId: paymentLink.id,
+    returnedLink: paymentLink.link,
+    finalCheckoutUrl: redirectUrl,
+    amount: paymentLink.amount,
+    merchantReference: paymentLink.merchantReference,
+    status: paymentLink.status || "NOT_RETURNED",
+  });
+
+  // ==========================================================
+  // SAVE STITCH PAYMENT LINK TO FIRESTORE
+  // ==========================================================
 
   await attachStitchPaymentLink({
     reference: payment.reference,
@@ -219,11 +267,16 @@ async function createCheckoutForPayment(payment, req = {}) {
     redirectUrl,
   });
 
+  // ==========================================================
+  // RETURN CHECKOUT DETAILS
+  // ==========================================================
+
   return {
     paymentLinkId: paymentLink.id,
     redirectUrl,
   };
 }
+
 
 // ============================================================
 // VERIFY A PAYMENT DIRECTLY WITH STITCH
