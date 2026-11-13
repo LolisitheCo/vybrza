@@ -1,4 +1,3 @@
-
 import express from "express";
 
 import {
@@ -9,47 +8,29 @@ import {
   stitchWebhook,
 } from "../controllers/paymentController.js";
 
-import { verifyFirebaseToken } from "../middleware/authMiddleware.js";
+import { verifyFirebaseToken } from "../middleware/verifyFirebaseToken.js";
 
 const router = express.Router();
 
-// ============================================================
-// SA LIVE — STITCH PAY BY BANK PAYMENT ROUTES
-// ============================================================
+// Public Stitch webhook
+router.post("/stitch/webhook", stitchWebhook);
 
-// Create a new payment and Stitch Pay By Bank checkout.
-router.post(
-  "/initialize",
-  verifyFirebaseToken,
-  initializePayment
-);
+// Public customer return URL
+router.get("/callback", paymentCallback);
 
-// Re-create or retrieve checkout for an existing pending payment.
+// Authenticated customer payment routes
+router.post("/initialize", verifyFirebaseToken, initializePayment);
+
 router.post(
   "/checkout/:reference",
   verifyFirebaseToken,
   initializeExistingPaymentCheckout
 );
 
-// Verify payment status using the backend and Stitch.
 router.get(
   "/verify/:reference",
   verifyFirebaseToken,
   verifyPayment
-);
-
-// Stitch webhook.
-// Public route: signature verification is handled inside the controller.
-router.post(
-  "/stitch/webhook",
-  stitchWebhook
-);
-
-// Stitch return page.
-// The browser redirect does NOT independently confirm payment.
-router.get(
-  "/callback",
-  paymentCallback
 );
 
 export default router;

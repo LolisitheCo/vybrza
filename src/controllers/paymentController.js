@@ -1,32 +1,25 @@
-
 import crypto from "node:crypto";
 
 import {
   getPaymentPackage,
   createPaymentRecord,
   getPaymentByReference,
-  attachStitchPaymentRequest,
+  attachStitchPaymentLink,
   creditSuccessfulPayment,
 } from "../services/paymentService.js";
 
 import {
-  createStitchPaymentRequest,
-  getStitchPaymentRequest,
+  createStitchPaymentLink,
+  getStitchPaymentLink,
+  getStitchPayment,
 } from "../services/stitchService.js";
-
-// ============================================================
-// SA LIVE — STITCH DEVELOPER PORTAL PAYMENT CONTROLLER
-// Pay By Bank + all payment methods enabled for the client
-// ============================================================
 
 const PAYMENT_REFERENCE_PATTERN = /^SALIVE-[A-F0-9]{32}$/;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-const MAX_EMAIL_LENGTH = 254;
 const WEBHOOK_TOLERANCE_SECONDS = 300;
 
 // ============================================================
-// AUTHENTICATION HELPERS
+// HELPERS
 // ============================================================
 
 function getAuthenticatedUserId(req) {
@@ -51,10 +44,6 @@ function isPaymentOwner(payment, userId) {
   );
 }
 
-// ============================================================
-// INPUT VALIDATION
-// ============================================================
-
 function isValidReference(reference) {
   return (
     typeof reference === "string" &&
@@ -65,10 +54,30 @@ function isValidReference(reference) {
 function isValidEmail(email) {
   return (
     typeof email === "string" &&
-    email.length <= MAX_EMAIL_LENGTH &&
+    email.length <= 254 &&
     email === email.trim() &&
     EMAIL_PATTERN.test(email)
   );
+}
+
+function getPayerName(req) {
+  const possibleNames = [
+    req.user?.displayName,
+    req.user?.name,
+    req.body?.payerName,
+  ];
+
+  for (const value of possibleNames) {
+    if (typeof value === "string") {
+      const name = value.trim().replace(/\s+/g, " ");
+
+      if (name.length >= 3 && name.length <= 40) {
+        return name;
+      }
+    }
+  }
+
+  return "SA LIVE Customer";
 }
 
 function validateStoredPayment(payment, reference) {
@@ -83,9 +92,7 @@ function validateStoredPayment(payment, reference) {
     return false;
   }
 
-  const paymentPackage = getPaymentPackage(
-    payment.packageId
-  );
+  const paymentPackage = getPaymentPackage(payment.packageId);
 
   if (!paymentPackage) {
     return false;
@@ -94,184 +101,215 @@ function validateStoredPayment(payment, reference) {
   return (
     payment.amount === paymentPackage.amount &&
     payment.minutes === paymentPackage.minutes &&
-    payment.amountCents ===
-      Math.round(paymentPackage.amount * 100)
+    payment.amountCents === paymentPackage.amount * 100
   );
 }
 
 // ============================================================
-// STITCH AMOUNT VALIDATION
+// STITCH REDIRECT URL
 // ============================================================
 
-function amountToCents(quantity) {
-  const amount = Number(quantity);
-
+function addRedirectUrl(paymentLink, reference) {
   if (
-    !Number.isFinite(amount) ||
-    amount <= 0
+    !paymentLink ||
+    typeof paymentLink.link !== "string"
   ) {
-    return null;
+    throw new Error("Stitch did not return a checkout link.");
   }
 
-  const cents = Math.round(amount * 100);
+  const configuredRedirect =
+    process.env.STITCH_REDIRECT_URL?.trim();
 
-  if (
-    !Number.isSafeInteger(cents) ||
-    Math.abs(amount * 100 - cents) > 0.000001
-  ) {
-    return null;
+  if (!configuredRedirect) {
+    return paymentLink.link;
   }
 
-  return cents;
+  const returnUrl = new URL(configuredRedirect);
+
+  if (returnUrl.protocol !== "https:") {
+    throw new Error(
+      "STITCH_REDIRECT_URL must use HTTPS."
+    );
+  }
+
+  returnUrl.searchParams.set("reference", reference);
+
+  const checkoutUrl = new URL(paymentLink.link);
+
+  if (
+    checkoutUrl.protocol !== "https:" ||
+    checkoutUrl.hostname !== "express.stitch.money"
+  ) {
+    throw new Error("Invalid Stitch Express checkout URL.");
+  }
+
+  checkoutUrl.searchParams.set(
+    "redirect_url",
+    returnUrl.toString()
+  );
+
+  return checkoutUrl.toString();
 }
 
 // ============================================================
-// CREATE STITCH CHECKOUT
+// CREATE OR REUSE STITCH CHECKOUT
 // ============================================================
 
-async function createCheckoutForPayment(payment) {
-  const checkout = await createStitchPaymentRequest({
-    reference: payment.reference,
-    amount: payment.amount,
-    userId: payment.userId,
-  });
-
+async function createCheckoutForPayment(payment, req = {}) {
   if (
-    !checkout ||
-    typeof checkout.paymentRequestId !== "string" ||
-    typeof checkout.redirectUrl !== "string"
+    typeof payment.stitchPaymentLinkId === "string" &&
+    payment.stitchPaymentLinkId.trim()
   ) {
-    throw new Error(
-      "Stitch did not return a valid payment request."
+    const existingLink = await getStitchPaymentLink(
+      payment.stitchPaymentLinkId
     );
-  }
 
-  await attachStitchPaymentRequest({
-    reference: payment.reference,
-    paymentRequestId: checkout.paymentRequestId,
-    redirectUrl: checkout.redirectUrl,
-  });
+    if (
+      existingLink.id !== payment.stitchPaymentLinkId ||
+      existingLink.merchantReference !== payment.reference ||
+      existingLink.amount !== payment.amountCents
+    ) {
+      throw new Error(
+        "The existing Stitch payment link does not match this payment."
+      );
+    }
 
-  return {
-    paymentRequestId: checkout.paymentRequestId,
-    redirectUrl: checkout.redirectUrl,
-  };
-}
+    if (existingLink.status !== "PENDING") {
+      throw new Error(
+        "The existing Stitch payment link is no longer pending."
+      );
+    }
 
-// ============================================================
-// VERIFY STITCH PAYMENT REQUEST
-// ============================================================
-//
-// Never trust the browser redirect query parameters.
-// Retrieve the request directly from Stitch.
-// ============================================================
-
-async function verifyStitchRequestAgainstLocalPayment({
-  payment,
-  stitchRequest,
-}) {
-  if (
-    !payment ||
-    !stitchRequest ||
-    payment.provider !== "stitch" ||
-    payment.currency !== "ZAR"
-  ) {
-    throw new Error(
-      "Payment verification data is invalid."
-    );
-  }
-
-  if (
-    stitchRequest.id !== payment.stitchPaymentRequestId ||
-    stitchRequest.externalReference !== payment.reference
-  ) {
-    throw new Error(
-      "Stitch payment reference or request ID mismatch."
-    );
-  }
-
-  const state = stitchRequest.state;
-
-  if (
-    !state ||
-    state.__typename !==
-      "PaymentInitiationRequestCompleted"
-  ) {
     return {
-      completed: false,
-      state: state?.__typename || "Unknown",
+      paymentLinkId: existingLink.id,
+      redirectUrl: addRedirectUrl(
+        existingLink,
+        payment.reference
+      ),
     };
   }
 
-  const requestCurrency =
-    stitchRequest.amount?.currency;
-
-  const completedCurrency =
-    state.amount?.currency;
-
-  const requestCents = amountToCents(
-    stitchRequest.amount?.quantity
-  );
-
-  const completedCents = amountToCents(
-    state.amount?.quantity
-  );
+  const paymentLink = await createStitchPaymentLink({
+    amount: payment.amountCents,
+    payerName: getPayerName(req),
+    payerEmailAddress: payment.email,
+    merchantReference: payment.reference,
+  });
 
   if (
-    requestCurrency !== "ZAR" ||
-    completedCurrency !== "ZAR" ||
-    requestCents === null ||
-    completedCents === null ||
-    requestCents !== payment.amountCents ||
-    completedCents !== payment.amountCents
+    !paymentLink ||
+    typeof paymentLink.id !== "string" ||
+    typeof paymentLink.link !== "string" ||
+    paymentLink.amount !== payment.amountCents ||
+    paymentLink.merchantReference !== payment.reference
   ) {
     throw new Error(
-      "Stitch payment amount or currency does not match the SA LIVE payment."
+      "Stitch returned a payment link that did not match the SA LIVE payment."
     );
   }
 
+  const redirectUrl = addRedirectUrl(
+    paymentLink,
+    payment.reference
+  );
+
+  await attachStitchPaymentLink({
+    reference: payment.reference,
+    paymentLinkId: paymentLink.id,
+    redirectUrl,
+  });
+
   return {
-    completed: true,
-    state: state.__typename,
+    paymentLinkId: paymentLink.id,
+    redirectUrl,
   };
 }
 
 // ============================================================
-// VERIFY AND CREDIT A COMPLETED PAYMENT
+// VERIFY A PAYMENT DIRECTLY WITH STITCH
 // ============================================================
 
-async function confirmAndCreditPayment({
-  payment,
-  eventId = null,
-}) {
-  if (!payment?.stitchPaymentRequestId) {
+async function verifyAndCreditPayment(payment, eventId = null) {
+  if (
+    !payment ||
+    typeof payment.stitchPaymentLinkId !== "string"
+  ) {
+    throw new Error("Stitch payment link ID is missing.");
+  }
+
+  const paymentLink = await getStitchPaymentLink(
+    payment.stitchPaymentLinkId
+  );
+
+  if (
+    paymentLink.id !== payment.stitchPaymentLinkId ||
+    paymentLink.merchantReference !== payment.reference ||
+    paymentLink.amount !== payment.amountCents
+  ) {
     throw new Error(
-      "Stitch payment request ID is missing."
+      "Stitch payment link does not match the SA LIVE payment."
     );
   }
 
-  const stitchRequest = await getStitchPaymentRequest(
-    payment.stitchPaymentRequestId
-  );
+  const linkStatus = String(
+    paymentLink.status || ""
+  ).toUpperCase();
 
-  const verification =
-    await verifyStitchRequestAgainstLocalPayment({
-      payment,
-      stitchRequest,
-    });
-
-  if (!verification.completed) {
+  if (linkStatus !== "PAID") {
     return {
       success: true,
       credited: false,
-      status: verification.state,
+      status: linkStatus || "PENDING",
     };
+  }
+
+  const paymentId = paymentLink.paymentId;
+
+  if (
+    typeof paymentId !== "string" ||
+    !paymentId.trim()
+  ) {
+    throw new Error(
+      "Stitch marked the link as paid but did not return a payment ID."
+    );
+  }
+
+  const stitchPayment = await getStitchPayment(paymentId);
+
+  const paymentStatus = String(
+    stitchPayment.status || ""
+  ).toUpperCase();
+
+  if (
+    paymentStatus !== "PAID" &&
+    paymentStatus !== "SETTLED"
+  ) {
+    return {
+      success: true,
+      credited: false,
+      status: paymentStatus || "PENDING",
+    };
+  }
+
+  if (
+    stitchPayment.id !== paymentId ||
+    stitchPayment.type !== "LINK" ||
+    stitchPayment.amount !== payment.amountCents ||
+    (
+      stitchPayment.merchantReference &&
+      stitchPayment.merchantReference !== payment.reference
+    )
+  ) {
+    throw new Error(
+      "Stitch payment details do not match the SA LIVE payment."
+    );
   }
 
   const result = await creditSuccessfulPayment(
     payment.reference,
     {
-      paymentRequestId: stitchRequest.id,
+      paymentId,
+      paymentLinkId: paymentLink.id,
       eventId,
     }
   );
@@ -281,17 +319,492 @@ async function confirmAndCreditPayment({
     credited: true,
     alreadyCredited: result.alreadyCredited === true,
     minutes: result.minutes,
+    status: paymentStatus,
   };
 }
 
 // ============================================================
-// HTML RESPONSE HELPERS
+// INITIALIZE A NEW PAYMENT
+// POST /api/payments/initialize
+// ============================================================
+
+export async function initializePayment(req, res) {
+  try {
+    const authenticatedUserId = getAuthenticatedUserId(req);
+
+    if (!authenticatedUserId) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication is required.",
+      });
+    }
+
+    const { userId, packageId, email } = req.body ?? {};
+
+    if (
+      userId !== undefined &&
+      String(userId) !== authenticatedUserId
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "User identity mismatch.",
+      });
+    }
+
+    if (
+      typeof packageId !== "string" ||
+      packageId.length > 64 ||
+      !/^[a-zA-Z0-9_-]+$/.test(packageId)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid payment package.",
+      });
+    }
+
+    if (!isValidEmail(email)) {
+      return res.status(400).json({
+        success: false,
+        message: "A valid email address is required.",
+      });
+    }
+
+    const paymentPackage = getPaymentPackage(packageId);
+
+    if (
+      !paymentPackage ||
+      !Number.isFinite(Number(paymentPackage.amount)) ||
+      paymentPackage.amount <= 0 ||
+      !Number.isSafeInteger(paymentPackage.minutes) ||
+      paymentPackage.minutes <= 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid payment package.",
+      });
+    }
+
+    const reference = `SALIVE-${crypto.randomUUID()
+      .replace(/-/g, "")
+      .toUpperCase()}`;
+
+    await createPaymentRecord({
+      userId: authenticatedUserId,
+      reference,
+      packageId: paymentPackage.id,
+      email: email.toLowerCase(),
+    });
+
+    const payment = await getPaymentByReference(reference);
+
+    if (
+      !payment ||
+      payment.provider !== "stitch" ||
+      payment.amountCents !== paymentPackage.amount * 100
+    ) {
+      throw new Error(
+        "SA LIVE payment record was not created correctly."
+      );
+    }
+
+    const checkout = await createCheckoutForPayment(
+      payment,
+      req
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Stitch checkout created.",
+      payment: {
+        reference,
+        packageId: paymentPackage.id,
+        packageName: paymentPackage.name,
+        amount: paymentPackage.amount,
+        amountCents: payment.amountCents,
+        currency: "ZAR",
+        minutes: paymentPackage.minutes,
+        paymentLinkId: checkout.paymentLinkId,
+        redirectUrl: checkout.redirectUrl,
+        provider: "stitch",
+      },
+    });
+  } catch (error) {
+    console.error(
+      "Initialize Stitch Express payment failed:",
+      error.message
+    );
+
+    return res.status(500).json({
+      success: false,
+      message:
+        "Unable to initialize checkout. Please try again.",
+    });
+  }
+}
+
+// ============================================================
+// REUSE AN EXISTING PAYMENT CHECKOUT
+// POST /api/payments/checkout/:reference
+// ============================================================
+
+export async function initializeExistingPaymentCheckout(
+  req,
+  res
+) {
+  try {
+    const reference = req.params?.reference;
+    const authenticatedUserId = getAuthenticatedUserId(req);
+
+    if (!isValidReference(reference)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid payment reference.",
+      });
+    }
+
+    if (!authenticatedUserId) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication is required.",
+      });
+    }
+
+    const payment = await getPaymentByReference(reference);
+
+    if (!isPaymentOwner(payment, authenticatedUserId)) {
+      return res.status(404).json({
+        success: false,
+        message: "Payment not found.",
+      });
+    }
+
+    if (!validateStoredPayment(payment, reference)) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "This payment is no longer available for checkout.",
+      });
+    }
+
+    if (!isValidEmail(payment.email)) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "A valid payment email is missing. Please update your email.",
+      });
+    }
+
+    const checkout = await createCheckoutForPayment(
+      payment,
+      req
+    );
+
+    return res.status(200).json({
+      success: true,
+      provider: "stitch",
+      reference,
+      paymentLinkId: checkout.paymentLinkId,
+      redirectUrl: checkout.redirectUrl,
+    });
+  } catch (error) {
+    console.error(
+      "Existing Stitch checkout failed:",
+      error.message
+    );
+
+    return res.status(500).json({
+      success: false,
+      message:
+        "Unable to prepare checkout. Please try again shortly.",
+    });
+  }
+}
+
+// ============================================================
+// CHECK PAYMENT STATUS
+// GET /api/payments/verify/:reference
+// ============================================================
+
+export async function verifyPayment(req, res) {
+  try {
+    const authenticatedUserId = getAuthenticatedUserId(req);
+    const reference = req.params?.reference;
+
+    if (!authenticatedUserId) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication is required.",
+      });
+    }
+
+    if (!isValidReference(reference)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid payment reference.",
+      });
+    }
+
+    const payment = await getPaymentByReference(reference);
+
+    if (!isPaymentOwner(payment, authenticatedUserId)) {
+      return res.status(404).json({
+        success: false,
+        message: "Payment record not found.",
+      });
+    }
+
+    if (
+      payment.status === "complete" &&
+      payment.credited === true
+    ) {
+      return res.status(200).json({
+        success: true,
+        payment: {
+          reference,
+          provider: "stitch",
+          status: "complete",
+          credited: true,
+          minutes: payment.minutes,
+          amount: payment.amount,
+          currency: payment.currency,
+        },
+      });
+    }
+
+    let stitchStatus = null;
+
+    if (payment.stitchPaymentLinkId) {
+      const result = await verifyAndCreditPayment(payment);
+      stitchStatus = result.status || null;
+    }
+
+    const updatedPayment = await getPaymentByReference(reference);
+
+    return res.status(200).json({
+      success: true,
+      payment: {
+        reference: updatedPayment.reference,
+        provider: updatedPayment.provider,
+        status: updatedPayment.status,
+        credited: updatedPayment.credited === true,
+        minutes: updatedPayment.minutes,
+        amount: updatedPayment.amount,
+        currency: updatedPayment.currency,
+        stitchStatus,
+      },
+    });
+  } catch (error) {
+    console.error(
+      "Payment status lookup failed:",
+      error.message
+    );
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to check payment status.",
+    });
+  }
+}
+
+// ============================================================
+// STITCH SVIX WEBHOOK SIGNATURE VERIFICATION
+// ============================================================
+
+function verifyStitchWebhookSignature(req) {
+  const secret = process.env.STITCH_WEBHOOK_SECRET;
+  const rawBody = req.rawBody;
+
+  const webhookId = req.headers["svix-id"];
+  const timestamp = req.headers["svix-timestamp"];
+  const signatureHeader = req.headers["svix-signature"];
+
+  if (
+    typeof secret !== "string" ||
+    !secret.startsWith("whsec_") ||
+    !Buffer.isBuffer(rawBody) ||
+    typeof webhookId !== "string" ||
+    !webhookId ||
+    typeof timestamp !== "string" ||
+    !/^\d+$/.test(timestamp) ||
+    typeof signatureHeader !== "string"
+  ) {
+    return false;
+  }
+
+  const timestampSeconds = Number(timestamp);
+
+  if (
+    !Number.isSafeInteger(timestampSeconds) ||
+    Math.abs(
+      Math.floor(Date.now() / 1000) - timestampSeconds
+    ) > WEBHOOK_TOLERANCE_SECONDS
+  ) {
+    return false;
+  }
+
+  const secretBytes = Buffer.from(
+    secret.slice("whsec_".length),
+    "base64"
+  );
+
+  if (!secretBytes.length) {
+    return false;
+  }
+
+  const signedContent = Buffer.concat([
+    Buffer.from(`${webhookId}.${timestamp}.`, "utf8"),
+    rawBody,
+  ]);
+
+  const expectedSignature = crypto
+    .createHmac("sha256", secretBytes)
+    .update(signedContent)
+    .digest();
+
+  const signatures = signatureHeader.split(" ");
+
+  for (const item of signatures) {
+    const [version, receivedSignature] = item.split(",", 2);
+
+    if (
+      version !== "v1" ||
+      typeof receivedSignature !== "string"
+    ) {
+      continue;
+    }
+
+    const received = Buffer.from(
+      receivedSignature,
+      "base64"
+    );
+
+    if (
+      received.length === expectedSignature.length &&
+      crypto.timingSafeEqual(received, expectedSignature)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// ============================================================
+// STITCH EXPRESS WEBHOOK
+// POST /api/payments/stitch/webhook
+// ============================================================
+
+export async function stitchWebhook(req, res) {
+  try {
+    if (!verifyStitchWebhookSignature(req)) {
+      console.warn(
+        "Rejected Stitch webhook: invalid signature."
+      );
+
+      return res.status(400).send(
+        "Invalid webhook signature"
+      );
+    }
+
+    let event;
+
+    try {
+      event = JSON.parse(req.rawBody.toString("utf8"));
+    } catch {
+      return res.status(400).send("Invalid webhook JSON");
+    }
+
+    // Stitch Express sends these fields directly in the body.
+    const webhookId = req.headers["svix-id"];
+
+    if (
+      !event ||
+      typeof event.id !== "string" ||
+      typeof event.status !== "string" ||
+      typeof event.amount !== "number" ||
+      typeof event.type !== "string"
+    ) {
+      return res.status(400).send("Invalid payment event");
+    }
+
+    // This SA LIVE integration creates payment links only.
+    if (event.type !== "LINK") {
+      return res.status(200).send("Event ignored");
+    }
+
+    if (event.status !== "PAID") {
+      return res.status(200).send("Event ignored");
+    }
+
+    if (
+      typeof event.linkId !== "string" ||
+      !event.linkId
+    ) {
+      return res.status(400).send("Missing payment link ID");
+    }
+
+    const paymentLink = await getStitchPaymentLink(
+      event.linkId
+    );
+
+    const reference = paymentLink.merchantReference;
+
+    if (!isValidReference(reference)) {
+      return res.status(400).send("Unknown payment reference");
+    }
+
+    const payment = await getPaymentByReference(reference);
+
+    if (
+      !payment ||
+      payment.provider !== "stitch" ||
+      payment.reference !== reference ||
+      payment.stitchPaymentLinkId !== event.linkId ||
+      payment.currency !== "ZAR" ||
+      payment.amountCents !== paymentLink.amount ||
+      event.amount !== payment.amountCents
+    ) {
+      return res.status(400).send("Local payment mismatch");
+    }
+
+    // Confirm the actual payment through Stitch's API.
+    // The webhook itself never credits the customer.
+    const result = await verifyAndCreditPayment(
+      payment,
+      webhookId
+    );
+
+    console.info("Stitch Express webhook processed:", {
+      reference,
+      paymentLinkId: event.linkId,
+      eventId: webhookId,
+      credited: result.credited === true,
+      alreadyCredited: result.alreadyCredited === true,
+      status: result.status,
+    });
+
+    return res.status(200).send("OK");
+  } catch (error) {
+    console.error(
+      "Stitch webhook processing failed:",
+      error.message
+    );
+
+    return res.status(500).send(
+      "Webhook processing failed"
+    );
+  }
+}
+
+// ============================================================
+// CUSTOMER RETURN CALLBACK
+// GET /api/payments/callback
 // ============================================================
 
 function setSecurityHeaders(res) {
   res.set({
     "Cache-Control": "no-store, max-age=0",
-    "Pragma": "no-cache",
+    Pragma: "no-cache",
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
@@ -372,565 +885,9 @@ function sendPaymentPage(res, statusCode, page) {
     .send(page);
 }
 
-// ============================================================
-// INITIALIZE A NEW PAYMENT
-// ============================================================
-
-export async function initializePayment(req, res) {
-  try {
-    const authenticatedUserId =
-      getAuthenticatedUserId(req);
-
-    if (!authenticatedUserId) {
-      return res.status(401).json({
-        success: false,
-        message: "Authentication is required.",
-      });
-    }
-
-    const {
-      userId,
-      packageId,
-      email,
-    } = req.body ?? {};
-
-    // Never allow the request body to select another user.
-    if (
-      userId !== undefined &&
-      String(userId) !== authenticatedUserId
-    ) {
-      return res.status(403).json({
-        success: false,
-        message: "User identity mismatch.",
-      });
-    }
-
-    if (
-      typeof packageId !== "string" ||
-      packageId.length > 64 ||
-      !/^[a-zA-Z0-9_-]+$/.test(packageId)
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid payment package.",
-      });
-    }
-
-    if (
-      !isValidEmail(email)
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "A valid email address is required.",
-      });
-    }
-
-    const paymentPackage = getPaymentPackage(packageId);
-
-    if (
-      !paymentPackage ||
-      !Number.isFinite(Number(paymentPackage.amount)) ||
-      paymentPackage.amount <= 0 ||
-      !Number.isSafeInteger(paymentPackage.minutes) ||
-      paymentPackage.minutes <= 0
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid payment package.",
-      });
-    }
-
-    const reference =
-      `SALIVE-${crypto.randomUUID()
-        .replace(/-/g, "")
-        .toUpperCase()}`;
-
-    // Create local pending payment first.
-    await createPaymentRecord({
-      userId: authenticatedUserId,
-      reference,
-      packageId: paymentPackage.id,
-      email: email.toLowerCase(),
-    });
-
-    const payment =
-      await getPaymentByReference(reference);
-
-    if (
-      !payment ||
-      payment.provider !== "stitch"
-    ) {
-      throw new Error(
-        "SA LIVE payment record was not created correctly."
-      );
-    }
-
-    const checkout =
-      await createCheckoutForPayment(payment);
-
-    return res.status(200).json({
-      success: true,
-      message: "Stitch checkout created.",
-
-      payment: {
-        reference,
-        packageId: paymentPackage.id,
-        packageName: paymentPackage.name,
-        amount: paymentPackage.amount,
-        amountCents: payment.amountCents,
-        currency: "ZAR",
-        minutes: paymentPackage.minutes,
-        paymentRequestId: checkout.paymentRequestId,
-        redirectUrl: checkout.redirectUrl,
-        provider: "stitch",
-      },
-    });
-  } catch (error) {
-    console.error(
-      "Initialize Stitch payment failed:",
-      error.message
-    );
-
-    return res.status(500).json({
-      success: false,
-      message:
-        "Unable to initialize checkout. Please try again.",
-    });
-  }
-}
-
-// ============================================================
-// REUSE OR CREATE AN EXISTING CHECKOUT
-// ============================================================
-
-export async function initializeExistingPaymentCheckout(
-  req,
-  res
-) {
-  try {
-    const reference = req.params?.reference;
-
-    if (!isValidReference(reference)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid payment reference.",
-      });
-    }
-
-    const authenticatedUserId =
-      getAuthenticatedUserId(req);
-
-    if (!authenticatedUserId) {
-      return res.status(401).json({
-        success: false,
-        message: "Authentication is required.",
-      });
-    }
-
-    const payment =
-      await getPaymentByReference(reference);
-
-    if (!isPaymentOwner(payment, authenticatedUserId)) {
-      return res.status(404).json({
-        success: false,
-        message: "Payment not found.",
-      });
-    }
-
-    if (!validateStoredPayment(payment, reference)) {
-      return res.status(409).json({
-        success: false,
-        message:
-          "This payment is no longer available for checkout.",
-      });
-    }
-
-    // Reuse an existing Developer Portal payment request.
-    if (
-      typeof payment.stitchPaymentRequestId === "string" &&
-      typeof payment.stitchPaymentRequestUrl === "string"
-    ) {
-      return res.status(200).json({
-        success: true,
-        provider: "stitch",
-        reference,
-        paymentRequestId:
-          payment.stitchPaymentRequestId,
-        redirectUrl:
-          payment.stitchPaymentRequestUrl,
-      });
-    }
-
-    if (!isValidEmail(payment.email)) {
-      return res.status(409).json({
-        success: false,
-        message:
-          "A valid payment email is missing. Please update your email.",
-      });
-    }
-
-    const checkout =
-      await createCheckoutForPayment(payment);
-
-    return res.status(200).json({
-      success: true,
-      provider: "stitch",
-      reference,
-      paymentRequestId: checkout.paymentRequestId,
-      redirectUrl: checkout.redirectUrl,
-    });
-  } catch (error) {
-    console.error(
-      "Existing Stitch checkout failed:",
-      error.message
-    );
-
-    return res.status(500).json({
-      success: false,
-      message:
-        "Unable to prepare checkout. Please try again shortly.",
-    });
-  }
-}
-
-// ============================================================
-// CHECK PAYMENT STATUS
-// ============================================================
-
-export async function verifyPayment(req, res) {
-  try {
-    const authenticatedUserId =
-      getAuthenticatedUserId(req);
-
-    if (!authenticatedUserId) {
-      return res.status(401).json({
-        success: false,
-        message: "Authentication is required.",
-      });
-    }
-
-    const reference = req.params?.reference;
-
-    if (!isValidReference(reference)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid payment reference.",
-      });
-    }
-
-    const payment =
-      await getPaymentByReference(reference);
-
-    if (!isPaymentOwner(payment, authenticatedUserId)) {
-      return res.status(404).json({
-        success: false,
-        message: "Payment record not found.",
-      });
-    }
-
-    // If already credited, return the stored final result.
-    if (
-      payment.status === "complete" &&
-      payment.credited === true
-    ) {
-      return res.status(200).json({
-        success: true,
-        payment: {
-          reference,
-          provider: "stitch",
-          status: "complete",
-          credited: true,
-          minutes: payment.minutes,
-          amount: payment.amount,
-          currency: payment.currency,
-        },
-      });
-    }
-
-    let stitchStatus = null;
-
-    // Query Stitch directly when a request exists.
-    // This is not based on browser-supplied status parameters.
-    if (payment.stitchPaymentRequestId) {
-      const result = await confirmAndCreditPayment({
-        payment,
-      });
-
-      stitchStatus = result.status || null;
-    }
-
-    // Read the updated Firestore payment record.
-    const updatedPayment =
-      await getPaymentByReference(reference);
-
-    return res.status(200).json({
-      success: true,
-      payment: {
-        reference: updatedPayment.reference,
-        provider: updatedPayment.provider,
-        status: updatedPayment.status,
-        credited: updatedPayment.credited === true,
-        minutes: updatedPayment.minutes,
-        amount: updatedPayment.amount,
-        currency: updatedPayment.currency,
-        stitchStatus,
-      },
-    });
-  } catch (error) {
-    console.error(
-      "Payment status lookup failed:",
-      error.message
-    );
-
-    return res.status(500).json({
-      success: false,
-      message: "Unable to check payment status.",
-    });
-  }
-}
-
-// ============================================================
-// STITCH SVIX WEBHOOK SIGNATURE VERIFICATION
-// ============================================================
-
-function verifyStitchWebhookSignature(req) {
-  const secret = process.env.STITCH_WEBHOOK_SECRET;
-  const rawBody = req.rawBody;
-
-  const webhookId = req.headers["svix-id"];
-  const timestamp = req.headers["svix-timestamp"];
-  const signatureHeader = req.headers["svix-signature"];
-
-  if (
-    typeof secret !== "string" ||
-    !secret.startsWith("whsec_") ||
-    !Buffer.isBuffer(rawBody) ||
-    typeof webhookId !== "string" ||
-    !webhookId ||
-    typeof timestamp !== "string" ||
-    !/^\d+$/.test(timestamp) ||
-    typeof signatureHeader !== "string"
-  ) {
-    return false;
-  }
-
-  const timestampSeconds = Number(timestamp);
-
-  if (
-    !Number.isSafeInteger(timestampSeconds) ||
-    Math.abs(
-      Math.floor(Date.now() / 1000) - timestampSeconds
-    ) > WEBHOOK_TOLERANCE_SECONDS
-  ) {
-    return false;
-  }
-
-  const secretBytes = Buffer.from(
-    secret.slice("whsec_".length),
-    "base64"
-  );
-
-  if (!secretBytes.length) {
-    return false;
-  }
-
-  const signedContent = Buffer.concat([
-    Buffer.from(
-      `${webhookId}.${timestamp}.`,
-      "utf8"
-    ),
-    rawBody,
-  ]);
-
-  const expectedSignature = crypto
-    .createHmac("sha256", secretBytes)
-    .update(signedContent)
-    .digest("base64");
-
-  const expected = Buffer.from(
-    expectedSignature,
-    "base64"
-  );
-
-  // Svix can provide multiple signatures during secret rotation.
-  const signatures = signatureHeader.split(" ");
-
-  for (const item of signatures) {
-    const [version, receivedSignature] =
-      item.split(",", 2);
-
-    if (
-      version !== "v1" ||
-      typeof receivedSignature !== "string"
-    ) {
-      continue;
-    }
-
-    const received = Buffer.from(
-      receivedSignature,
-      "base64"
-    );
-
-    if (
-      received.length === expected.length &&
-      crypto.timingSafeEqual(received, expected)
-    ) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-// ============================================================
-// STITCH PAYMENT WEBHOOK
-// Event: payment
-// ============================================================
-
-export async function stitchWebhook(req, res) {
-  try {
-    // Always verify the signature before reading event data.
-    if (!verifyStitchWebhookSignature(req)) {
-      console.warn(
-        "Rejected Stitch webhook: invalid signature."
-      );
-
-      return res.status(400).send(
-        "Invalid webhook signature"
-      );
-    }
-
-    let event;
-
-    try {
-      event = JSON.parse(
-        req.rawBody.toString("utf8")
-      );
-    } catch {
-      return res.status(400).send(
-        "Invalid webhook JSON"
-      );
-    }
-
-    const webhookId = req.headers["svix-id"];
-
-    const stitchRequest =
-      event?.data?.client?.paymentInitiationRequests?.node;
-
-    if (
-      !stitchRequest ||
-      stitchRequest.__typename !==
-        "PaymentInitiationRequest" ||
-      typeof stitchRequest.id !== "string" ||
-      typeof stitchRequest.externalReference !== "string"
-    ) {
-      console.warn(
-        "Stitch webhook did not contain a payment request."
-      );
-
-      return res.status(400).send(
-        "Invalid payment event"
-      );
-    }
-
-    const reference = stitchRequest.externalReference;
-
-    if (!isValidReference(reference)) {
-      console.warn(
-        "Stitch webhook contained an invalid SA LIVE reference."
-      );
-
-      return res.status(400).send(
-        "Unknown payment reference"
-      );
-    }
-
-    const payment =
-      await getPaymentByReference(reference);
-
-    if (
-      !payment ||
-      payment.provider !== "stitch" ||
-      payment.reference !== reference ||
-      payment.stitchPaymentRequestId !== stitchRequest.id ||
-      payment.currency !== "ZAR"
-    ) {
-      console.warn(
-        "Stitch webhook did not match a local payment:",
-        reference
-      );
-
-      return res.status(400).send(
-        "Local payment mismatch"
-      );
-    }
-
-    // Validate the webhook's amount before querying Stitch.
-    const webhookCurrency =
-      stitchRequest.amount?.currency ||
-      stitchRequest.currency;
-
-    const webhookAmountCents = amountToCents(
-      stitchRequest.amount?.quantity ??
-      stitchRequest.quantity
-    );
-
-    if (
-      webhookCurrency !== "ZAR" ||
-      webhookAmountCents !== payment.amountCents
-    ) {
-      console.warn(
-        "Stitch webhook amount mismatch:",
-        reference
-      );
-
-      return res.status(400).send(
-        "Payment amount mismatch"
-      );
-    }
-
-    // Query Stitch independently. Never credit based only
-    // on the event body, even after its signature is valid.
-    const result = await confirmAndCreditPayment({
-      payment,
-      eventId: webhookId,
-    });
-
-    // Completed payment events are credited once.
-    // Cancelled or expired events do not credit minutes.
-    console.info("Stitch payment webhook processed:", {
-      reference,
-      paymentRequestId: stitchRequest.id,
-      eventId: webhookId,
-      credited: result.credited === true,
-      alreadyCredited: result.alreadyCredited === true,
-      stitchStatus: result.status || "completed",
-    });
-
-    // Acknowledge valid events, including cancelled/expired ones.
-    return res.status(200).send("OK");
-  } catch (error) {
-    console.error(
-      "Stitch webhook processing failed:",
-      error.message
-    );
-
-    // A 5xx response lets Svix retry temporary failures.
-    return res.status(500).send(
-      "Webhook processing failed"
-    );
-  }
-}
-
-// ============================================================
-// CUSTOMER RETURN CALLBACK
-// Browser return is NOT proof of payment.
-// ============================================================
-
 export async function paymentCallback(req, res) {
   try {
     const reference =
-      req.query?.externalReference ??
       req.query?.reference ??
       req.query?.merchantReference;
 
@@ -947,8 +904,7 @@ export async function paymentCallback(req, res) {
       );
     }
 
-    const payment =
-      await getPaymentByReference(reference);
+    const payment = await getPaymentByReference(reference);
 
     if (!payment) {
       return sendPaymentPage(
@@ -963,19 +919,14 @@ export async function paymentCallback(req, res) {
       );
     }
 
-    // If Stitch has completed the payment but the webhook
-    // is still arriving, verify directly with Stitch.
     if (
       payment.status === "pending" &&
-      payment.stitchPaymentRequestId
+      payment.stitchPaymentLinkId
     ) {
-      await confirmAndCreditPayment({
-        payment,
-      });
+      await verifyAndCreditPayment(payment);
     }
 
-    const updatedPayment =
-      await getPaymentByReference(reference);
+    const updatedPayment = await getPaymentByReference(reference);
 
     if (
       updatedPayment.status === "complete" &&

@@ -1,354 +1,221 @@
+import "dotenv/config";
 
-// ============================================================
-// SA LIVE — STITCH DEVELOPER PORTAL SERVICE
-// Pay By Bank + all payment methods enabled for this client
-// ============================================================
-
-const STITCH_TOKEN_URL =
-  "https://secure.stitch.money/connect/token";
-
-const STITCH_GRAPHQL_URL =
-  "https://api.stitch.money/graphql";
+const STITCH_BASE_URL = "https://express.stitch.money/api/v1";
 
 let cachedAccessToken = null;
 let tokenExpiresAt = 0;
 
-// ============================================================
-// CONFIGURATION
-// ============================================================
+function getCredentials() {
+  const clientId = process.env.STITCH_CLIENT_ID?.trim();
+  const clientSecret = process.env.STITCH_CLIENT_SECRET?.trim();
 
-function getStitchConfig() {
-  const clientId = process.env.STITCH_CLIENT_ID;
-  const clientSecret = process.env.STITCH_CLIENT_SECRET;
-  const redirectUrl = process.env.STITCH_REDIRECT_URL;
-
-  if (!clientId || !clientSecret || !redirectUrl) {
-    throw new Error(
-      "Missing Stitch configuration. Check STITCH_CLIENT_ID, STITCH_CLIENT_SECRET and STITCH_REDIRECT_URL."
-    );
+  if (!clientId || !clientSecret) {
+    throw new Error("Stitch Express credentials are missing.");
   }
 
-  let parsedRedirectUrl;
-
-  try {
-    parsedRedirectUrl = new URL(redirectUrl);
-  } catch {
-    throw new Error("STITCH_REDIRECT_URL is not a valid URL.");
-  }
-
-  if (parsedRedirectUrl.protocol !== "https:") {
-    throw new Error("STITCH_REDIRECT_URL must use HTTPS.");
-  }
-
-  return {
-    clientId,
-    clientSecret,
-    redirectUrl: parsedRedirectUrl.toString(),
-  };
+  return { clientId, clientSecret };
 }
 
-// ============================================================
-// ACCESS TOKEN
-// ============================================================
+async function readResponse(response) {
+  const text = await response.text();
 
+  let body = {};
 
-async function getStitchAccessToken() {
-  const { clientId, clientSecret } = getStitchConfig();
+  if (text) {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      throw new Error("Stitch returned an invalid response.");
+    }
+  }
 
-  if (cachedAccessToken && Date.now() < tokenExpiresAt) {
+  if (!response.ok || body.success === false) {
+    const message =
+      body.generalErrors?.join(", ") ||
+      body.message ||
+      `Stitch API request failed (${response.status}).`;
+
+    throw new Error(message);
+  }
+
+  return body;
+}
+
+export async function getStitchAccessToken(forceRefresh = false) {
+  if (
+    !forceRefresh &&
+    cachedAccessToken &&
+    Date.now() < tokenExpiresAt
+  ) {
     return cachedAccessToken;
   }
 
-  const body = new URLSearchParams({
-    grant_type: "client_credentials",
-    client_id: clientId,
-    client_secret: clientSecret,
-    audience: "https://secure.stitch.money/connect/token",
-    scope: "client_paymentrequest",
-  });
+  const { clientId, clientSecret } = getCredentials();
 
-  const response = await fetch(STITCH_TOKEN_URL, {
+  const response = await fetch(`${STITCH_BASE_URL}/token`, {
     method: "POST",
     headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      Accept: "application/json",
-    },
-    body,
-  });
-
-  const result = await response.json().catch(() => ({}));
-
-  if (!response.ok || !result.access_token) {
-    console.error("Stitch authentication failed:", {
-      status: response.status,
-      error: result.error,
-      description: result.error_description,
-    });
-
-    throw new Error(
-      result.error || "Could not authenticate with Stitch Developer Portal."
-    );
-  }
-
-  cachedAccessToken = result.access_token;
-
-  const expiresIn = Number(result.expires_in || 3600);
-  tokenExpiresAt =
-    Date.now() + Math.max(expiresIn - 60, 60) * 1000;
-
-  console.info("Stitch Developer Portal authentication successful.");
-
-  return cachedAccessToken;
-}
-
-
-// ============================================================
-// GRAPHQL CLIENT
-// ============================================================
-
-async function stitchGraphQL(query, variables = {}) {
-  const token = await getStitchAccessToken();
-
-  const response = await fetch(STITCH_GRAPHQL_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
       Accept: "application/json",
     },
     body: JSON.stringify({
-      query,
-      variables,
+      clientId,
+      clientSecret,
+      scope: "client_paymentrequest",
     }),
   });
 
-  const result = await response.json().catch(() => ({}));
+  const result = await readResponse(response);
+  const accessToken = result?.data?.accessToken;
 
-  if (!response.ok || result.errors?.length || !result.data) {
-    console.error("Stitch GraphQL request failed:", {
-      status: response.status,
-      errors: result.errors,
-    });
-
-    throw new Error(
-      result.errors?.[0]?.message ||
-      "Stitch payment request failed."
-    );
+  if (
+    typeof accessToken !== "string" ||
+    !accessToken.trim()
+  ) {
+    throw new Error("Stitch did not return an access token.");
   }
 
-  return result.data;
+  cachedAccessToken = accessToken;
+
+  // Stitch tokens expire after 15 minutes.
+  // Refresh slightly early to avoid using an expiring token.
+  tokenExpiresAt = Date.now() + 14 * 60 * 1000;
+
+  return cachedAccessToken;
 }
 
-// ============================================================
-// CREATE PAYMENT REQUEST
-// ============================================================
+async function stitchRequest(path, options = {}, retry = true) {
+  const token = await getStitchAccessToken();
 
-export async function createStitchPaymentRequest({
-  reference,
+  const response = await fetch(`${STITCH_BASE_URL}${path}`, {
+    method: options.method || "GET",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    ...(options.body !== undefined
+      ? { body: JSON.stringify(options.body) }
+      : {}),
+  });
+
+  if (response.status === 401 && retry) {
+    cachedAccessToken = null;
+    tokenExpiresAt = 0;
+
+    await getStitchAccessToken(true);
+
+    return stitchRequest(path, options, false);
+  }
+
+  return readResponse(response);
+}
+
+export async function createStitchPaymentLink({
   amount,
-  userId,
+  payerName,
+  payerEmailAddress,
+  merchantReference,
 }) {
-  if (!reference || !userId) {
+  if (
+    !Number.isSafeInteger(amount) ||
+    amount < 100
+  ) {
     throw new Error(
-      "Payment reference and customer ID are required."
+      "Stitch payment amount must be at least 100 cents."
     );
   }
-
-  const numericAmount = Number(amount);
 
   if (
-    !Number.isFinite(numericAmount) ||
-    numericAmount < 1
+    typeof payerName !== "string" ||
+    payerName.trim().length < 3 ||
+    payerName.trim().length > 40
   ) {
-    throw new Error("Invalid payment amount.");
+    throw new Error("Invalid Stitch payer name.");
   }
-
-  const { redirectUrl } = getStitchConfig();
-
-  // Keep bank-statement references within Stitch limits.
-  const shortReference = reference.replace(
-    /[^A-Za-z0-9]/g,
-    ""
-  );
-
-  const payerReference =
-    `SALIVE${shortReference.slice(-6)}`.slice(0, 12);
-
-  const beneficiaryReference =
-    `SALIVE-${shortReference.slice(-12)}`.slice(0, 20);
-
-  const mutation = `
-    mutation CreatePaymentRequest(
-      $input: ClientPaymentInitiationRequestCreateInput!
-    ) {
-      clientPaymentInitiationRequestCreate(input: $input) {
-        paymentInitiationRequest {
-          id
-          url
-        }
-      }
-    }
-  `;
-
-  const expireAt = new Date(
-    Date.now() + 30 * 60 * 1000
-  ).toISOString();
-
-  const input = {
-    amount: {
-      quantity: numericAmount.toFixed(2),
-      currency: "ZAR",
-    },
-
-    payerReference,
-
-    beneficiaryReference,
-
-    // Full internal SA LIVE payment reference.
-    externalReference: reference,
-
-    expireAt,
-
-    payerInformation: {
-      payerId: String(userId),
-    },
-
-    // Do not disable payment methods.
-    // Stitch will use the methods available to this client.
-
-    metadata: {
-      application: "SA LIVE",
-      paymentReference: reference,
-    },
-  };
-
-  const data = await stitchGraphQL(
-    mutation,
-    { input }
-  );
-
-  const paymentRequest =
-    data.clientPaymentInitiationRequestCreate
-      ?.paymentInitiationRequest;
 
   if (
-    !paymentRequest?.id ||
-    !paymentRequest?.url
+    typeof merchantReference !== "string" ||
+    !/^[a-zA-Z0-9\s\-()]+$/.test(merchantReference) ||
+    merchantReference.length > 50
   ) {
-    console.error(
-      "Unexpected Stitch payment request response:",
-      data
-    );
-
-    throw new Error(
-      "Stitch did not return a valid payment request."
-    );
+    throw new Error("Invalid Stitch merchant reference.");
   }
 
-  let checkoutUrl;
-
-  try {
-    checkoutUrl = new URL(paymentRequest.url);
-  } catch {
-    throw new Error(
-      "Stitch returned an invalid checkout URL."
-    );
-  }
-
-  if (checkoutUrl.protocol !== "https:") {
-    throw new Error(
-      "Stitch checkout URL must use HTTPS."
-    );
-  }
-
-  // Stitch requires the redirect URL to be allowlisted.
-  checkoutUrl.searchParams.set(
-    "redirect_uri",
-    redirectUrl
-  );
-
-  return {
-    paymentRequestId: paymentRequest.id,
-    redirectUrl: checkoutUrl.toString(),
-    stitchUrl: paymentRequest.url,
+  const body = {
+    amount,
+    payerName: payerName.trim(),
+    merchantReference,
   };
-}
 
-// ============================================================
-// GET PAYMENT REQUEST STATUS
-// ============================================================
+  if (payerEmailAddress) {
+    body.payerEmailAddress = payerEmailAddress;
+  }
 
-export async function getStitchPaymentRequest(
-  paymentRequestId
-) {
-  if (!paymentRequestId) {
+  const result = await stitchRequest("/payment-links", {
+    method: "POST",
+    body,
+  });
+
+  const payment = result?.data?.payment;
+
+  if (
+    !payment ||
+    typeof payment.id !== "string" ||
+    typeof payment.link !== "string" ||
+    payment.amount !== amount ||
+    payment.merchantReference !== merchantReference
+  ) {
     throw new Error(
-      "Stitch payment request ID is required."
+      "Stitch returned an invalid payment link."
     );
   }
 
-  const query = `
-    query GetPaymentRequest($paymentRequestId: ID!) {
-      node(id: $paymentRequestId) {
-        ... on PaymentInitiationRequest {
-          id
+  return payment;
+}
 
-          externalReference
+export async function getStitchPaymentLink(paymentLinkId) {
+  if (
+    typeof paymentLinkId !== "string" ||
+    !paymentLinkId.trim()
+  ) {
+    throw new Error("Invalid Stitch payment link ID.");
+  }
 
-          amount {
-            quantity
-            currency
-          }
-
-          state {
-            __typename
-
-            ... on PaymentInitiationRequestCompleted {
-              date
-
-              amount {
-                quantity
-                currency
-              }
-            }
-
-            ... on PaymentInitiationRequestCancelled {
-              reason
-            }
-
-            ... on PaymentInitiationRequestExpired {
-              __typename
-            }
-
-            ... on PaymentInitiationRequestPending {
-              __typename
-            }
-          }
-        }
-      }
-    }
-  `;
-
-  const data = await stitchGraphQL(
-    query,
-    { paymentRequestId }
+  const result = await stitchRequest(
+    `/payment-links/${encodeURIComponent(paymentLinkId)}`
   );
 
-  if (!data.node) {
+  const payment = result?.data?.payment;
+
+  if (!payment || typeof payment.id !== "string") {
     throw new Error(
-      "Stitch payment request was not found."
+      "Stitch did not return the requested payment link."
     );
   }
 
-  return data.node;
+  return payment;
 }
 
-// ============================================================
-// CLEAR TOKEN CACHE
-// Useful for controlled re-authentication.
-// ============================================================
+export async function getStitchPayment(paymentId) {
+  if (
+    typeof paymentId !== "string" ||
+    !paymentId.trim()
+  ) {
+    throw new Error("Invalid Stitch payment ID.");
+  }
 
-export function clearStitchTokenCache() {
-  cachedAccessToken = null;
-  tokenExpiresAt = 0;
+  const result = await stitchRequest(
+    `/payment/${encodeURIComponent(paymentId)}`
+  );
+
+  const payment = result?.data?.payment;
+
+  if (!payment || typeof payment.id !== "string") {
+    throw new Error(
+      "Stitch did not return the requested payment."
+    );
+  }
+
+  return payment;
 }

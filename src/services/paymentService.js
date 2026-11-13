@@ -181,14 +181,14 @@ function validateEmail(email) {
   }
 
   if (
-    typeof email !== "string" ||
-    email.length > MAX_EMAIL_LENGTH ||
-    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
-  ) {
-    throw new Error(
-      "A valid payment email is required."
-    );
-  }
+  typeof email !== "string" ||
+  email.length > MAX_EMAIL_LENGTH ||
+  !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+) {
+  throw new Error(
+    "A valid payment email is required."
+  );
+}
 
   return email.trim().toLowerCase();
 }
@@ -444,92 +444,62 @@ export async function attachStitchPaymentRequest({
   paymentRequestId,
   redirectUrl,
 }) {
-  reference = requirePaymentReference(reference);
-
-  paymentRequestId = requireString(
-    paymentRequestId,
-    "Stitch payment request ID",
-    500
-  );
-
-  redirectUrl = requireString(
-    redirectUrl,
-    "Stitch checkout URL",
-    2048
-  );
-
-  let parsedUrl;
-
-  try {
-    parsedUrl = new URL(redirectUrl);
-  } catch {
-    throw new Error(
-      "Stitch checkout URL is invalid."
-    );
+  if (
+    typeof reference !== "string" ||
+    typeof paymentRequestId !== "string" ||
+    typeof redirectUrl !== "string"
+  ) {
+    throw new Error("Invalid Stitch payment link details.");
   }
+
+  const parsedUrl = new URL(redirectUrl);
 
   if (
     parsedUrl.protocol !== "https:" ||
-    parsedUrl.hostname !== "secure.stitch.money"
+    parsedUrl.hostname !== "express.stitch.money"
   ) {
-    throw new Error(
-      "Stitch checkout URL is invalid."
-    );
+    throw new Error("Invalid Stitch Express checkout URL.");
   }
 
   const paymentRef = paymentsCollection.doc(reference);
+  const now = new Date();
 
   await db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(paymentRef);
 
     if (!snapshot.exists) {
-      throw new Error(
-        "Payment record was not found."
-      );
+      throw new Error("Payment record not found.");
     }
 
     const payment = snapshot.data();
 
     if (
-      payment.provider !== "stitch" ||
       payment.status !== "pending" ||
       payment.credited === true
     ) {
-      throw new Error(
-        "Payment is not available for Stitch checkout."
-      );
+      throw new Error("Payment is no longer pending.");
     }
 
     if (
-      payment.stitchPaymentRequestId &&
-      payment.stitchPaymentRequestId !== paymentRequestId
+      payment.stitchPaymentLinkId &&
+      payment.stitchPaymentLinkId !== paymentRequestId
     ) {
       throw new Error(
-        "A different Stitch payment request is already attached to this payment."
+        "A different Stitch payment link is already attached."
       );
     }
 
-    const now = new Date();
-
     transaction.update(paymentRef, {
+      stitchPaymentLinkId: paymentRequestId,
       stitchPaymentRequestId: paymentRequestId,
       stitchPaymentRequestUrl: redirectUrl,
       stitchPaymentRequestCreatedAt: now,
-
-      // Keep old generic redirect field populated for
-      // any existing frontend that reads this field.
       stitchRedirectUrl: redirectUrl,
-
       updatedAt: now,
     });
   });
 
-  return {
-    reference,
-    paymentRequestId,
-    redirectUrl,
-    provider: "stitch",
-  };
+  return true;
 }
 
 // ============================================================
