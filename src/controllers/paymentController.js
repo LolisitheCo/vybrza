@@ -1,3 +1,4 @@
+
 import crypto from "node:crypto";
 
 import {
@@ -106,55 +107,42 @@ function validateStoredPayment(payment, reference) {
 }
 
 // ============================================================
-// STITCH REDIRECT URL
+// STITCH CHECKOUT URL
 // ============================================================
 
-function addRedirectUrl(paymentLink, reference) {
+function addRedirectUrl(paymentLink) {
   if (
     !paymentLink ||
-    typeof paymentLink.link !== "string"
+    typeof paymentLink.link !== "string" ||
+    !paymentLink.link.trim()
   ) {
     throw new Error("Stitch did not return a checkout link.");
   }
 
-  const configuredRedirect =
-    process.env.STITCH_REDIRECT_URL?.trim();
+  let checkoutUrl;
 
-  if (!configuredRedirect) {
-    return paymentLink.link;
+  try {
+    checkoutUrl = new URL(paymentLink.link);
+  } catch {
+    throw new Error("Stitch returned an invalid checkout URL.");
   }
-
-  const returnUrl = new URL(configuredRedirect);
-
-  if (returnUrl.protocol !== "https:") {
-    throw new Error(
-      "STITCH_REDIRECT_URL must use HTTPS."
-    );
-  }
-
-  returnUrl.searchParams.set("reference", reference);
-
-  const checkoutUrl = new URL(paymentLink.link);
 
   if (
     checkoutUrl.protocol !== "https:" ||
-    checkoutUrl.hostname !== "express.stitch.money"
+    checkoutUrl.hostname !== "express.stitch.money" ||
+    !checkoutUrl.pathname.startsWith("/pay/")
   ) {
     throw new Error("Invalid Stitch Express checkout URL.");
   }
 
-  checkoutUrl.searchParams.set(
-    "redirect_url",
-    returnUrl.toString()
-  );
-
+  // Use Stitch's original hosted checkout URL unchanged.
+  // Do not append redirect_url until Stitch confirms the supported format.
   return checkoutUrl.toString();
 }
 
 // ============================================================
 // CREATE OR REUSE STITCH CHECKOUT
 // ============================================================
-
 
 async function createCheckoutForPayment(payment, req = {}) {
   // ==========================================================
@@ -187,10 +175,7 @@ async function createCheckoutForPayment(payment, req = {}) {
       );
     }
 
-    const redirectUrl = addRedirectUrl(
-      existingLink,
-      payment.reference
-    );
+    const redirectUrl = addRedirectUrl(existingLink);
 
     console.log("STITCH EXISTING PAYMENT LINK DIAGNOSTIC:", {
       paymentLinkId: existingLink.id,
@@ -236,13 +221,10 @@ async function createCheckoutForPayment(payment, req = {}) {
   }
 
   // ==========================================================
-  // PREPARE CHECKOUT URL
+  // USE ORIGINAL STITCH CHECKOUT URL
   // ==========================================================
 
-  const redirectUrl = addRedirectUrl(
-    paymentLink,
-    payment.reference
-  );
+  const redirectUrl = addRedirectUrl(paymentLink);
 
   // ==========================================================
   // DIAGNOSTIC LOGGING
@@ -276,7 +258,6 @@ async function createCheckoutForPayment(payment, req = {}) {
     redirectUrl,
   };
 }
-
 
 // ============================================================
 // VERIFY A PAYMENT DIRECTLY WITH STITCH
