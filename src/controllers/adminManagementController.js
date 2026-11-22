@@ -55,7 +55,9 @@ const result = await removeUserRecord(req.params.id);
 
 return res.status(200).json({
   success: true,
-  message: "User removed successfully.",
+  message: result.alreadyDeactivated
+      ? "User account was already deactivated."
+      : "User account deactivated successfully.",
   result,
 });
 

@@ -5,6 +5,7 @@ import express from "express";
 import cors from "cors";
 
 import hostRoutes from "./routes/hostRoutes.js";
+import authRoutes from "./routes/authRoutes.js";
 import callRoutes from "./routes/callRoutes.js";
 import livekitRoutes from "./routes/livekitRoutes.js";
 import customerCallRoutes from "./routes/customerCallRoutes.js";
@@ -210,6 +211,7 @@ app.get("/health", (req, res) => {
 // WEBSITE API ROUTES
 // ------------------------------------------------------------
 
+app.use("/api/auth", authRoutes);
 app.use("/api/hosts", hostRoutes);
 app.use("/api/payments", paymentRoutes);
 app.use("/api/customer-calls", customerCallRoutes);

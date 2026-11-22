@@ -137,57 +137,86 @@ fail(
 
 /*
 
-REMOVE USER PROFILE
+DEACTIVATE CUSTOMER ACCOUNT
 
 --------------------------------------------------------------------------
 
-Removes the website profile only.
-
-Financial and call history remain preserved.
-
-Firebase Authentication account deletion is deliberately not performed.
+Keep the user document as a tombstone so normal login/sync code cannot
+recreate the profile. Preserve financial and call history. Disable the
+Firebase Authentication account and revoke its refresh tokens.
 
 --------------------------------------------------------------------------
 
 */
 
 export async function removeUserRecord(documentId) {
-const id = normalizeDocumentId(documentId);
-const userRef = users.doc(id);
-const userSnapshot = await userRef.get();
+  const id = normalizeDocumentId(documentId);
+  const userRef = users.doc(id);
+  const userSnapshot = await userRef.get();
 
-if (!userSnapshot.exists) {
-fail(404, "User record not found.");
-}
+  if (!userSnapshot.exists) {
+    fail(404, "User record not found.");
+  }
 
-const user = userSnapshot.data();
-const firebaseUid = user.uid || user.firebaseUid || id;
+  const user = userSnapshot.data();
+  const firebaseUid = user.uid || user.firebaseUid || id;
 
-if (user.role === "admin") {
-fail(409, "Administrator accounts cannot be removed here.");
-}
+  if (user.role === "admin") {
+    fail(409, "Administrator accounts cannot be removed here.");
+  }
 
-if (user.activeCallId) {
-fail(
-409,
-"This user has an active call. End the call before removing the account."
-);
-}
+  const alreadyDeactivated = user.accountStatus === "deleted";
 
-await ensureNotAdmin(firebaseUid);
-await ensureNoActiveCalls("userId", id);
-await ensureNoUnresolvedPayments(id);
+  if (user.activeCallId) {
+    fail(
+      409,
+      "This user has an active call. End the call before deactivating the account."
+    );
+  }
 
-// Do not delete payment records, call sessions, or financial history.
-// Customer email verification is handled by Firebase Authentication.
-await userRef.delete();
+  await ensureNotAdmin(firebaseUid);
+  await ensureNoActiveCalls("userId", id);
+  await ensureNoUnresolvedPayments(id);
 
-return {
-removed: true,
-documentId: id,
-financialHistoryPreserved: true,
-firebaseAuthAccountPreserved: true,
-};
+  const now = new Date();
+
+  // Keep the profile document. Deleting it would allow getOrCreateUser()
+  // to mistake the account for a first-time user and create it again.
+  await userRef.set(
+    {
+      accountStatus: "deleted",
+      active: false,
+      deleted: true,
+      deletedAt: now,
+      updatedAt: now,
+    },
+    { merge: true }
+  );
+
+  // Disable the Firebase identity and invalidate existing sessions.
+  // The Firestore tombstone remains authoritative if Auth is unavailable.
+  try {
+    await auth.updateUser(firebaseUid, { disabled: true });
+    await auth.revokeRefreshTokens(firebaseUid);
+  } catch (error) {
+    if (error?.code !== "auth/user-not-found") {
+      console.error(
+        "Customer profile was tombstoned, but Firebase Auth deactivation needs attention:",
+        { code: error?.code || "UNKNOWN_ERROR" }
+      );
+      throw error;
+    }
+  }
+
+  return {
+    removed: false,
+    deactivated: true,
+    documentId: id,
+    financialHistoryPreserved: true,
+    callHistoryPreserved: true,
+    firebaseAuthAccountDisabled: true,
+    alreadyDeactivated,
+  };
 }
 
 /*

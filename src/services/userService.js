@@ -235,7 +235,19 @@ export async function getOrCreateUser(firebaseUser) {
     const snapshot = await transaction.get(userRef);
 
     if (snapshot.exists) {
-      return toUser(snapshot);
+      const existingUser = toUser(snapshot);
+
+      // A deleted account is a permanent tombstone. Never recreate or
+      // reactivate its website profile during a normal login/sync flow.
+      if (existingUser.accountStatus === "deleted") {
+        throw makeError(
+          "This account has been deactivated. Contact support if you believe this is a mistake.",
+          403,
+          "ACCOUNT_DELETED"
+        );
+      }
+
+      return existingUser;
     }
 
     const email = getFirebaseEmail(firebaseUser);
