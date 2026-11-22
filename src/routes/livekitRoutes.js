@@ -27,6 +27,7 @@ const router = express.Router();
 router.use(verifyFirebaseToken);
 
 const callSessions = db.collection("callSessions");
+const users = db.collection("users");
 const hosts = db.collection("hosts");
 const callRooms = db.collection("callRooms");
 
@@ -387,6 +388,26 @@ async function getAuthorizedCall(callId, firebaseUid) {
   };
 }
 
+// Check the Firestore customer profile before issuing or starting
+// a LiveKit session. Missing accountStatus remains compatible with
+// older registered profiles; explicit non-active statuses are denied.
+async function requireActiveCustomerAccount(firebaseUid) {
+  const userSnapshot = await users.doc(firebaseUid).get();
+
+  if (!userSnapshot.exists) {
+    throw httpError(403, "Customer account is unavailable.");
+  }
+
+  const accountStatus = userSnapshot.data()?.accountStatus;
+
+  if (accountStatus && accountStatus !== "active") {
+    throw httpError(
+      403,
+      "Your customer account is not active."
+    );
+  }
+}
+
 // ============================================================
 // GROUP ROOM AUTHORIZATION
 // ============================================================
@@ -665,6 +686,10 @@ router.post("/token", async (req, res, next) => {
       firebaseUid
     );
 
+    if (isCustomer) {
+      await requireActiveCustomerAccount(firebaseUid);
+    }
+
     if (!ACTIVE_CALL_STATUSES.has(call.status)) {
       throw httpError(
         409,
@@ -777,6 +802,10 @@ router.post("/start", async (req, res, next) => {
       callId,
       firebaseUid
     );
+
+    if (isCustomer) {
+      await requireActiveCustomerAccount(firebaseUid);
+    }
 
     if (!ACTIVE_CALL_STATUSES.has(call.status)) {
       throw httpError(
